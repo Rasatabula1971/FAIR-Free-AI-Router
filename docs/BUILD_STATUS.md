@@ -58,7 +58,7 @@ requirements, not separate authorization for deployment, paid inference or publi
 ## Subsequent sprints
 
 - B (in progress): deterministic acceptance and persistent performance are implemented below.
-  Remaining work includes isolated code tests, broader grounding/consistency checks, independent
+  Remaining work includes native sandboxed code tests, broader grounding/consistency checks, independent
   verification and quality calibration.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
@@ -112,3 +112,26 @@ The GitHub workflow is prepared locally and has not been executed on GitHub.
   changes across router restart, and separate accounting for quality/infra/quota/unverified outcomes.
 - Full Sprint B is not complete: isolated code tests, general claim/source alignment,
   independent verification and calibrated quality scoring remain. Live providers are disabled.
+
+## Fourth increment: source extraction and bounded code tests
+
+- `grounded_json` contract binds each output field to a host-selected JSON source/path. Values
+  and provenance must match exactly; fabricated values, wrong attribution and extra claims fail.
+- `python_function` contract checks every host-supplied integer/boolean case using a bounded
+  interpreter for a small Python AST subset. No native code execution, imports, calls, loops,
+  external access or subprocesses are exposed to generated code. Host cases are withheld.
+- Both contracts integrate with capability selection, quality rejection/fallback, persistent
+  model/task metrics and explicit `SOURCE_DATA_MATCH`/`BOUNDED_CODE_TESTS` verification states.
+- Engine version advances to `deterministic-v2`. No new migration is required. High-impact,
+  freshness, unrelated capabilities and arbitrary prose/native code remain uncovered.
+- Clarified that the phrase "source code" alone is not a request for factual grounding.
+
+## Validation of the fourth increment
+
+- Full suite: 179 passed, one PostgreSQL test skipped locally, two upstream deprecation warnings.
+- Lint, formatting and migration/schema-drift checks pass.
+- Adversarial tests reject imports, calls, decorators, loops, recursive functions, attributes,
+  unexecuted dangerous branches, huge values and resource-budget violations without executing
+  generated code. Source tests reject incorrect provenance, unsupported content and invalid input.
+- Docker/PostgreSQL remain unavailable locally. Native sandboxing, general claim entailment,
+  independent cross-model verification and calibrated scoring remain unfinished Sprint B work.

@@ -4,24 +4,10 @@ import json
 from jsonschema import Draft202012Validator, ValidationError
 
 from fair.quality.arithmetic import calculate, numeric_answer
+from fair.quality.code_validator import validate_function
+from fair.quality.grounding import grounded_result
+from fair.quality.json_data import strict_json
 from fair.schemas.domain import QualityReport
-
-
-def strict_json(text):
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError("Duplicate JSON key")
-            result[key] = value
-        return result
-
-    def nonfinite(value):
-        raise ValueError("Non-finite JSON number")
-
-    value = json.loads(text, object_pairs_hook=pairs, parse_constant=nonfinite)
-    json.dumps(value, allow_nan=False)
-    return value
 
 
 def evaluate(request, profile, response) -> QualityReport:
@@ -59,7 +45,8 @@ def evaluate(request, profile, response) -> QualityReport:
         if key in assertions and assertions[key] != claim.value.strip().casefold():
             reasons.append("MATERIAL_CONTRADICTION")
         assertions[key] = claim.value.strip().casefold()
-    if profile.requires_grounding and not response.citations:
+    kind = request.validation.kind if request.validation is not None else None
+    if profile.requires_grounding and not response.citations and kind != "grounded_json":
         reasons.append("GROUNDING_REQUIRED")
 
     if request.validation is not None:
@@ -72,7 +59,7 @@ def evaluate(request, profile, response) -> QualityReport:
             verification = "DETERMINISTIC_ARITHMETIC" if matched else "UNVERIFIED"
             if not matched:
                 reasons.append("ARITHMETIC_MISMATCH")
-        else:
+        elif kind == "reference_json":
             try:
                 actual = json.dumps(strict_json(response.text), sort_keys=True, allow_nan=False)
                 expected = json.dumps(request.validation.expected, sort_keys=True, allow_nan=False)
@@ -83,14 +70,39 @@ def evaluate(request, profile, response) -> QualityReport:
             verification = "HOST_REFERENCE_MATCH" if matched else "UNVERIFIED"
             if not matched:
                 reasons.append("REFERENCE_MISMATCH")
+        elif kind == "grounded_json":
+            expected = grounded_result(request.validation, request.evidence)
+            try:
+                actual = strict_json(response.text)
+                matched = json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+            except (ValueError, RecursionError):
+                matched = False
+            checks["grounded_json"] = "PASS" if matched else "FAIL"
+            verification = "SOURCE_DATA_MATCH" if matched else "UNVERIFIED"
+            if not matched:
+                reasons.append("GROUNDED_DATA_MISMATCH")
+        else:
+            matched, failure = validate_function(response.text, request.validation)
+            checks["python_function"] = "PASS" if matched else "FAIL"
+            checks["code_test_count"] = str(len(request.validation.cases))
+            verification = "BOUNDED_CODE_TESTS" if matched else "UNVERIFIED"
+            if not matched:
+                reasons.append(failure)
         # 100 means all deterministic contract checks passed, not a truth probability.
         score = 100.0 if matched else 0.0
 
     unsupported = (
-        profile.requires_grounding
+        (profile.requires_grounding and kind != "grounded_json")
         or request.freshness_required
         or request.quality_level == "high_impact_support"
-        or bool(profile.required_capabilities - {"structured_output"})
+        or bool(
+            profile.required_capabilities
+            - (
+                {"structured_output", "coding"}
+                if kind == "python_function"
+                else {"structured_output"}
+            )
+        )
     )
     if unsupported:
         checks["coverage"] = "TASK_VALIDATOR_UNAVAILABLE"
@@ -127,5 +139,11 @@ def acceptable(report, profile):
         and not report.hard_reject
         and report.overall_score is not None
         and report.overall_score >= profile.minimum_quality_score
-        and report.verification_state in {"DETERMINISTIC_ARITHMETIC", "HOST_REFERENCE_MATCH"}
+        and report.verification_state
+        in {
+            "DETERMINISTIC_ARITHMETIC",
+            "HOST_REFERENCE_MATCH",
+            "SOURCE_DATA_MATCH",
+            "BOUNDED_CODE_TESTS",
+        }
     )

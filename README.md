@@ -1,7 +1,7 @@
 # FAIR Free AI Router
 
 FAIR is a governed routing service for zero-cost AI inference. This repository contains the
-Sprint A routing core and the first Sprint B quality increment. It is not yet a production AI service.
+Sprint A routing core and the developing Sprint B quality engine. It is not yet a production AI service.
 
 The core enforces free-only provider admission at registration, selection and execution;
 profiles tasks; filters models by capability, context and privacy; reserves request quotas;
@@ -9,13 +9,14 @@ and retries a bounded number of distinct free routes. It persists request, attem
 lineage and returns structured escalation when no eligible, verifiable answer exists.
 
 **No live adapters are included or enabled.** Demo mode uses offline fixtures. A non-empty
-or schema-valid response is not evidence of factual correctness. Explicit arithmetic and
-host-reference JSON validation contracts can now produce `ACCEPTED`; unsupported tasks still
-escalate. Failed answers are withheld. Paid inference is never executed.
+or schema-valid response is not evidence of factual correctness. Arithmetic, host-reference JSON,
+source-bound JSON extraction, and bounded Python-function test contracts can produce `ACCEPTED`.
+Unsupported tasks still escalate. Failed answers are withheld. Paid inference is never executed.
 
 See [quality contracts](docs/QUALITY_CONTRACTS.md) for the supported checks, verification
 labels, examples and limitations. These deterministic checks do not establish general
-factual correctness or validate arbitrary generated code.
+factual correctness or validate arbitrary generated code. The code validator interprets only a
+small numeric subset; it never passes generated code to Python `exec`/`eval` or a subprocess.
 
 ## Development
 
@@ -39,6 +40,8 @@ Quality tests exercise exact rational arithmetic, strict JSON reference matching
 precedence, citation-reference checks, structured assertion conflicts, model switching after
 rejection, private accepted output and persistent task-performance learning. A validator
 service error returns `FAILED` without penalizing the provider.
+Further tests cover source-path provenance, unsupported claims, hostile code constructs,
+resource limits and code test failures that trigger another model attempt.
 
 Restart regressions also cover durable stop/resume, reservations, exhaustion, authentication
 blocks, throttle deadlines, circuit history, single recovery probes and abandoned probes.

@@ -81,7 +81,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
 
     @app.get("/healthz")
     def health():
-        return {"status": "ok", "milestone": "A", "live_inference_enabled": False}
+        return {"status": "ok", "milestone": "B", "live_inference_enabled": False}
 
     @app.post("/v1/solve", response_model=SolveResponse)
     async def solve(request: SolveRequest, identity=Depends(client)):

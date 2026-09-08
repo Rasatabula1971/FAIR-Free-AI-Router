@@ -139,10 +139,15 @@ class QualityReport(DTO):
     hard_reject: bool = False
     reject_reasons: list[str] = Field(default_factory=list)
     verification_state: Literal[
-        "UNVERIFIED", "STRUCTURE_VALIDATED", "DETERMINISTIC_ARITHMETIC", "HOST_REFERENCE_MATCH"
+        "UNVERIFIED",
+        "STRUCTURE_VALIDATED",
+        "DETERMINISTIC_ARITHMETIC",
+        "HOST_REFERENCE_MATCH",
+        "SOURCE_DATA_MATCH",
+        "BOUNDED_CODE_TESTS",
     ] = "UNVERIFIED"
     validator_results: dict[str, str] = Field(default_factory=dict)
-    engine_version: str = "deterministic-v1"
+    engine_version: str = "deterministic-v2"
     validation_fingerprint: str | None = None
 
 

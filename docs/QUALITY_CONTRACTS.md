@@ -1,6 +1,6 @@
 # Deterministic quality contracts
 
-The first Sprint B increment accepts only answers covered by an explicit validation contract.
+The Sprint B engine accepts only answers covered by an explicit validation contract.
 The authenticated host chooses that contract; the provider cannot choose its own acceptance
 criteria. A contract defines the output being checked. Do not use an arithmetic contract to
 claim that unrelated instructions or additional work in the task have been verified.
@@ -43,6 +43,77 @@ extraction/evaluation workloads, not open-ended factual verification.
 
 Passing verification state: `HOST_REFERENCE_MATCH`.
 
+## Extraction from supplied JSON sources
+
+```json
+{
+  "client_id": "my-app",
+  "task": "Extract the report population",
+  "validation": {
+    "kind": "grounded_json",
+    "fields": [{"output_key": "population", "source_id": "report", "pointer": "/city/population"}]
+  },
+  "evidence": [{"source_id": "report", "text": "{\"city\":{\"population\":1000}}"}]
+}
+```
+
+The model must return exactly:
+
+```json
+{
+  "answer": {"population": 1000},
+  "sources": {"population": {"source_id": "report", "pointer": "/city/population"}}
+}
+```
+
+FAIR resolves each host-selected JSON pointer in the supplied source. Both the complete answer
+and its source/path mapping must match. A correct value attributed to a different source,
+an invented value, duplicate keys or an extra claim all fail. Pointers support object members,
+array indices and `~0`/`~1` escapes, without retrieving remote content. Invalid source JSON,
+missing paths/sources, duplicate requested output keys and oversized results are rejected
+before inference. Sources remain untrusted data and are included in the model request as such.
+
+Passing verification state: `SOURCE_DATA_MATCH`. This verifies exact extraction from the supplied
+data, not source credibility, real-world truth, freshness or arbitrary natural-language entailment.
+
+## Bounded Python function tests
+
+```json
+{
+  "client_id": "my-app",
+  "task": "Implement absolute value",
+  "validation": {
+    "kind": "python_function",
+    "function_name": "solve",
+    "cases": [
+      {"arguments": [-4], "expected": 4},
+      {"arguments": [3], "expected": 3},
+      {"arguments": [0], "expected": 0}
+    ]
+  }
+}
+```
+
+The provider must return raw Python source containing exactly one function with the specified
+name and parameter count. The host test cases are withheld from the model request. FAIR parses
+the source and interprets an allowlisted AST subset itself; generated text is never passed to
+Python `exec`, `eval`, a shell or a subprocess. This is a restricted interpreter, not a general
+Python sandbox or evidence that code has run under native CPython.
+
+Supported features: integer/boolean parameters and constants; local assignments; `if`/`else`;
+`return`; `+ - * // %`; unary signs and `not`; comparisons; `and`/`or`; conditional expressions.
+Imports, calls, attributes, loops, recursion, decorators, annotations, default arguments,
+collections, strings and other statements are outside the contract and hard-rejected, including
+when they occur in unused branches. Incorrect outputs, missing returns and division by zero fail.
+
+Limits: 8,192 source characters, 128 AST nodes, eight parameters, 32 nonempty host test cases,
+256-bit integer values, 256 interpretation steps per test, and depth 20. Inputs and expected
+outputs must be strict integers or booleans; `True` does not match expected integer `1`.
+Only all-tests-passing functions may be accepted. Test coverage remains the host's responsibility.
+
+Passing verification state: `BOUNDED_CODE_TESTS`. Passing these cases does not establish correctness
+for untested inputs, native execution, external packages, filesystem/network access or arbitrary code.
+
 ## Hard rejection and incomplete coverage
 
 Schema failure, empty or incomplete response, arithmetic/reference mismatch, fabricated
@@ -57,10 +128,11 @@ arbitrary claim. No URL is fetched. Text outside the normalized citation metadat
 automatically parsed for citations. Likewise, contradiction checks compare structured
 subject/predicate/value assertions; they do not detect arbitrary prose contradictions.
 
-Fresh/current, grounded research, high-impact and capability-dependent tasks such as coding
-remain unverified even when a narrow contract check passes. Independent verification, source
-evaluation and sandboxed code tests are not implemented. Schema-only and general prose
-responses also remain unverified. `model_disagreement` is `NOT_ASSESSED`.
+Fresh/current and high-impact tasks remain unverified even when a narrow contract check passes.
+Grounding is covered only for exact `grounded_json` extraction, and coding only for the
+`python_function` subset. Other required capabilities are not covered. Independent verification,
+source credibility evaluation and native sandboxed code execution are not implemented.
+Schema-only and general prose responses also remain unverified. `model_disagreement` is `NOT_ASSESSED`.
 
 ## Results and learning
 
@@ -82,5 +154,9 @@ separately. The latest 20 measured quality scores are retained alongside lifetim
 Unsupported tasks do not receive invented scores. The admin performance endpoint reports
 aggregates without raw prompts, evidence or answer text.
 
-Full Sprint B remains open for sandboxed code validation, broader grounding/consistency
+The engine version is `deterministic-v2`. Existing quality reports retain their original engine
+version; new validation kinds have separate model/task statistics. No database schema change
+is required for these two new contracts.
+
+Full Sprint B remains open for native sandboxed code validation, broader grounding/consistency
 checks, independent model verification and quality calibration. Live providers remain disabled.

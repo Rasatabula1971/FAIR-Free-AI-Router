@@ -5,6 +5,7 @@ from jsonschema import Draft202012Validator, SchemaError
 from pydantic import Field, model_validator
 
 from fair.quality.contracts import Evidence, ValidationContract
+from fair.quality.grounding import grounded_result
 from fair.schemas.domain import DTO, Attempt, Capability, PrivacyClass, QualityReport
 
 
@@ -25,6 +26,13 @@ class SolveRequest(DTO):
         ids = [item.source_id for item in self.evidence]
         if len(ids) != len(set(ids)):
             raise ValueError("Evidence source IDs must be unique")
+        if self.validation is not None and self.validation.kind == "grounded_json":
+            try:
+                expected = grounded_result(self.validation, self.evidence)
+                if len(json.dumps(expected)) > 50000:
+                    raise ValueError("Grounded result exceeds validation budget")
+            except RecursionError as error:
+                raise ValueError("Grounded source exceeds depth budget") from error
         if self.expected_schema is not None:
             try:
                 Draft202012Validator.check_schema(self.expected_schema)
@@ -46,7 +54,11 @@ class SolveResponse(DTO):
     minimum_required: float
     best_quality_score: float | None = None
     verification_state: Literal[
-        "UNVERIFIED", "DETERMINISTIC_ARITHMETIC", "HOST_REFERENCE_MATCH"
+        "UNVERIFIED",
+        "DETERMINISTIC_ARITHMETIC",
+        "HOST_REFERENCE_MATCH",
+        "SOURCE_DATA_MATCH",
+        "BOUNDED_CODE_TESTS",
     ] = "UNVERIFIED"
     output: str | None = None
     provider_id: str | None = None
