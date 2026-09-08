@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: fair
+      POSTGRES_PASSWORD: fair
+      POSTGRES_DB: fair
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["fair_db:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fair"]
+      interval: 5s
+      retries: 10
+  migrate:
+    build: {context: ../.., dockerfile: infra/docker/Dockerfile}
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      FAIR_DATABASE_URL: postgresql+psycopg://fair:fair@db:5432/fair
+    depends_on:
+      db: {condition: service_healthy}
+  api:
+    build: {context: ../.., dockerfile: infra/docker/Dockerfile}
+    ports: ["127.0.0.1:8000:8000"]
+    environment:
+      FAIR_DATABASE_URL: postgresql+psycopg://fair:fair@db:5432/fair
+      FAIR_CLIENT_KEYS: ${FAIR_CLIENT_KEYS:?Set FAIR_CLIENT_KEYS}
+      FAIR_ADMIN_KEY: ${FAIR_ADMIN_KEY:?Set FAIR_ADMIN_KEY}
+      FAIR_DEMO_MODE: ${FAIR_DEMO_MODE:-0}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+volumes:
+  fair_db:

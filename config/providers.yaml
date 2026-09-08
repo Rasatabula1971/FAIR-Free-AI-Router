@@ -1,0 +1,12 @@
+# All candidates deliberately inactive until live adapters and eligibility verification exist.
+# No quota values or current provider terms are inferred from the source seed.
+providers:
+  - {provider_id: groq, access_class: FREE_RECURRING}
+  - {provider_id: google_gemini_api, access_class: FREE_RECURRING}
+  - {provider_id: cloudflare_workers_ai, access_class: FREE_RECURRING}
+  - {provider_id: mistral, access_class: FREE_RECURRING}
+  - {provider_id: kilo_gateway, access_class: FREE_DYNAMIC}
+  - {provider_id: openrouter_free, access_class: FREE_DYNAMIC}
+  - {provider_id: ollama_cloud, access_class: FREE_RECURRING}
+  - {provider_id: huggingface_inference, access_class: FREE_RECURRING}
+  - {provider_id: ollama_local, access_class: FREE_LOCAL, status: DISABLED}

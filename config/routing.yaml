@@ -1,0 +1,8 @@
+max_attempts: 3
+timeout_seconds: 15
+circuit_failures: 3
+circuit_window_seconds: 60
+cooldown_seconds: 60
+quality_weight: 0.65
+quota_weight: 0.20
+reliability_weight: 0.15

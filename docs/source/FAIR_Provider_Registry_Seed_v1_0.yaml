@@ -1,0 +1,101 @@
+version: "1.0"
+last_reviewed: "2026-09-08"
+project: "FAIR - Free AI Router"
+
+policy:
+  max_fair_ai_spend_usd: 0.00
+  paid_api_keys_allowed: false
+  auto_topup_allowed: false
+  pay_as_you_go_allowed: false
+  paid_subscription_routing_inside_fair: false
+  allowed_access_classes:
+    - FREE_RECURRING
+    - FREE_DYNAMIC
+    - FREE_LOCAL
+
+provider_states:
+  - ACTIVE
+  - THROTTLED
+  - QUOTA_PRESSURE
+  - QUOTA_EXHAUSTED
+  - DEGRADED
+  - OUTAGE
+  - DISABLED
+  - TERMS_REVIEW
+  - SECURITY_BLOCKED
+
+providers:
+  - provider_id: groq
+    access_class: FREE_RECURRING
+    status: TERMS_REVIEW
+    notes: "Seed candidate. Verify current free API limits and intended-use terms before activation."
+
+  - provider_id: google_gemini_api
+    access_class: FREE_RECURRING
+    status: TERMS_REVIEW
+    notes: "Seed candidate. Verify current eligible free models, quotas, privacy/data-use terms."
+
+  - provider_id: cloudflare_workers_ai
+    access_class: FREE_RECURRING
+    status: TERMS_REVIEW
+    notes: "Seed candidate. Verify current Workers Free allowance and model availability."
+
+  - provider_id: mistral
+    access_class: FREE_RECURRING
+    status: TERMS_REVIEW
+    notes: "Seed candidate. Verify current no-charge developer/API mode and limits."
+
+  - provider_id: kilo_gateway
+    access_class: FREE_DYNAMIC
+    status: TERMS_REVIEW
+    notes: "Seed candidate. Verify current free-model pool, anonymous/account limits, and intended-use terms."
+
+  - provider_id: openrouter_free
+    access_class: FREE_DYNAMIC
+    status: TERMS_REVIEW
+    notes: "Only routes requiring no deposit/paid credits qualify for strict FAIR."
+
+  - provider_id: ollama_cloud
+    access_class: FREE_RECURRING
+    status: TERMS_REVIEW
+    notes: "Verify current free-plan allowance and supported models."
+
+  - provider_id: huggingface_inference
+    access_class: FREE_RECURRING
+    status: TERMS_REVIEW
+    notes: "Low-volume secondary route; verify recurring free credit and provider-specific conditions."
+
+  - provider_id: ollama_local
+    access_class: FREE_LOCAL
+    status: ACTIVE
+    notes: "No external inference charge. Hardware/electricity remain host operating costs."
+
+admission_requirements:
+  - "Current access cost is $0"
+  - "Programmatic access exists"
+  - "No paid subscription or mandatory deposit is required"
+  - "No automatic billing is required"
+  - "Intended workload is allowed by current terms"
+  - "Privacy/data use is acceptable for configured data class"
+  - "Provider/model passes FAIR benchmark threshold"
+  - "Quota/reset behavior is documented or empirically measurable"
+
+quality_defaults:
+  thresholds:
+    commodity: 75
+    standard: 82
+    advanced: 88
+    high_impact_support: 92
+  reject_on:
+    - fabricated_citation
+    - material_unsupported_claims
+    - schema_failure
+    - material_internal_contradiction
+    - failed_required_tests
+
+host_escalation:
+  enabled: true
+  fair_executes_paid_inference: false
+  escalation_status: ESCALATION_REQUIRED
+  direct_paid_levels:
+    - L4
