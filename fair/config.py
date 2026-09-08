@@ -9,6 +9,7 @@ from fair.schemas.domain import DTO
 
 class RoutingSettings(DTO):
     max_attempts: int = Field(default=3, ge=1, le=10)
+    max_verification_attempts: int = Field(default=2, ge=1, le=3)
     timeout_seconds: float = Field(default=15, gt=0, le=120)
     circuit_failures: int = Field(default=3, ge=1)
     circuit_window_seconds: float = Field(default=60, gt=0)

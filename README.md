@@ -13,6 +13,11 @@ or schema-valid response is not evidence of factual correctness. Arithmetic, hos
 source-bound JSON extraction, and bounded Python-function test contracts can produce `ACCEPTED`.
 Unsupported tasks still escalate. Failed answers are withheld. Paid inference is never executed.
 
+Set `cross_check_required: true` to require a second provider/model to solve and validate the
+same task independently. This is mandatory for `high_impact_support`. Both answers must pass
+the selected contract and agree within its scope; otherwise FAIR withholds the provisional
+answer and returns escalation or a service failure. Agreement does not establish general truth.
+
 See [quality contracts](docs/QUALITY_CONTRACTS.md) for the supported checks, verification
 labels, examples and limitations. These deterministic checks do not establish general
 factual correctness or validate arbitrary generated code. The code validator interprets only a
@@ -42,6 +47,8 @@ rejection, private accepted output and persistent task-performance learning. A v
 service error returns `FAILED` without penalizing the provider.
 Further tests cover source-path provenance, unsupported claims, hostile code constructs,
 resource limits and code test failures that trigger another model attempt.
+Cross-check tests cover route diversity, alias groups, bounded failover, disagreement,
+answer isolation, high-impact enforcement and durable cancellation lineage.
 
 Restart regressions also cover durable stop/resume, reservations, exhaustion, authentication
 blocks, throttle deadlines, circuit history, single recovery probes and abandoned probes.
@@ -117,6 +124,9 @@ attempts contribute to these statistics. Accepted response text is stored with t
 result and is readable only by its owning client. Rejected response text, host reference
 answers and raw evidence are not stored in quality/audit rows; a contract fingerprint records
 which validation inputs were used. Integrators must retain their input for exact replay.
+Migration `0004` adds optional model `independence_group` metadata. Known aliases of the same
+underlying model/family should share a group; FAIR then excludes them from checking each other.
+Provider and model IDs must also differ. Unknown aliases cannot be automatically detected.
 
 ## Build roadmap and limitations
 

@@ -94,7 +94,6 @@ def evaluate(request, profile, response) -> QualityReport:
     unsupported = (
         (profile.requires_grounding and kind != "grounded_json")
         or request.freshness_required
-        or request.quality_level == "high_impact_support"
         or bool(
             profile.required_capabilities
             - (

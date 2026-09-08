@@ -51,6 +51,7 @@ class Model(Base):
     context_window: Mapped[int] = mapped_column(Integer)
     capabilities: Mapped[list] = mapped_column(JSON)
     active: Mapped[bool] = mapped_column(Boolean)
+    independence_group: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class ProviderQuotaState(Base):

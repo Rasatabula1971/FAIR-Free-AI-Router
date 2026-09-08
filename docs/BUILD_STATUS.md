@@ -58,8 +58,9 @@ requirements, not separate authorization for deployment, paid inference or publi
 ## Subsequent sprints
 
 - B (in progress): deterministic acceptance and persistent performance are implemented below.
-  Remaining work includes native sandboxed code tests, broader grounding/consistency checks, independent
-  verification and quality calibration.
+  Remaining work includes native sandboxed code tests, broader grounding/consistency checks,
+  source credibility evaluation and quality calibration. Scoped independent cross-checks are
+  implemented in the fifth increment.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
@@ -135,3 +136,29 @@ The GitHub workflow is prepared locally and has not been executed on GitHub.
   generated code. Source tests reject incorrect provenance, unsupported content and invalid input.
 - Docker/PostgreSQL remain unavailable locally. Native sandboxing, general claim entailment,
   independent cross-model verification and calibrated scoring remain unfinished Sprint B work.
+
+## Fifth increment: bounded independent verification
+
+- Optional `cross_check_required` and mandatory verification for high-impact requests. A second
+  eligible provider/model independently solves the same task without seeing the first answer.
+- Both responses must pass the existing deterministic contract and agree in scope. Matching
+  text alone cannot verify unsupported tasks or override hard rejection. Exact-value comparison
+  covers arithmetic/JSON; code agreement is limited to the same hidden host test cases.
+- Separate bounded checker budget, infrastructure failover, immediate escalation on measured
+  disagreement/rejection, and withholding of provisional output on every unsuccessful check.
+- Migration `0004` persists optional model independence groups; provider/model identities and
+  known alias groups enforce configured route diversity. Unknown shared ancestry is not inferred.
+- Unified attempt execution applies zero-spend, quota, quality and audit controls to both roles.
+  Cancellation now persists a cancelled attempt as well as request status.
+- Reports include cross-check state, role, attempt references and comparison scope. Candidate
+  quality and final request acceptance remain distinct. Engine version is `deterministic-v3`.
+
+## Validation of the fifth increment
+
+- Full suite: 208 passed, one PostgreSQL test skipped locally, two upstream deprecation warnings.
+- Lint, formatting, migration upgrade and SQLite schema-drift checks pass.
+- Tests cover mandatory high-impact checks, producer/alias exclusion, verifier eligibility,
+  separate call budgets, quota/outage failover, disagreement without repeated agreement-seeking,
+  hidden producer answers/tests, code/JSON agreement, service failures and durable cancellation.
+- PostgreSQL/Docker, native sandboxing, general claim entailment and calibrated quality scoring
+  remain unverified or unfinished. Live providers remain disabled; remote CI has not been run.

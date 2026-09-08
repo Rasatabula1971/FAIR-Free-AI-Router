@@ -63,6 +63,7 @@ class ModelDescriptor(DTO):
     context_window: int = Field(gt=0)
     capabilities: set[Capability] = Field(default_factory=set)
     active: bool = True
+    independence_group: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ProviderSpec(DTO):
@@ -147,7 +148,7 @@ class QualityReport(DTO):
         "BOUNDED_CODE_TESTS",
     ] = "UNVERIFIED"
     validator_results: dict[str, str] = Field(default_factory=dict)
-    engine_version: str = "deterministic-v2"
+    engine_version: str = "deterministic-v3"
     validation_fingerprint: str | None = None
 
 
@@ -161,3 +162,22 @@ class Attempt(DTO):
     latency_ms: float
     error_type: str | None = None
     quality: QualityReport | None = None
+    role: Literal["PRIMARY", "CROSS_CHECK"] = "PRIMARY"
+
+
+class CrossCheckReport(DTO):
+    required: bool = False
+    state: Literal[
+        "NOT_REQUESTED",
+        "NOT_RUN",
+        "UNAVAILABLE",
+        "PASSED",
+        "REJECTED",
+        "DISAGREEMENT",
+        "STOPPED",
+        "SERVICE_FAILED",
+    ] = "NOT_REQUESTED"
+    primary_attempt_number: int | None = None
+    verification_attempt_number: int | None = None
+    attempts_count: int = 0
+    agreement_basis: Literal["NOT_ASSESSED", "EXACT_VALUE", "HOST_TEST_CASES"] = "NOT_ASSESSED"

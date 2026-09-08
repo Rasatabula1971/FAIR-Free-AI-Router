@@ -6,7 +6,14 @@ from pydantic import Field, model_validator
 
 from fair.quality.contracts import Evidence, ValidationContract
 from fair.quality.grounding import grounded_result
-from fair.schemas.domain import DTO, Attempt, Capability, PrivacyClass, QualityReport
+from fair.schemas.domain import (
+    DTO,
+    Attempt,
+    Capability,
+    CrossCheckReport,
+    PrivacyClass,
+    QualityReport,
+)
 
 
 class SolveRequest(DTO):
@@ -18,6 +25,7 @@ class SolveRequest(DTO):
     expected_schema: dict | None = None
     required_capabilities: set[Capability] = Field(default_factory=set)
     freshness_required: bool = False
+    cross_check_required: bool = False
     validation: ValidationContract | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=10)
 
@@ -64,6 +72,7 @@ class SolveResponse(DTO):
     provider_id: str | None = None
     model_id: str | None = None
     quality: QualityReport | None = None
-    model_disagreement: Literal["NOT_ASSESSED"] = "NOT_ASSESSED"
+    model_disagreement: Literal["NOT_ASSESSED", "NONE", "DETECTED"] = "NOT_ASSESSED"
+    cross_check: CrossCheckReport = Field(default_factory=CrossCheckReport)
     recommended_capability: str = "VALIDATED_FREE_MODEL_OR_HOST_REVIEW"
     paid_inference_executed: Literal[False] = False

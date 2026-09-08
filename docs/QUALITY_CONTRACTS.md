@@ -128,11 +128,50 @@ arbitrary claim. No URL is fetched. Text outside the normalized citation metadat
 automatically parsed for citations. Likewise, contradiction checks compare structured
 subject/predicate/value assertions; they do not detect arbitrary prose contradictions.
 
-Fresh/current and high-impact tasks remain unverified even when a narrow contract check passes.
+Fresh/current tasks remain unverified even when a narrow contract check passes. High-impact
+tasks require the independent cross-check described below before accepting a supported contract.
 Grounding is covered only for exact `grounded_json` extraction, and coding only for the
-`python_function` subset. Other required capabilities are not covered. Independent verification,
-source credibility evaluation and native sandboxed code execution are not implemented.
-Schema-only and general prose responses also remain unverified. `model_disagreement` is `NOT_ASSESSED`.
+`python_function` subset. Other required capabilities are not covered. Source credibility
+evaluation and native sandboxed code execution are not implemented. Schema-only and general
+prose responses remain unverified even if multiple models return identical text.
+
+## Independent cross-checks
+
+Add `"cross_check_required": true` to a supported request, or use `"quality_level":
+"high_impact_support"`. High-impact requests cannot disable the requirement by setting the
+boolean to false. FAIR first obtains a locally validated candidate, then asks another eligible
+provider/model to solve the same task without seeing the candidate answer. Both roles use the
+same host validation contract; reference answers and code test cases remain hidden from providers.
+
+Provider IDs and model IDs must differ after whitespace/case normalization. Optional model
+`independence_group` metadata prevents known aliases or related underlying routes from checking
+each other. Groups default to model ID for comparison when absent. Operators must identify
+known aliases correctly: distinct configured IDs do not prove different training data,
+infrastructure or independent error patterns.
+
+Each verification call passes the normal admission, privacy, capability, context, quota,
+timeout and kill-switch controls. `max_attempts` bounds primary attempts (default 3), while
+`max_verification_attempts` separately bounds cross-check calls (default 2, maximum 3). Thus
+the default request can dispatch at most five model calls. Infrastructure/quota failures may
+try another eligible checker within that budget. A measured rejection or disagreement stops
+the request immediately; FAIR does not keep querying until it finds agreement.
+
+Arithmetic results are compared as exact rational values. JSON results are compared by their
+complete canonical values. Different Python implementations may agree when both pass all the
+same host cases; this comparison says nothing about untested inputs. A matching answer with
+failed citations, schema or another hard rejection cannot approve the candidate.
+
+The response retains the specific validation scope, such as `SOURCE_DATA_MATCH`, and adds a
+`cross_check` report with state, attempt references, count and agreement basis. Attempt roles
+are `PRIMARY` or `CROSS_CHECK`. `model_disagreement` is `NONE`, `DETECTED` or `NOT_ASSESSED`.
+`PASSED` means both scoped checks passed and their outputs agree under that comparison, not
+that arbitrary claims are true. The returned answer belongs to the primary producer.
+
+No eligible distinct checker produces `INDEPENDENT_VERIFIER_UNAVAILABLE`; differing comparable
+answers produce `MODEL_DISAGREEMENT`; a malformed or rejected checker produces
+`CROSS_CHECK_REJECTED`. These results withhold all answer text, including the provisional
+candidate. Stop and service-failure paths also withhold it. Cross-check evidence is audited
+and retained in client-isolated request history. Cancellation records the cancelled attempt.
 
 ## Results and learning
 
@@ -153,10 +192,14 @@ and quota failures never enter the quality numerator or denominator; availabilit
 separately. The latest 20 measured quality scores are retained alongside lifetime totals.
 Unsupported tasks do not receive invented scores. The admin performance endpoint reports
 aggregates without raw prompts, evidence or answer text.
+An attempt's `ACCEPTED` disposition and its performance counter mean that the local contract
+checks passed. The final request may still escalate because its required cross-check failed.
+Consequently an escalation can legitimately have a best local score of 100; that score never
+overrides the independent-verification gate.
 
-The engine version is `deterministic-v2`. Existing quality reports retain their original engine
-version; new validation kinds have separate model/task statistics. No database schema change
-is required for these two new contracts.
+The engine version is `deterministic-v3`. Existing quality reports retain their original engine
+version; new validation kinds have separate model/task statistics. Migration `0004` adds the
+nullable model independence group; historical attempts default to the `PRIMARY` role when read.
 
 Full Sprint B remains open for native sandboxed code validation, broader grounding/consistency
-checks, independent model verification and quality calibration. Live providers remain disabled.
+checks, source credibility evaluation and quality calibration. Live providers remain disabled.

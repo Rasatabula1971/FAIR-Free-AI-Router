@@ -1,4 +1,5 @@
 max_attempts: 3
+max_verification_attempts: 2
 timeout_seconds: 15
 circuit_failures: 3
 circuit_window_seconds: 60
