@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     create_engine,
@@ -108,6 +109,46 @@ class TaskProfile(Base):
     minimum_quality_score: Mapped[float] = mapped_column(Float)
     requires_grounding: Mapped[bool] = mapped_column(Boolean)
     profile_source: Mapped[str] = mapped_column(String(16))
+
+
+class QualityRecord(Base):
+    __tablename__ = "quality_reports"
+    attempt_id: Mapped[str] = mapped_column(ForeignKey("routing_attempts.id"), primary_key=True)
+    overall_score: Mapped[float | None] = mapped_column(Float)
+    hard_reject: Mapped[bool] = mapped_column(Boolean)
+    verification_state: Mapped[str] = mapped_column(String(32))
+    report_json: Mapped[dict] = mapped_column(JSON)
+
+
+class ModelTaskPerformance(Base):
+    __tablename__ = "model_task_performance"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["provider_id", "model_id"], ["models.provider_id", "models.model_id"]
+        ),
+    )
+    provider_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    model_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    task_class: Mapped[str] = mapped_column(String(64), primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    accepted: Mapped[int] = mapped_column(Integer, default=0)
+    quality_failures: Mapped[int] = mapped_column(Integer, default=0)
+    infra_failures: Mapped[int] = mapped_column(Integer, default=0)
+    quota_failures: Mapped[int] = mapped_column(Integer, default=0)
+    unverified: Mapped[int] = mapped_column(Integer, default=0)
+    hallucination_events: Mapped[int] = mapped_column(Integer, default=0)
+    quality_samples: Mapped[int] = mapped_column(Integer, default=0)
+    quality_sum: Mapped[float] = mapped_column(Float, default=0)
+    latency_sum_ms: Mapped[float] = mapped_column(Float, default=0)
+    recent_quality: Mapped[list] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EscalationRecord(Base):
+    __tablename__ = "escalation_requests"
+    request_id: Mapped[str] = mapped_column(ForeignKey("task_requests.id"), primary_key=True)
+    reason_code: Mapped[str] = mapped_column(String(64))
+    detail_json: Mapped[dict] = mapped_column(JSON)
 
 
 class AuditEvent(Base):

@@ -11,7 +11,7 @@ from fair.governor.policy import AdmissionDenied, admit_provider
 from fair.providers.base import ProviderUnavailable, QuotaExceeded, RateLimited
 from fair.providers.mock import MockAdapter
 from fair.schemas.api import SolveRequest
-from fair.schemas.db import AuditEvent, RoutingAttempt
+from fair.schemas.db import AuditEvent, ModelTaskPerformance, RoutingAttempt
 
 
 def req(**values):
@@ -88,15 +88,33 @@ async def test_capability_context_privacy_filter(make_router, task_request):
 
 def test_task_specific_quality_wins(make_router):
     router = make_router([(provider(n), MockAdapter(n)) for n in ("a", "b")])
-    router.selector.quality[("b", "model", "general")] = 0.9
+    with router.sessions.begin() as session:
+        session.add(
+            ModelTaskPerformance(
+                provider_id="b",
+                model_id="model",
+                task_class="general",
+                quality_samples=10,
+                quality_sum=900,
+            )
+        )
     profile = profile_task(req(), router.thresholds)
     assert router.selector.candidates(req(), profile, set())[0][1].provider_id == "b"
 
 
 def test_quota_scarcity_preserves_near_equal_model(make_router):
     router = make_router([(provider(n, request_limit=100), MockAdapter(n)) for n in ("a", "b")])
-    router.selector.quality[("a", "model", "general")] = 0.85
-    router.selector.quality[("b", "model", "general")] = 0.83
+    with router.sessions.begin() as session:
+        for name, total in (("a", 850), ("b", 830)):
+            session.add(
+                ModelTaskPerformance(
+                    provider_id=name,
+                    model_id="model",
+                    task_class="general",
+                    quality_samples=10,
+                    quality_sum=total,
+                )
+            )
     for _ in range(95):
         router.quota.reserve(router.registry.providers["a"])
     assert (
@@ -124,7 +142,7 @@ async def test_failover_and_no_error_or_raw_text_leak(make_router, error, dispos
     assert result.attempts[0].disposition == disposition
     assert first.calls == second.calls == 1
     assert "secret-key-canary" not in result.model_dump_json()
-    assert not router.selector.quality
+    assert router.performance.scores("a", "model", "general")[0] == 0.5
     if isinstance(error, QuotaExceeded):
         assert router.quota.effective_status(router.registry.providers["a"]) == "QUOTA_EXHAUSTED"
     with router.sessions() as session:
@@ -183,7 +201,7 @@ async def test_structure_alone_is_never_accepted(make_router, text, hard_reject)
     result = await router.solve(req(expected_schema={"type": "object", "required": ["answer"]}))
     assert result.status == "ESCALATION_REQUIRED"
     assert result.attempts[0].quality.hard_reject == hard_reject
-    assert result.best_quality_score is None
+    assert result.best_quality_score == (0 if hard_reject else None)
 
 
 def test_api_auth_isolation_audit_and_admin(make_router):
@@ -224,7 +242,7 @@ def test_invalid_schema_rejected_before_call(make_router):
             result = client.post(
                 "/v1/solve",
                 headers={"X-API-Key": "key"},
-                json=req(expected_schema=schema).model_dump(mode="json"),
+                json={**req().model_dump(mode="json"), "expected_schema": schema},
             )
             assert result.status_code == 422
     assert router.registry.adapters["a"].calls == 0

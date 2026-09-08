@@ -1,7 +1,7 @@
 # FAIR Free AI Router
 
 FAIR is a governed routing service for zero-cost AI inference. This repository contains the
-Sprint A routing core with durable governance state. It is not yet a production AI service.
+Sprint A routing core and the first Sprint B quality increment. It is not yet a production AI service.
 
 The core enforces free-only provider admission at registration, selection and execution;
 profiles tasks; filters models by capability, context and privacy; reserves request quotas;
@@ -9,9 +9,13 @@ and retries a bounded number of distinct free routes. It persists request, attem
 lineage and returns structured escalation when no eligible, verifiable answer exists.
 
 **No live adapters are included or enabled.** Demo mode uses offline fixtures. A non-empty
-or schema-valid response is not evidence of factual correctness. Until Sprint B implements
-task-specific quality validation, every solve deliberately returns `ESCALATION_REQUIRED`.
-No response text, invented quality score, or paid inference is returned.
+or schema-valid response is not evidence of factual correctness. Explicit arithmetic and
+host-reference JSON validation contracts can now produce `ACCEPTED`; unsupported tasks still
+escalate. Failed answers are withheld. Paid inference is never executed.
+
+See [quality contracts](docs/QUALITY_CONTRACTS.md) for the supported checks, verification
+labels, examples and limitations. These deterministic checks do not establish general
+factual correctness or validate arbitrary generated code.
 
 ## Development
 
@@ -30,6 +34,11 @@ execution-boundary checks, kill switches, capability/privacy/context filters, ta
 selection, quota scarcity, 429/quota/outage/timeout failover, cooldown recovery, bounded
 attempts, conservative concurrent reservations, schema validation, authenticated client
 isolation and persisted audit lineage.
+
+Quality tests exercise exact rational arithmetic, strict JSON reference matching, hard-reject
+precedence, citation-reference checks, structured assertion conflicts, model switching after
+rejection, private accepted output and persistent task-performance learning. A validator
+service error returns `FAILED` without penalizing the provider.
 
 Restart regressions also cover durable stop/resume, reservations, exhaustion, authentication
 blocks, throttle deadlines, circuit history, single recovery probes and abandoned probes.
@@ -76,6 +85,7 @@ For an existing local PostgreSQL instance, set `FAIR_DATABASE_URL`, run
 | `POST /v1/solve` | Client key; body identity must match key |
 | `GET /v1/providers` | Client key; safe registry summary |
 | `GET /v1/providers/{id}/health` | Client key; persisted quota and circuit observations |
+| `GET /v1/models/performance` | Admin key; up to 1,000 aggregate model/task records |
 | `GET /v1/requests/{id}` | Owning client only |
 | `GET /v1/requests/{id}/audit` | Owning client only |
 | `POST /v1/system/stop` | Separate admin key |
@@ -99,6 +109,11 @@ they do not make live provider calls. Deadline fields use UTC Unix seconds.
 
 After pulling a schema change, run `alembic upgrade head` before starting the service.
 Existing profile JSON remains readable; new requests also receive relational profile rows.
+Migration `0003` adds quality reports, escalation records and model/task statistics. Only new
+attempts contribute to these statistics. Accepted response text is stored with the request
+result and is readable only by its owning client. Rejected response text, host reference
+answers and raw evidence are not stored in quality/audit rows; a contract fingerprint records
+which validation inputs were used. Integrators must retain their input for exact replay.
 
 ## Build roadmap and limitations
 

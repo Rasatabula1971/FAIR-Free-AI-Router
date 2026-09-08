@@ -1,8 +1,11 @@
+import json
 from typing import Literal
 
-from pydantic import Field
+from jsonschema import Draft202012Validator, SchemaError
+from pydantic import Field, model_validator
 
-from fair.schemas.domain import DTO, Attempt, Capability, PrivacyClass
+from fair.quality.contracts import Evidence, ValidationContract
+from fair.schemas.domain import DTO, Attempt, Capability, PrivacyClass, QualityReport
 
 
 class SolveRequest(DTO):
@@ -14,15 +17,41 @@ class SolveRequest(DTO):
     expected_schema: dict | None = None
     required_capabilities: set[Capability] = Field(default_factory=set)
     freshness_required: bool = False
+    validation: ValidationContract | None = None
+    evidence: list[Evidence] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def unique_sources(self):
+        ids = [item.source_id for item in self.evidence]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Evidence source IDs must be unique")
+        if self.expected_schema is not None:
+            try:
+                Draft202012Validator.check_schema(self.expected_schema)
+                encoded = json.dumps(self.expected_schema)
+            except (SchemaError, RecursionError) as error:
+                raise ValueError("Invalid expected JSON schema") from error
+            if len(encoded) > 20000 or '"$ref"' in encoded or '"$dynamicRef"' in encoded:
+                raise ValueError(
+                    "Schema references and schemas over 20000 characters are unsupported"
+                )
+        return self
 
 
 class SolveResponse(DTO):
     request_id: str
-    status: Literal["ESCALATION_REQUIRED", "FAILED"]
+    status: Literal["ACCEPTED", "ESCALATION_REQUIRED", "FAILED"]
     reason_code: str
     attempts: list[Attempt]
     minimum_required: float
     best_quality_score: float | None = None
-    verification_state: Literal["UNVERIFIED"] = "UNVERIFIED"
+    verification_state: Literal[
+        "UNVERIFIED", "DETERMINISTIC_ARITHMETIC", "HOST_REFERENCE_MATCH"
+    ] = "UNVERIFIED"
+    output: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    quality: QualityReport | None = None
+    model_disagreement: Literal["NOT_ASSESSED"] = "NOT_ASSESSED"
     recommended_capability: str = "VALIDATED_FREE_MODEL_OR_HOST_REVIEW"
     paid_inference_executed: Literal[False] = False

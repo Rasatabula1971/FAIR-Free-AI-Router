@@ -4,7 +4,6 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from jsonschema import Draft202012Validator, SchemaError
 from sqlalchemy import select
 
 from fair.config import RoutingSettings, load_yaml
@@ -12,7 +11,7 @@ from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.router.orchestrator import Router
 from fair.schemas.api import SolveRequest, SolveResponse
-from fair.schemas.db import AuditEvent, database
+from fair.schemas.db import AuditEvent, ModelTaskPerformance, database
 from fair.schemas.db import TaskRequest as TaskRow
 from fair.schemas.domain import ProviderSpec
 
@@ -88,16 +87,6 @@ def create_app(router=None, client_keys=None, admin_key=None):
     async def solve(request: SolveRequest, identity=Depends(client)):
         if request.client_id != identity:
             raise HTTPException(403, "Client identity mismatch")
-        if request.expected_schema is not None:
-            try:
-                Draft202012Validator.check_schema(request.expected_schema)
-            except SchemaError:
-                raise HTTPException(422, "Invalid expected JSON schema") from None
-            # Do not let a supplied schema trigger retrieval of arbitrary URLs.
-            if '"$ref"' in json.dumps(request.expected_schema) or '"$dynamicRef"' in json.dumps(
-                request.expected_schema
-            ):
-                raise HTTPException(422, "Schema references are not supported in milestone A")
         return await app.state.router.solve(request)
 
     @app.get("/v1/providers")
@@ -117,6 +106,39 @@ def create_app(router=None, client_keys=None, admin_key=None):
         if row is None or row.client_id != identity:
             raise HTTPException(404, "Request not found")
         return row
+
+    @app.get("/v1/models/performance", dependencies=[Depends(administrator)])
+    def performance():
+        with app.state.router.sessions() as session:
+            rows = session.scalars(
+                select(ModelTaskPerformance)
+                .order_by(
+                    ModelTaskPerformance.provider_id,
+                    ModelTaskPerformance.model_id,
+                    ModelTaskPerformance.task_class,
+                )
+                .limit(1000)
+            )
+            return [
+                {
+                    "provider_id": row.provider_id,
+                    "model_id": row.model_id,
+                    "task_class": row.task_class,
+                    "attempts": row.attempts,
+                    "accepted": row.accepted,
+                    "quality_failures": row.quality_failures,
+                    "infra_failures": row.infra_failures,
+                    "quota_failures": row.quota_failures,
+                    "unverified": row.unverified,
+                    "quality_samples": row.quality_samples,
+                    "average_quality": row.quality_sum / row.quality_samples
+                    if row.quality_samples
+                    else None,
+                    "hallucination_events": row.hallucination_events,
+                    "recent_quality": row.recent_quality,
+                }
+                for row in rows
+            ]
 
     @app.get("/v1/requests/{request_id}")
     def request_detail(request_id: str, identity=Depends(client)):

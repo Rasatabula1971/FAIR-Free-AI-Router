@@ -37,10 +37,29 @@ requirements, not separate authorization for deployment, paid inference or publi
   is available on the local build machine; the PostgreSQL test is prepared but skipped locally.
 - Production validation remains a gate before any live-provider integration.
 
+## Third increment: first Sprint B quality path
+
+- Explicit host validation contracts for bounded exact arithmetic and complete JSON reference
+  matching; accepted responses include output, provider/model, quality and verification scope.
+- Hard rejection overrides a passing contract for schema failures, invalid/incomplete output,
+  fabricated citation references, unsupported quotes and conflicting structured assertions.
+- Distinct `UNVERIFIED` attempt disposition prevents missing validator coverage from being
+  recorded as measured model failure. General, grounded, coding and high-impact tasks still
+  escalate when appropriate validators are unavailable.
+- Quality rejection retries a different eligible model; failed text is withheld. Validator
+  service errors return `FAILED` without charging them to model quality or availability.
+- Migration `0003` adds quality reports, escalation records and persistent model/task metrics.
+  Selector rankings now use those measured metrics with a neutral prior. Quota and infrastructure
+  failures do not lower measured quality. A small recent-quality window is retained.
+- Admin-only performance endpoint; accepted request history remains isolated by client.
+- Contract fingerprints preserve validation identity without storing host reference answers
+  or evidence in audit rows. See [QUALITY_CONTRACTS.md](QUALITY_CONTRACTS.md) for exact scope.
+
 ## Subsequent sprints
 
-- B: task-specific validators, quality calibration, verified acceptance, hallucination controls,
-  richer escalation and persistent model-task performance. No quality claims are made yet.
+- B (in progress): deterministic acceptance and persistent performance are implemented below.
+  Remaining work includes isolated code tests, broader grounding/consistency checks, independent
+  verification and quality calibration.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
@@ -83,3 +102,13 @@ The GitHub workflow is prepared locally and has not been executed on GitHub.
 - Actual application lifespan restart test uses migrated storage and demo configuration,
   preserving stop state, quota consumption and request history through two app instances.
 - PostgreSQL migration/audit-trigger job is defined in CI; remote CI and Docker remain unrun.
+
+## Validation of the third increment
+
+- Full suite: 96 passed, one PostgreSQL test skipped, two upstream deprecation warnings.
+- Lint, formatting and SQLite migration/schema-drift checks pass.
+- Regression coverage includes a deliberately hallucinating mock rejected before fallback,
+  exact arithmetic, malformed JSON, hard-reject precedence, private accepted output, ranking
+  changes across router restart, and separate accounting for quality/infra/quota/unverified outcomes.
+- Full Sprint B is not complete: isolated code tests, general claim/source alignment,
+  independent verification and calibrated quality scoring remain. Live providers are disabled.

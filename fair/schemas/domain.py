@@ -45,6 +45,7 @@ class AttemptDisposition(StrEnum):
     PRIVACY_BLOCK = "PRIVACY_BLOCK"
     TERMS_BLOCK = "TERMS_BLOCK"
     CANCELLED = "CANCELLED"
+    UNVERIFIED = "UNVERIFIED"
 
 
 PrivacyClass = Literal["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"]
@@ -99,11 +100,24 @@ class NormalizedModelRequest(DTO):
     max_output_tokens: int = 1024
 
 
+class Citation(DTO):
+    source_id: str = Field(min_length=1, max_length=128)
+    quote: str = Field(min_length=1, max_length=10000)
+
+
+class Assertion(DTO):
+    subject: str = Field(min_length=1, max_length=256)
+    predicate: str = Field(min_length=1, max_length=256)
+    value: str = Field(min_length=1, max_length=1024)
+
+
 class NormalizedModelResponse(DTO):
     provider_id: str
     model_id: str
-    text: str
+    text: str = Field(max_length=100000)
     finish_reason: str = "stop"
+    citations: list[Citation] = Field(default_factory=list, max_length=50)
+    assertions: list[Assertion] = Field(default_factory=list, max_length=50)
 
 
 class ProviderHealth(DTO):
@@ -121,10 +135,15 @@ class QuotaSnapshot(DTO):
 
 
 class QualityReport(DTO):
-    overall_score: float | None = None
+    overall_score: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     hard_reject: bool = False
     reject_reasons: list[str] = Field(default_factory=list)
-    verification_state: Literal["UNVERIFIED", "STRUCTURE_VALIDATED"] = "UNVERIFIED"
+    verification_state: Literal[
+        "UNVERIFIED", "STRUCTURE_VALIDATED", "DETERMINISTIC_ARITHMETIC", "HOST_REFERENCE_MATCH"
+    ] = "UNVERIFIED"
+    validator_results: dict[str, str] = Field(default_factory=dict)
+    engine_version: str = "deterministic-v1"
+    validation_fingerprint: str | None = None
 
 
 class Attempt(DTO):

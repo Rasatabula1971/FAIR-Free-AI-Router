@@ -6,12 +6,11 @@ PRIVACY = {
 
 
 class Selector:
-    def __init__(self, registry, quota, settings):
+    def __init__(self, registry, quota, settings, performance):
         self.registry = registry
         self.quota = quota
         self.settings = settings
-        # Measured scores only; neutral prior until the quality milestone.
-        self.quality: dict[tuple[str, str, str], float] = {}
+        self.performance = performance
 
     def candidates(self, request, profile, tried):
         candidates = []
@@ -31,15 +30,15 @@ class Selector:
                     continue
                 if profile.context_tokens_estimate > model.context_window:
                     continue
-                quality = self.quality.get(
-                    (spec.provider_id, model.model_id, profile.task_class), 0.5
+                quality, reliability = self.performance.scores(
+                    spec.provider_id, model.model_id, profile.task_class
                 )
                 remaining = self.quota.remaining(spec)
                 headroom = remaining / spec.request_limit if spec.request_limit else 0.5
                 score = (
                     self.settings.quality_weight * quality
                     + self.settings.quota_weight * headroom
-                    + self.settings.reliability_weight * 0.5
+                    + self.settings.reliability_weight * reliability
                 )
                 candidates.append((score, spec, model))
         return sorted(
