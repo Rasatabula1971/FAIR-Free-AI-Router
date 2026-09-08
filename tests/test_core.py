@@ -97,7 +97,8 @@ def test_quota_scarcity_preserves_near_equal_model(make_router):
     router = make_router([(provider(n, request_limit=100), MockAdapter(n)) for n in ("a", "b")])
     router.selector.quality[("a", "model", "general")] = 0.85
     router.selector.quality[("b", "model", "general")] = 0.83
-    router.quota.state("a").used = 95
+    for _ in range(95):
+        router.quota.reserve(router.registry.providers["a"])
     assert (
         router.selector.candidates(req(), profile_task(req(), router.thresholds), set())[0][
             1
@@ -125,7 +126,7 @@ async def test_failover_and_no_error_or_raw_text_leak(make_router, error, dispos
     assert "secret-key-canary" not in result.model_dump_json()
     assert not router.selector.quality
     if isinstance(error, QuotaExceeded):
-        assert router.registry.providers["a"].status == "QUOTA_EXHAUSTED"
+        assert router.quota.effective_status(router.registry.providers["a"]) == "QUOTA_EXHAUSTED"
     with router.sessions() as session:
         assert len(list(session.scalars(select(RoutingAttempt)))) == 2
 

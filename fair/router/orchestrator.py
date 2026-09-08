@@ -3,6 +3,7 @@ from time import monotonic
 from uuid import uuid4
 
 from fair.classifier.task_profiler import profile_task
+from fair.governor.kill_switch import KillSwitch
 from fair.governor.policy import admit_provider
 from fair.providers.base import AuthenticationFailed, QuotaExceeded, RateLimited
 from fair.quality.engine import evaluate
@@ -10,6 +11,7 @@ from fair.quota.governor import QuotaGovernor
 from fair.router.selector import Selector
 from fair.schemas.api import SolveResponse
 from fair.schemas.db import AuditEvent, RoutingAttempt, TaskRequest
+from fair.schemas.db import TaskProfile as ProfileRow
 from fair.schemas.domain import Attempt, NormalizedModelRequest
 
 
@@ -19,11 +21,20 @@ class Router:
         self.settings = settings
         self.thresholds = thresholds
         self.sessions = sessions
-        self.quota = QuotaGovernor(settings)
+        registry.persist(sessions)
+        self.quota = QuotaGovernor(settings, sessions)
         self.selector = Selector(registry, self.quota, settings)
-        self.stopped = False
+        self.kill_switch = KillSwitch(sessions)
         # Milestone A intentionally serializes requests to make reservations/probes atomic.
         self.lock = asyncio.Lock()
+
+    @property
+    def stopped(self):
+        return self.kill_switch.stopped
+
+    @stopped.setter
+    def stopped(self, value):
+        self.kill_switch.set(value)
 
     def audit(self, session, request_id, client_id, event_type, payload):
         session.add(
@@ -54,6 +65,7 @@ class Router:
                 )
             )
             session.flush()
+            session.add(ProfileRow(request_id=request_id, **profile.model_dump(mode="json")))
             self.audit(
                 session, request_id, request.client_id, "PROFILED", profile.model_dump(mode="json")
             )
@@ -109,17 +121,17 @@ class Router:
                 quality = evaluate(request, response)
                 disposition = "QUALITY_FAILURE"
                 reason = "QUALITY_VERIFICATION_UNAVAILABLE"
-            except QuotaExceeded:
-                self.quota.state(spec.provider_id).exhausted = True
-                spec.status = "QUOTA_EXHAUSTED"
+            except QuotaExceeded as error:
+                self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
                 disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
             except RateLimited:
                 self.quota.throttle(spec.provider_id)
                 disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
             except AuthenticationFailed:
-                spec.status = "SECURITY_BLOCKED"
+                self.quota.block_security(spec.provider_id)
                 disposition, error_type = "INFRA_FAILURE", "AUTHENTICATION_FAILED"
             except asyncio.CancelledError:
+                self.quota.failure(spec.provider_id)
                 with self.sessions.begin() as session:
                     row = session.get(TaskRequest, request_id)
                     row.status = "CANCELLED"

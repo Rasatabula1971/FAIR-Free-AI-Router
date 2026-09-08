@@ -106,6 +106,20 @@ class NormalizedModelResponse(DTO):
     finish_reason: str = "stop"
 
 
+class ProviderHealth(DTO):
+    provider_id: str
+    state: ProviderState
+    source: Literal["OBSERVED", "OFFLINE_FIXTURE"]
+
+
+class QuotaSnapshot(DTO):
+    provider_id: str
+    quota_unit: Literal["requests"] = "requests"
+    quota_limit: int | None = Field(default=None, ge=0)
+    quota_remaining_estimate: int | None = Field(default=None, ge=0)
+    reset_at: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
 class QualityReport(DTO):
     overall_score: float | None = None
     hard_reject: bool = False

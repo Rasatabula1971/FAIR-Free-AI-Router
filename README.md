@@ -1,7 +1,7 @@
 # FAIR Free AI Router
 
 FAIR is a governed routing service for zero-cost AI inference. This repository contains the
-first runnable core increment of Sprint A. It is not yet a production AI service.
+Sprint A routing core with durable governance state. It is not yet a production AI service.
 
 The core enforces free-only provider admission at registration, selection and execution;
 profiles tasks; filters models by capability, context and privacy; reserves request quotas;
@@ -30,6 +30,12 @@ execution-boundary checks, kill switches, capability/privacy/context filters, ta
 selection, quota scarcity, 429/quota/outage/timeout failover, cooldown recovery, bounded
 attempts, conservative concurrent reservations, schema validation, authenticated client
 isolation and persisted audit lineage.
+
+Restart regressions also cover durable stop/resume, reservations, exhaustion, authentication
+blocks, throttle deadlines, circuit history, single recovery probes and abandoned probes.
+The migration test verifies that existing audit history and the last stop command survive
+an upgrade. A separate PostgreSQL migration/audit-trigger test runs when
+`FAIR_TEST_POSTGRES_URL` is set; GitHub Actions includes a PostgreSQL service for that check.
 
 ## Local service with PostgreSQL
 
@@ -69,17 +75,30 @@ For an existing local PostgreSQL instance, set `FAIR_DATABASE_URL`, run
 | `GET /healthz` | Public process health |
 | `POST /v1/solve` | Client key; body identity must match key |
 | `GET /v1/providers` | Client key; safe registry summary |
+| `GET /v1/providers/{id}/health` | Client key; persisted quota and circuit observations |
 | `GET /v1/requests/{id}` | Owning client only |
 | `GET /v1/requests/{id}/audit` | Owning client only |
 | `POST /v1/system/stop` | Separate admin key |
 | `POST /v1/system/resume` | Separate admin key |
 
 Stop prevents subsequent model dispatches, including retries; it does not cancel an
-already-running attempt. The switch and quota counters are process-local. Use one worker.
+already-running attempt. The switch, request counters, failure windows, quota exhaustion,
+authentication blocks and recovery deadlines persist in the database. Use one worker;
+multi-worker scheduling and distributed dispatch coordination are not implemented.
 API keys are held only in application authentication closures; tasks and keys are not stored
 in request/audit rows. Audit ORM updates/deletes are rejected, and the PostgreSQL migration
 adds a database trigger rejecting update/delete/truncate. Database-owner DDL is outside that
 boundary. SQLite is for tests only.
+
+Provider YAML remains the authority for configured eligibility and models. Startup records
+relational snapshots without clearing runtime blocks or quota consumption. A quota reset
+must be explicitly observed by the adapter; no daily/monthly reset is invented. Exhaustion
+without a known reset, and authentication blocks, remain blocked across restarts. An operator
+recovery workflow for those states is still pending. Health reads report stored observations;
+they do not make live provider calls. Deadline fields use UTC Unix seconds.
+
+After pulling a schema change, run `alembic upgrade head` before starting the service.
+Existing profile JSON remains readable; new requests also receive relational profile rows.
 
 ## Build roadmap and limitations
 

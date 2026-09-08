@@ -13,3 +13,26 @@ jobs:
       - run: alembic upgrade head && alembic check
         env:
           FAIR_DATABASE_URL: sqlite:///migration-test.db
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: fair
+          POSTGRES_PASSWORD: fair
+          POSTGRES_DB: fair_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd 'pg_isready -U fair -d fair_test'
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - run: pip install -e '.[dev]'
+      - run: pytest -q tests/test_migrations.py
+        env:
+          FAIR_TEST_POSTGRES_URL: postgresql+psycopg://fair:fair@localhost:5432/fair_test

@@ -54,6 +54,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
                         ),
                         MockAdapter(name),
                     )
+                    registry.adapters[name].models = registry.providers[name].models
             app.state.router = Router(
                 registry,
                 RoutingSettings(**load_yaml("routing.yaml")),
@@ -104,7 +105,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return [
             {
                 "provider_id": p.provider_id,
-                "status": p.status,
+                "status": app.state.router.quota.effective_status(p),
                 "access_class": p.access_class,
                 "models": [m.model_id for m in p.models],
             }
@@ -139,11 +140,26 @@ def create_app(router=None, client_keys=None, admin_key=None):
 
     def set_stop(stopped):
         active = app.state.router
-        # Persist audit before acknowledging the change.
-        with active.sessions.begin() as session:
-            active.audit(session, None, "admin", "SYSTEM_STOP" if stopped else "SYSTEM_RESUME", {})
         active.stopped = stopped
-        return {"stopped": stopped, "scope": "current_process"}
+        return {"stopped": stopped, "scope": "database"}
+
+    @app.get("/v1/providers/{provider_id}/health")
+    def provider_health(provider_id: str, identity=Depends(client)):
+        active = app.state.router
+        spec = active.registry.providers.get(provider_id)
+        if spec is None:
+            raise HTTPException(404, "Provider not found")
+        state = active.quota.state(provider_id)
+        return {
+            "provider_id": provider_id,
+            "status": active.quota.effective_status(spec),
+            "circuit_state": state.circuit_state,
+            "requests_used": state.used,
+            "request_limit": spec.request_limit,
+            "reset_at": state.reset_at,
+            "blocked_until": state.blocked_until,
+            "source": "persisted_observations",
+        }
 
     @app.post("/v1/system/stop", dependencies=[Depends(administrator)])
     async def stop():
