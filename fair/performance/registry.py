@@ -30,7 +30,14 @@ class PerformanceRegistry:
                 row.quality_sum += score
                 row.recent_quality = (row.recent_quality + [score])[-20:]
             if any(
-                reason in {"FABRICATED_CITATION", "UNSUPPORTED_CITATION"}
+                reason
+                in {
+                    "FABRICATED_CITATION",
+                    "UNSUPPORTED_CITATION",
+                    "UNSUPPORTED_CLAIM",
+                    "CONTRADICTED_CLAIM",
+                    "CLAIM_OVER_CONFLICTING_EVIDENCE",
+                }
                 for reason in attempt.quality.reject_reasons
             ):
                 row.hallucination_events += 1

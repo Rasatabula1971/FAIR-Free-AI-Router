@@ -135,6 +135,21 @@ class QuotaSnapshot(DTO):
     reset_at: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
+class ClaimCheck(DTO):
+    claim_id: str
+    status: Literal[
+        "SUPPORTED",
+        "CONTRADICTED",
+        "UNSUPPORTED",
+        "CONFLICTING_EVIDENCE",
+        "INVALID_PROVENANCE",
+        "MISSING",
+        "ABSTAINED",
+        "INSUFFICIENT_EVIDENCE",
+    ]
+    evidence_count: int = Field(ge=0)
+
+
 class QualityReport(DTO):
     overall_score: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     hard_reject: bool = False
@@ -145,11 +160,13 @@ class QualityReport(DTO):
         "DETERMINISTIC_ARITHMETIC",
         "HOST_REFERENCE_MATCH",
         "SOURCE_DATA_MATCH",
+        "STRUCTURED_CLAIMS_SUPPORTED",
         "BOUNDED_CODE_TESTS",
         "NATIVE_CODE_TESTS",
     ] = "UNVERIFIED"
     validator_results: dict[str, str] = Field(default_factory=dict)
-    engine_version: str = "deterministic-v4"
+    claim_checks: list[ClaimCheck] = Field(default_factory=list)
+    engine_version: str = "deterministic-v5"
     validation_fingerprint: str | None = None
 
 

@@ -3,6 +3,7 @@
 import json
 
 from fair.quality.arithmetic import numeric_answer
+from fair.quality.claims import canonical, comparable_claims
 from fair.quality.json_data import strict_json
 
 
@@ -27,6 +28,12 @@ def compare(request, first, second, both_validated):
     try:
         if kind == "arithmetic":
             return numeric_answer(first.text) == numeric_answer(second.text), "EXACT_VALUE"
+        if kind == "grounded_claims":
+            return (
+                canonical(comparable_claims(first.text))
+                == canonical(comparable_claims(second.text)),
+                "EXACT_VALUE",
+            )
         if kind in {"reference_json", "grounded_json"}:
             return (
                 json.dumps(strict_json(first.text), sort_keys=True)

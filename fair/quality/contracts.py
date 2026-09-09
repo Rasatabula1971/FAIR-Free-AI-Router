@@ -54,6 +54,40 @@ class GroundedValidation(DTO):
         return value
 
 
+class FactKey(DTO):
+    subject: str = Field(min_length=1, max_length=128)
+    predicate: str = Field(min_length=1, max_length=128)
+    context: str = Field(min_length=1, max_length=256)
+
+    @field_validator("subject", "predicate", "context")
+    @classmethod
+    def exact_nonblank_key(cls, value):
+        if value != value.strip():
+            raise ValueError("Fact keys must not have surrounding whitespace")
+        return value
+
+    def key(self):
+        return self.subject, self.predicate, self.context
+
+
+class ClaimTarget(FactKey):
+    claim_id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+class ClaimsValidation(DTO):
+    kind: Literal["grounded_claims"]
+    claims: list[ClaimTarget] = Field(min_length=1, max_length=20)
+
+    @field_validator("claims")
+    @classmethod
+    def unique_claims(cls, value):
+        if len({claim.claim_id for claim in value}) != len(value):
+            raise ValueError("Claim IDs must be unique")
+        if len({claim.key() for claim in value}) != len(value):
+            raise ValueError("Requested fact keys must be unique")
+        return value
+
+
 class FunctionCase(DTO):
     arguments: list[StrictInt | StrictBool] = Field(max_length=8)
     expected: StrictInt | StrictBool
@@ -95,6 +129,7 @@ ValidationContract = Annotated[
     ArithmeticValidation
     | ReferenceValidation
     | GroundedValidation
+    | ClaimsValidation
     | FunctionValidation
     | NativeFunctionValidation,
     Field(discriminator="kind"),

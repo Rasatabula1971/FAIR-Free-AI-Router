@@ -4,6 +4,7 @@ import json
 from jsonschema import Draft202012Validator, ValidationError
 
 from fair.quality.arithmetic import calculate, numeric_answer
+from fair.quality.claims import validate_claims
 from fair.quality.code_validator import validate_function
 from fair.quality.grounding import grounded_result
 from fair.quality.json_data import strict_json
@@ -13,6 +14,7 @@ from fair.schemas.domain import QualityReport
 def evaluate(request, profile, response, *, native_result=None) -> QualityReport:
     reasons = []
     checks = {}
+    claim_checks = []
     verification = "UNVERIFIED"
     score = None
     if not response.text.strip():
@@ -46,7 +48,11 @@ def evaluate(request, profile, response, *, native_result=None) -> QualityReport
             reasons.append("MATERIAL_CONTRADICTION")
         assertions[key] = claim.value.strip().casefold()
     kind = request.validation.kind if request.validation is not None else None
-    if profile.requires_grounding and not response.citations and kind != "grounded_json":
+    if (
+        profile.requires_grounding
+        and not response.citations
+        and kind not in {"grounded_json", "grounded_claims"}
+    ):
         reasons.append("GROUNDING_REQUIRED")
 
     if request.validation is not None:
@@ -81,6 +87,17 @@ def evaluate(request, profile, response, *, native_result=None) -> QualityReport
             verification = "SOURCE_DATA_MATCH" if matched else "UNVERIFIED"
             if not matched:
                 reasons.append("GROUNDED_DATA_MISMATCH")
+        elif kind == "grounded_claims":
+            matched, failures, claim_checks = validate_claims(
+                response.text, request.validation, request.evidence
+            )
+            reasons.extend(failures)
+            checks[kind] = "INCOMPLETE" if matched is None else "PASS" if matched else "FAIL"
+            checks["claim_count"] = str(len(request.validation.claims))
+            checks["supported_claim_count"] = str(
+                sum(claim.status == "SUPPORTED" for claim in claim_checks)
+            )
+            verification = "STRUCTURED_CLAIMS_SUPPORTED" if matched else "UNVERIFIED"
         elif kind == "native_python_function":
             matched, failure = native_result if native_result is not None else (None, None)
             checks[kind] = "UNAVAILABLE" if matched is None else "PASS" if matched else "FAIL"
@@ -99,7 +116,7 @@ def evaluate(request, profile, response, *, native_result=None) -> QualityReport
         score = None if matched is None else 100.0 if matched else 0.0
 
     unsupported = (
-        (profile.requires_grounding and kind != "grounded_json")
+        (profile.requires_grounding and kind not in {"grounded_json", "grounded_claims"})
         or request.freshness_required
         or bool(
             profile.required_capabilities
@@ -124,6 +141,7 @@ def evaluate(request, profile, response, *, native_result=None) -> QualityReport
         reject_reasons=list(dict.fromkeys(reasons)),
         verification_state=verification,
         validator_results=checks,
+        claim_checks=claim_checks,
         validation_fingerprint=hashlib.sha256(
             json.dumps(
                 {
@@ -150,6 +168,7 @@ def acceptable(report, profile):
             "DETERMINISTIC_ARITHMETIC",
             "HOST_REFERENCE_MATCH",
             "SOURCE_DATA_MATCH",
+            "STRUCTURED_CLAIMS_SUPPORTED",
             "BOUNDED_CODE_TESTS",
             "NATIVE_CODE_TESTS",
         }
