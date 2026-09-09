@@ -21,7 +21,7 @@ def profile_task(request: SolveRequest, thresholds: dict[str, float]) -> TaskPro
         task_class = request.validation.kind
         if request.validation.kind in {"reference_json", "grounded_json"}:
             required.add("structured_output")
-        elif request.validation.kind == "python_function":
+        elif request.validation.kind in {"python_function", "native_python_function"}:
             required.add("coding")
     if request.task_type == "vision":
         required.add("vision")
@@ -54,7 +54,7 @@ def model_task(request):
                 "\nReturn only the exact integer, decimal or fraction for: "
                 + request.validation.expression
             )
-        elif request.validation.kind == "python_function":
+        elif request.validation.kind in {"python_function", "native_python_function"}:
             task += "\nReturn only one Python function named " + request.validation.function_name
             task += (
                 " with "

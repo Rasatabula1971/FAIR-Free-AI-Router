@@ -146,9 +146,10 @@ class QualityReport(DTO):
         "HOST_REFERENCE_MATCH",
         "SOURCE_DATA_MATCH",
         "BOUNDED_CODE_TESTS",
+        "NATIVE_CODE_TESTS",
     ] = "UNVERIFIED"
     validator_results: dict[str, str] = Field(default_factory=dict)
-    engine_version: str = "deterministic-v3"
+    engine_version: str = "deterministic-v4"
     validation_fingerprint: str | None = None
 
 

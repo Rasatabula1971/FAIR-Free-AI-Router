@@ -9,6 +9,7 @@ from sqlalchemy import select
 from fair.config import RoutingSettings, load_yaml
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
+from fair.quality.sandbox import DockerSandbox
 from fair.router.orchestrator import Router
 from fair.schemas.api import SolveRequest, SolveResponse
 from fair.schemas.db import AuditEvent, ModelTaskPerformance, database
@@ -59,6 +60,9 @@ def create_app(router=None, client_keys=None, admin_key=None):
                 RoutingSettings(**load_yaml("routing.yaml")),
                 load_yaml("quality_thresholds.yaml"),
                 sessions,
+                sandbox=DockerSandbox(os.environ["FAIR_SANDBOX_IMAGE"])
+                if os.environ.get("FAIR_SANDBOX_IMAGE")
+                else None,
             )
         else:
             app.state.router = router

@@ -58,3 +58,17 @@ jobs:
       - name: Remove the disposable CI stack
         if: always()
         run: docker compose -f infra/docker/docker-compose.yml down --volumes --remove-orphans
+  native-sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - run: pip install -e '.[dev]'
+      - name: Build the dedicated sandbox image
+        run: |
+          docker build -f infra/sandbox/Dockerfile --iidfile sandbox-image.id .
+          echo "FAIR_TEST_SANDBOX_IMAGE=$(cat sandbox-image.id)" >> "$GITHUB_ENV"
+      - name: Verify native execution, OS limits and cancellation cleanup
+        run: pytest -q tests/test_native_docker.py

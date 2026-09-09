@@ -87,8 +87,16 @@ class FunctionValidation(DTO):
         return value
 
 
+class NativeFunctionValidation(FunctionValidation):
+    kind: Literal["native_python_function"]
+
+
 ValidationContract = Annotated[
-    ArithmeticValidation | ReferenceValidation | GroundedValidation | FunctionValidation,
+    ArithmeticValidation
+    | ReferenceValidation
+    | GroundedValidation
+    | FunctionValidation
+    | NativeFunctionValidation,
     Field(discriminator="kind"),
 ]
 

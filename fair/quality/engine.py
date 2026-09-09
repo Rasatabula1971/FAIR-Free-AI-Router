@@ -10,7 +10,7 @@ from fair.quality.json_data import strict_json
 from fair.schemas.domain import QualityReport
 
 
-def evaluate(request, profile, response) -> QualityReport:
+def evaluate(request, profile, response, *, native_result=None) -> QualityReport:
     reasons = []
     checks = {}
     verification = "UNVERIFIED"
@@ -81,6 +81,13 @@ def evaluate(request, profile, response) -> QualityReport:
             verification = "SOURCE_DATA_MATCH" if matched else "UNVERIFIED"
             if not matched:
                 reasons.append("GROUNDED_DATA_MISMATCH")
+        elif kind == "native_python_function":
+            matched, failure = native_result if native_result is not None else (None, None)
+            checks[kind] = "UNAVAILABLE" if matched is None else "PASS" if matched else "FAIL"
+            checks["code_test_count"] = str(len(request.validation.cases))
+            verification = "NATIVE_CODE_TESTS" if matched else "UNVERIFIED"
+            if matched is False:
+                reasons.append(failure)
         else:
             matched, failure = validate_function(response.text, request.validation)
             checks["python_function"] = "PASS" if matched else "FAIL"
@@ -89,7 +96,7 @@ def evaluate(request, profile, response) -> QualityReport:
             if not matched:
                 reasons.append(failure)
         # 100 means all deterministic contract checks passed, not a truth probability.
-        score = 100.0 if matched else 0.0
+        score = None if matched is None else 100.0 if matched else 0.0
 
     unsupported = (
         (profile.requires_grounding and kind != "grounded_json")
@@ -98,7 +105,7 @@ def evaluate(request, profile, response) -> QualityReport:
             profile.required_capabilities
             - (
                 {"structured_output", "coding"}
-                if kind == "python_function"
+                if kind in {"python_function", "native_python_function"}
                 else {"structured_output"}
             )
         )
@@ -144,5 +151,6 @@ def acceptable(report, profile):
             "HOST_REFERENCE_MATCH",
             "SOURCE_DATA_MATCH",
             "BOUNDED_CODE_TESTS",
+            "NATIVE_CODE_TESTS",
         }
     )

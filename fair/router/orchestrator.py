@@ -18,11 +18,12 @@ from fair.schemas.domain import Attempt, CrossCheckReport, NormalizedModelReques
 
 
 class Router:
-    def __init__(self, registry, settings, thresholds, sessions):
+    def __init__(self, registry, settings, thresholds, sessions, sandbox=None):
         self.registry = registry
         self.settings = settings
         self.thresholds = thresholds
         self.sessions = sessions
+        self.sandbox = sandbox
         registry.persist(sessions)
         self.quota = QuotaGovernor(settings, sessions)
         self.performance = PerformanceRegistry(sessions)
@@ -134,10 +135,26 @@ class Router:
         else:
             try:
                 quality = evaluate(request, profile, response)
+                if (
+                    request.validation is not None
+                    and request.validation.kind == "native_python_function"
+                    and self.sandbox is not None
+                    and not quality.hard_reject
+                ):
+                    native_result = await self.sandbox.validate(response.text, request.validation)
+                    quality = evaluate(request, profile, response, native_result=native_result)
+                    quality.validator_results["sandbox_image_id"] = self.sandbox.image_id
+            except asyncio.CancelledError:
+                cancelled = True
+                quality = None
+                error_type = "REQUEST_CANCELLED"
             except Exception:
+                quality = None
                 validator_failed = True
                 error_type = "VALIDATION_SERVICE_FAILED"
-            if acceptable(quality, profile):
+            if cancelled:
+                disposition = "CANCELLED"
+            elif acceptable(quality, profile):
                 disposition = "ACCEPTED"
             elif quality is not None and (quality.hard_reject or quality.overall_score is not None):
                 disposition = "QUALITY_FAILURE"
@@ -204,6 +221,9 @@ class Router:
             attempts.append(attempt)
             report.attempts_count += 1
             report.verification_attempt_number = attempt.attempt_number
+            if self.stopped:
+                report.state = "STOPPED"
+                break
             if failed:
                 report.state = "SERVICE_FAILED"
                 break
@@ -296,6 +316,9 @@ class Router:
             tried.add((attempt.provider_id, attempt.model_id))
             attempts.append(attempt)
             if validator_failed:
+                break
+            if self.stopped and not required:
+                reason = "SYSTEM_STOPPED"
                 break
             if attempt.disposition != "ACCEPTED":
                 continue

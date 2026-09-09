@@ -33,7 +33,7 @@ def compare(request, first, second, both_validated):
                 == json.dumps(strict_json(second.text), sort_keys=True),
                 "EXACT_VALUE",
             )
-        if kind == "python_function" and both_validated:
+        if kind in {"python_function", "native_python_function"} and both_validated:
             # Both already passed the identical hidden host cases. Text may legitimately differ.
             return True, "HOST_TEST_CASES"
     except (ValueError, RecursionError):

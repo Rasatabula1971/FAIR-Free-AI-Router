@@ -67,6 +67,7 @@ class SolveResponse(DTO):
         "HOST_REFERENCE_MATCH",
         "SOURCE_DATA_MATCH",
         "BOUNDED_CODE_TESTS",
+        "NATIVE_CODE_TESTS",
     ] = "UNVERIFIED"
     output: str | None = None
     provider_id: str | None = None
