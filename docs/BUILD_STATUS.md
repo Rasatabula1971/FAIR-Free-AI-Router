@@ -342,5 +342,8 @@ examples and acceptance scope.
   No database migration or quality-engine version change is required (`deterministic-v8`).
 - Local validation: 487 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
   two upstream deprecation warnings. Lint, formatting and SQLite migration/schema checks pass.
-  GitHub integration validation is pending. Next is Step 6: operational security and recovery.
-  Live providers remain disabled.
+  All four GitHub jobs passed for code commit `b873cb5`: core, PostgreSQL, packaged Docker API
+  and native sandbox. Evidence:
+  [run 34392674807](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34392674807).
+  Step 5 is complete within the single-process scope. Next is Step 6: operational security and
+  recovery. Live providers remain disabled.
