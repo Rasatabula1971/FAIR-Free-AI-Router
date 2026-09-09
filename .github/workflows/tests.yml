@@ -36,3 +36,25 @@ jobs:
       - run: pytest -q tests/test_migrations.py
         env:
           FAIR_TEST_POSTGRES_URL: postgresql+psycopg://fair:fair@localhost:5432/fair_test
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Disposable credentials for this isolated CI stack only.
+      FAIR_CLIENT_KEYS: '{"smoke":"ci-smoke-client"}'
+      FAIR_ADMIN_KEY: ci-smoke-admin
+      FAIR_DEMO_MODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.13'}
+      - name: Build and start the packaged application
+        run: docker compose -f infra/docker/docker-compose.yml up -d --build
+      - name: Verify HTTP routing and persistence across restart
+        run: python scripts/docker_smoke.py
+      - name: Show container diagnostics on failure
+        if: failure()
+        run: docker compose -f infra/docker/docker-compose.yml logs --no-color --tail 150
+      - name: Remove the disposable CI stack
+        if: always()
+        run: docker compose -f infra/docker/docker-compose.yml down --volumes --remove-orphans
