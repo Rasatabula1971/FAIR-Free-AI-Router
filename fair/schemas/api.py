@@ -7,6 +7,7 @@ from pydantic import Field, model_validator
 from fair.quality.claims import fact_index
 from fair.quality.contracts import Evidence, SourcePolicy, ValidationContract
 from fair.quality.grounding import grounded_result
+from fair.router.scheduler import Priority
 from fair.schemas.domain import (
     DTO,
     Attempt,
@@ -21,6 +22,7 @@ from fair.schemas.domain import (
 
 class SolveRequest(DTO):
     client_id: str = Field(min_length=1, max_length=128)
+    priority: Priority = "P2"
     task: str = Field(min_length=1, max_length=100_000)
     task_type: str | None = Field(default=None, max_length=64)
     quality_level: Literal["commodity", "standard", "advanced", "high_impact_support"] = "standard"

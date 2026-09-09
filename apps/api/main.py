@@ -1,10 +1,11 @@
+import asyncio
 import hmac
 import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from sqlalchemy import select
 
 from fair.benchmarks.registry import BenchmarkRegistry
@@ -92,8 +93,11 @@ def create_app(router=None, client_keys=None, admin_key=None):
                 await app.state.router.sandbox.recover()
             yield
         finally:
-            if engine:
-                engine.dispose()
+            try:
+                await app.state.router.scheduler.close()
+            finally:
+                if engine:
+                    engine.dispose()
 
     app = FastAPI(title="FAIR Free AI Router", version="0.1.0", lifespan=lifespan)
 
@@ -113,10 +117,32 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return {"status": "ok", "milestone": "B", "live_inference_enabled": False}
 
     @app.post("/v1/solve", response_model=SolveResponse)
-    async def solve(request: SolveRequest, identity=Depends(client)):
+    async def solve(request: SolveRequest, connection: Request, identity=Depends(client)):
         if request.client_id != identity:
             raise HTTPException(403, "Client identity mismatch")
-        return await app.state.router.solve(request)
+
+        async def disconnected():
+            while (await connection.receive())["type"] != "http.disconnect":
+                pass
+
+        work = asyncio.create_task(app.state.router.solve(request))
+        watcher = asyncio.create_task(disconnected())
+        try:
+            done, _ = await asyncio.wait((work, watcher), return_when=asyncio.FIRST_COMPLETED)
+            if work not in done:
+                work.cancel()
+            return await asyncio.shield(work)
+        finally:
+            watcher.cancel()
+            if not work.done() and not work.cancelling():
+                work.cancel()
+            cleanup = asyncio.gather(work, watcher, return_exceptions=True)
+            # Keep the scheduler slot until provider/native cancellation cleanup has finished.
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
 
     @app.get("/v1/providers")
     def providers(identity=Depends(client)):
@@ -193,6 +219,10 @@ def create_app(router=None, client_keys=None, admin_key=None):
         active = app.state.router
         active.stopped = stopped
         return {"stopped": stopped, "scope": "database"}
+
+    @app.get("/v1/system/scheduler", dependencies=[Depends(administrator)])
+    async def scheduler_status():
+        return app.state.router.scheduler.snapshot()
 
     @app.get("/v1/providers/{provider_id}/health")
     def provider_health(provider_id: str, identity=Depends(client)):

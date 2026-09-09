@@ -27,6 +27,7 @@ class ProviderState(StrEnum):
 
 class RequestStatus(StrEnum):
     RECEIVED = "RECEIVED"
+    QUEUED = "QUEUED"
     PROFILED = "PROFILED"
     ROUTING = "ROUTING"
     EXECUTING = "EXECUTING"

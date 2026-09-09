@@ -17,6 +17,7 @@ from fair.quality.source_reviews import (
 )
 from fair.quality.thresholds import validate_thresholds
 from fair.quota.governor import QuotaGovernor
+from fair.router.scheduler import FairScheduler, SchedulingRejected
 from fair.router.selector import Selector
 from fair.schemas.api import SolveResponse
 from fair.schemas.db import AuditEvent, EscalationRecord, QualityRecord, RoutingAttempt, TaskRequest
@@ -52,8 +53,7 @@ class Router:
         self.performance = PerformanceRegistry(sessions)
         self.selector = Selector(registry, self.quota, settings, self.performance, self.benchmarks)
         self.kill_switch = KillSwitch(sessions)
-        # One worker until the shared scheduler/dispatch coordination is implemented.
-        self.lock = asyncio.Lock()
+        self.scheduler = FairScheduler(settings.scheduler)
 
     @property
     def stopped(self):
@@ -62,6 +62,8 @@ class Router:
     @stopped.setter
     def stopped(self, value):
         self.kill_switch.set(value)
+        if value:
+            self.scheduler.reject_pending("SYSTEM_STOPPED")
 
     def audit(self, session, request_id, client_id, event_type, payload):
         session.add(
@@ -323,8 +325,74 @@ class Router:
         return report, disagreement
 
     async def solve(self, request):
-        async with self.lock:
-            return await self._solve(request)
+        # Freeze mutable caller data before it waits for a turn.
+        request = request.model_copy(deep=True)
+        request_id = str(uuid4())
+        profile = profile_task(request, self.thresholds)
+        with self.sessions.begin() as session:
+            session.add(
+                TaskRequest(
+                    id=request_id,
+                    client_id=request.client_id,
+                    status="RECEIVED",
+                    profile_json=profile.model_dump(mode="json"),
+                )
+            )
+        ticket = None
+        try:
+            if self.stopped:
+                raise SchedulingRejected("SYSTEM_STOPPED")
+            ticket = self.scheduler.submit(
+                request.client_id, request.priority, len(request.model_dump_json().encode("utf-8"))
+            )
+            queued_at = monotonic()
+            with self.sessions.begin() as session:
+                session.get(TaskRequest, request_id).status = "QUEUED"
+                self.audit(
+                    session, request_id, request.client_id, "QUEUED", {"priority": request.priority}
+                )
+            await self.scheduler.wait(ticket)
+            with self.sessions.begin() as session:
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "SCHEDULED",
+                    {"priority": request.priority, "wait_ms": (monotonic() - queued_at) * 1000},
+                )
+            return await self._solve(request, request_id, profile)
+        except SchedulingRejected as error:
+            required = (
+                request.cross_check_required or request.quality_level == "high_impact_support"
+            )
+            result = SolveResponse(
+                request_id=request_id,
+                status="FAILED",
+                reason_code=error.reason,
+                attempts=[],
+                minimum_required=profile.minimum_quality_score,
+                cross_check=CrossCheckReport(
+                    required=required, state="NOT_RUN" if required else "NOT_REQUESTED"
+                ),
+            )
+            with self.sessions.begin() as session:
+                row = session.get(TaskRequest, request_id)
+                row.status, row.result_json = result.status, result.model_dump(mode="json")
+                self.audit(
+                    session, request_id, request.client_id, "FAILED", {"reason_code": error.reason}
+                )
+            return result
+        except BaseException as error:
+            status = "CANCELLED" if isinstance(error, asyncio.CancelledError) else "FAILED"
+            with self.sessions.begin() as session:
+                row = session.get(TaskRequest, request_id)
+                if row.status != status:
+                    row.status = status
+                    self.audit(session, request_id, request.client_id, status, {})
+            raise
+        finally:
+            if ticket is not None:
+                self.scheduler.release(ticket)
 
     def _source_report(self, request):
         try:
@@ -332,9 +400,7 @@ class Router:
         except Exception as error:
             raise SourceReviewUnavailable("SOURCE_REVIEW_SERVICE_FAILED") from error
 
-    async def _solve(self, request):
-        request_id = str(uuid4())
-        profile = profile_task(request, self.thresholds)
+    async def _solve(self, request, request_id, profile):
         attempts, tried = [], set()
         benchmark_checks = {}
         required = request.cross_check_required or request.quality_level == "high_impact_support"
@@ -343,15 +409,7 @@ class Router:
         )
         disagreement = "NOT_ASSESSED"
         with self.sessions.begin() as session:
-            session.add(
-                TaskRequest(
-                    id=request_id,
-                    client_id=request.client_id,
-                    status="PROFILED",
-                    profile_json=profile.model_dump(mode="json"),
-                )
-            )
-            session.flush()
+            session.get(TaskRequest, request_id).status = "PROFILED"
             session.add(ProfileRow(request_id=request_id, **profile.model_dump(mode="json")))
             self.audit(
                 session,

@@ -67,9 +67,9 @@ requirements, not separate authorization for deployment, paid inference or publi
   prose entailment remains outside the verified scope. Operator-reviewed source policies are
   implemented in the ninth increment. Offline benchmark calibration and reviewed workload
   qualification are implemented in the tenth increment. Step 4 expands numeric/list code
-  validation and scoped sandbox recovery in the eleventh increment. Step 5, fair client
-  scheduling, is next.
-- C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
+  validation and scoped sandbox recovery in the eleventh increment. Step 5 adds bounded
+  fair client scheduling in the twelfth increment.
+- C: distributed scheduling, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
 - F: remaining verified adapters, Python/JavaScript SDKs, cache and operating runbooks.
@@ -80,8 +80,8 @@ All live providers are inactive; even local Ollama remains disabled until its ad
 Unknown provider costs fail admission. Unknown request limits have no invented allowance;
 exhaustion without reset information stays blocked across restarts. No provider
 credential is needed for this increment. JSON schema references are disabled to prevent
-schema-driven network retrieval. Schema validation is structural only. Requests are serialized,
-and there is no multi-client fairness guarantee yet. Do not use this increment as a shared
+schema-driven network retrieval. Schema validation is structural only. One request runs at a
+time with bounded, process-local client fairness within each priority class. Do not use this increment as a shared
 production deployment or enable live inference before the subsequent gates are met.
 
 Provider configuration remains file-backed, with relational snapshots for inspection. Runtime
@@ -91,7 +91,7 @@ adapter observations cover request quotas; token/compute quota tracking is still
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment eleven.
+validation notes describe the results available at that time; current evidence is in increment twelve.
 
 ## Validation of the first increment
 
@@ -318,3 +318,29 @@ examples and acceptance scope.
   Step 4's bounded expansion is complete. Arbitrary Python, packages, production hostile-code
   isolation and Windows Docker verification remain outside the implemented scope. Next is
   Step 5: fair client scheduling. Live providers remain disabled.
+
+## Twelfth increment: fair client scheduling (Step 5)
+
+- Replaced the request lock with bounded waiting queues, strict P0–P4 priority and per-client
+  round-robin turns within each class. A turn includes the bounded primary/verification budget;
+  running work is not preempted. Higher-priority traffic can starve lower classes until timeout.
+- Client identity remains bound to its API key. Server configuration controls access to urgent
+  priorities; unlisted clients may request P2–P4. Total/per-client counts, queued UTF-8 payload
+  bytes, request bytes and monotonic wait deadlines bound admission and waiting.
+- Refusals, expiry and queued cancellation make no provider calls or quality samples. Queue
+  metadata and wait time are audited without raw payloads. HTTP disconnects cancel work; active
+  cancellation retains its turn through cleanup. Stop drains pending work and resume cannot
+  resurrect it. Shutdown waits for active cleanup before database disposal.
+- Added an admin-only aggregate scheduler endpoint and [SCHEDULING.md](SCHEDULING.md) covering
+  defaults, priority authorization, failure responses, retry guidance and operational limits.
+- Added 30 scheduler regressions covering contention, per-client FIFO, continuous arrivals,
+  priority order, admission bounds, timeout/dispatch races, cancellation, cleanup, shutdown,
+  client isolation and complete retry/verification turns. Packaged API smoke also verifies
+  scheduler access, urgent-priority denial and scheduling audit events.
+- Queue payloads remain volatile and process-local. Hard-crash queue replay/reconciliation,
+  distributed coordination and equal compute-time allocation remain outside this increment.
+  No database migration or quality-engine version change is required (`deterministic-v8`).
+- Local validation: 487 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
+  two upstream deprecation warnings. Lint, formatting and SQLite migration/schema checks pass.
+  GitHub integration validation is pending. Next is Step 6: operational security and recovery.
+  Live providers remain disabled.

@@ -130,6 +130,7 @@ For an existing local PostgreSQL instance, set `FAIR_DATABASE_URL`, run
 | `GET /v1/providers` | Client key; safe registry summary |
 | `GET /v1/providers/{id}/health` | Client key; persisted quota and circuit observations |
 | `GET /v1/models/performance` | Admin key; up to 1,000 aggregate model/task records |
+| `GET /v1/system/scheduler` | Admin key; process-local queue and priority counts |
 | `GET /v1/requests/{id}` | Owning client only |
 | `GET /v1/requests/{id}/audit` | Owning client only |
 | `POST /v1/system/stop` | Separate admin key |
@@ -139,6 +140,10 @@ Stop prevents subsequent model dispatches, including retries; it does not cancel
 already-running attempt. The switch, request counters, failure windows, quota exhaustion,
 authentication blocks and recovery deadlines persist in the database. Use one worker;
 multi-worker scheduling and distributed dispatch coordination are not implemented.
+The bounded scheduler uses strict P0–P4 priority and round-robin client turns within each
+class. Urgent classes require operator configuration; requests default to P2. See
+[SCHEDULING.md](docs/SCHEDULING.md) for queue limits, cancellation, failure codes and the
+volatile single-process scope.
 API keys are held only in application authentication closures; tasks and keys are not stored
 in request/audit rows. Audit ORM updates/deletes are rejected, and the PostgreSQL migration
 adds a database trigger rejecting update/delete/truncate. Database-owner DDL is outside that

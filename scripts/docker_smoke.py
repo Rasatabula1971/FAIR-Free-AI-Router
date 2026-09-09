@@ -49,6 +49,11 @@ def main():
     providers = request("/v1/providers", key=key)
     active = {p["provider_id"] for p in providers if p["status"] == "ACTIVE"}
     assert active == {"mock_primary", "mock_secondary"}
+    request("/v1/system/scheduler", key=key, expected=403)
+    scheduler = request("/v1/system/scheduler", key=admin)
+    assert scheduler["scope"] == "process" and scheduler["queued"] == scheduler["active"] == 0
+    denied = request("/v1/solve", key=key, payload=payload | {"priority": "P0"})
+    assert denied["reason_code"] == "PRIORITY_NOT_ALLOWED" and denied["attempts"] == []
     result = request("/v1/solve", key=key, payload=payload)
     assert result["status"] == "ESCALATION_REQUIRED"
     assert result["paid_inference_executed"] is False
@@ -59,6 +64,7 @@ def main():
     assert request(history_path, key=key) == result
     audit = request(history_path + "/audit", key=key)
     assert audit
+    assert [event["event_type"] for event in audit[:3]] == ["QUEUED", "SCHEDULED", "PROFILED"]
     request("/v1/system/stop", key=key, payload={}, expected=403)
     assert request("/v1/system/stop", key=admin, payload={})["stopped"] is True
     subprocess.run(
