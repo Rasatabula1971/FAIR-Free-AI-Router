@@ -20,8 +20,11 @@ answer and returns escalation or a service failure. Agreement does not establish
 
 See [quality contracts](docs/QUALITY_CONTRACTS.md) for the supported checks, verification
 labels, examples and limitations. These deterministic checks do not establish general
-factual correctness or validate arbitrary generated code. The code validator interprets only a
-small numeric subset; it never passes generated code to Python `exec`/`eval` or a subprocess.
+factual correctness or validate arbitrary generated code. The default code validator interprets
+only a small numeric subset. An opt-in `native_python_function` contract executes that same subset
+inside a constrained Docker container and reports `NATIVE_CODE_TESTS`. It is disabled unless
+a trusted local sandbox image is explicitly configured; see the quality contracts for setup
+and exact isolation limits.
 
 ## Development
 
@@ -60,6 +63,10 @@ GitHub Actions also builds and starts the actual Docker Compose package and runs
 `scripts/docker_smoke.py` against its HTTP API. This checks offline routing, authentication,
 request/audit persistence, and stop/resume across an API restart. The job uses disposable CI
 credentials and removes its database volume afterward; no live providers are enabled.
+
+A separate native-sandbox job builds the dedicated executor image and verifies native answers,
+OS restrictions, timeout/cancellation cleanup and output limits. Those real Docker tests are
+skipped locally unless `FAIR_TEST_SANDBOX_IMAGE` identifies an explicitly supplied test image.
 
 ## Local service with PostgreSQL
 

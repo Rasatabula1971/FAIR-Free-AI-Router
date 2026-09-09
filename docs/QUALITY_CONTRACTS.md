@@ -114,6 +114,57 @@ Only all-tests-passing functions may be accepted. Test coverage remains the host
 Passing verification state: `BOUNDED_CODE_TESTS`. Passing these cases does not establish correctness
 for untested inputs, native execution, external packages, filesystem/network access or arbitrary code.
 
+## Native Python function tests (opt-in)
+
+Use the same function name and case fields with `"kind": "native_python_function"` to require
+native CPython execution. Passing verification state: `NATIVE_CODE_TESTS`. The allowed language
+and host admission limits remain the numeric subset above; this is not arbitrary Python support.
+The bounded interpreter checks admission before Docker is contacted, and the trusted image
+repeats that check before compiling and executing the function. Each case gets a fresh namespace.
+
+The executor creates a new container per candidate, with no network, host mounts, provider keys,
+expected answers or inherited host environment. Only source, function name and test arguments
+travel over stdin. The router compares returned values to the expectations with strict types.
+Independent cross-check candidates get separate container executions. Native quality reports
+record the immutable image ID in `validator_results.sandbox_image_id`.
+
+Container restrictions: non-root UID 65534, read-only root filesystem, all Linux capabilities
+dropped, no new privileges, Docker's default seccomp filter, 128 MiB memory with no additional
+swap, half a CPU, 32 processes, a two-second CPU limit, zero file/core-dump limits, and 64 file
+descriptors. Each Docker operation has a ten-second wall deadline and each output stream has
+a 32 KiB limit. The trusted runner also limits address space and input size. These controls
+provide container isolation, not a separate kernel or a production hostile-code security claim.
+See [Docker runtime constraints](https://docs.docker.com/engine/containers/run/)
+and [seccomp](https://docs.docker.com/engine/security/seccomp/).
+
+Missing opt-in configuration yields `UNVERIFIED` with no invented quality score. Docker outages,
+timeouts, malformed output and cleanup failures produce `VALIDATION_SERVICE_FAILED`, withhold
+output and do not lower measured model quality. Candidate subset/test failures remain quality
+failures. Cancellation attempts forced container removal and persists cancelled lineage; an
+uncertain cleanup disables further native execution in that executor instance. An operator must
+resolve leftover containers/runtime failures before restarting it. A hard process/host crash can
+prevent cleanup, so this development executor is not an unattended sandbox service.
+
+The API factory enables this only when `FAIR_SANDBOX_IMAGE` holds a trusted, locally built image
+ID matching `sha256:` plus 64 lowercase hexadecimal characters. Tags and automatic image pulls
+are prohibited. The executor explicitly connects to the local Docker Unix socket on Linux or
+Docker Engine named pipe on Windows, ignoring remote Docker contexts. It never mounts that
+socket into generated-code containers. The default Compose API does not enable this feature
+or receive Docker-daemon access. Use a host-run, single-worker router for this opt-in development
+mode; Linux execution is tested in CI, and Windows Docker execution remains unverified.
+
+Example preparation from the repository root (Docker must already be installed):
+
+```powershell
+docker build -f infra/sandbox/Dockerfile -t fair-native-sandbox .
+$env:FAIR_SANDBOX_IMAGE = docker image inspect fair-native-sandbox --format '{{.Id}}'
+# Configure the database/client/admin keys and migrate as described in README.md, then:
+.\.venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Build this repository's dedicated sandbox image; do not substitute an unrelated image. Enabling
+the executor does not add or activate any live provider, and demo fixtures are not coding models.
+
 ## Hard rejection and incomplete coverage
 
 Schema failure, empty or incomplete response, arithmetic/reference mismatch, fabricated
@@ -131,8 +182,8 @@ subject/predicate/value assertions; they do not detect arbitrary prose contradic
 Fresh/current tasks remain unverified even when a narrow contract check passes. High-impact
 tasks require the independent cross-check described below before accepting a supported contract.
 Grounding is covered only for exact `grounded_json` extraction, and coding only for the
-`python_function` subset. Other required capabilities are not covered. Source credibility
-evaluation and native sandboxed code execution are not implemented. Schema-only and general
+`python_function` / `native_python_function` subset. Other required capabilities are not covered.
+Source credibility evaluation and arbitrary Python execution are not implemented. Schema-only and general
 prose responses remain unverified even if multiple models return identical text.
 
 ## Independent cross-checks
@@ -197,9 +248,9 @@ checks passed. The final request may still escalate because its required cross-c
 Consequently an escalation can legitimately have a best local score of 100; that score never
 overrides the independent-verification gate.
 
-The engine version is `deterministic-v3`. Existing quality reports retain their original engine
+The engine version is `deterministic-v4`. Existing quality reports retain their original engine
 version; new validation kinds have separate model/task statistics. Migration `0004` adds the
 nullable model independence group; historical attempts default to the `PRIMARY` role when read.
 
-Full Sprint B remains open for native sandboxed code validation, broader grounding/consistency
+Full Sprint B remains open for broader code execution support, grounding/consistency
 checks, source credibility evaluation and quality calibration. Live providers remain disabled.

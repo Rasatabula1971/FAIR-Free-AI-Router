@@ -59,9 +59,10 @@ requirements, not separate authorization for deployment, paid inference or publi
 ## Subsequent sprints
 
 - B (in progress): deterministic acceptance and persistent performance are implemented below.
-  Remaining work includes native sandboxed code tests, broader grounding/consistency checks,
+  Remaining work includes broader code execution support, grounding/consistency checks,
   source credibility evaluation and quality calibration. Scoped independent cross-checks are
   implemented in the fifth increment.
+  Opt-in native execution of the bounded numeric subset is implemented in the seventh increment.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
@@ -181,3 +182,27 @@ below describe the results available at that time; current integration evidence 
 - This verifies the development package on GitHub's Linux runner. Local Windows Docker remains
   untested; production deployment, live adapters and native generated-code sandboxing are still
   outside the verified scope. Sprint B grounding and quality calibration work remains.
+
+## Seventh increment: opt-in native function validation
+
+- Added `native_python_function`, retaining the bounded numeric language and hidden host cases.
+  Admitted source runs under native CPython in a dedicated container; only the router receives
+  expected answers. Results report `NATIVE_CODE_TESTS` and the immutable sandbox image ID.
+- Disabled by default. The operator must build and explicitly configure the trusted image.
+  Containers have no network or host mounts and run as non-root with a read-only filesystem,
+  dropped capabilities, no new privileges, seccomp, and memory/CPU/process/output limits.
+- Native validation integrates with quality fallback, independent checks, durable attempt
+  history and separate performance statistics. Executor failures do not lower model quality.
+  Stop during validation withholds results; cancellation attempts cleanup and records lineage.
+- Local suite: 238 passed, 10 integration tests skipped (one PostgreSQL and nine native Docker),
+  with two upstream warnings. Lint and formatting passed.
+- All four GitHub jobs passed for `744e4ac`: core, PostgreSQL, Docker API smoke, and native sandbox.
+  The nine native-container tests verify correct/incorrect/strict-type answers, actual router
+  acceptance, CPython semantics, OS restrictions, and timeout/cancellation/output-limit cleanup.
+  Evidence: [run 34300569475](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34300569475).
+- Engine version is `deterministic-v4`; no database migration is needed for the new JSON report
+  scope. Earlier persisted reports retain their versions.
+- This is limited development container isolation on Linux CI. Windows Docker, arbitrary code,
+  external packages and unattended orphan recovery are not verified/implemented. Broader
+  grounding, source credibility and calibrated quality scoring remain open. Live providers
+  remain disabled. See QUALITY_CONTRACTS.md for setup, limits and failure behavior.
