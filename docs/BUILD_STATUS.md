@@ -282,7 +282,9 @@ examples and acceptance scope.
   is the generated diagnostic fixture report.
 - Local validation: 383 tests passed, 10 PostgreSQL/native Docker tests skipped locally,
   two upstream deprecation warnings; lint, formatting and migration/schema checks pass.
-  GitHub integration verification for this increment is pending.
+  All four GitHub jobs passed for code commit `ba02085`: core, PostgreSQL migration/audit
+  checks, packaged Docker API smoke and native sandbox. Evidence:
+  [run 34354917233](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34354917233).
 - The Step 3 implementation is complete. Actual model qualification awaits representative
   workload recordings and independent operator review. Live collection, shadow scheduling,
   drift detection and general probabilistic confidence fitting remain future work. Live
