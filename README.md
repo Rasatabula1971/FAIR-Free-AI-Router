@@ -11,6 +11,9 @@ lineage and returns structured escalation when no eligible, verifiable answer ex
 **No live adapters are included or enabled.** Demo mode uses offline fixtures. A non-empty
 or schema-valid response is not evidence of factual correctness. Arithmetic, host-reference JSON,
 source-bound JSON extraction, and bounded Python-function test contracts can produce `ACCEPTED`.
+The `grounded_claims` contract additionally checks structured facts across all supplied sources,
+rejecting unsupported/contradicted claims and incomplete attribution. Missing or conflicting
+evidence supports explicit abstention, which remains unverified with no invented quality score.
 Unsupported tasks still escalate. Failed answers are withheld. Paid inference is never executed.
 
 Set `cross_check_required: true` to require a second provider/model to solve and validate the
@@ -52,6 +55,8 @@ Further tests cover source-path provenance, unsupported claims, hostile code con
 resource limits and code test failures that trigger another model attempt.
 Cross-check tests cover route diversity, alias groups, bounded failover, disagreement,
 answer isolation, high-impact enforcement and durable cancellation lineage.
+Claim-grounding tests cover cross-source conflicts, exact context/type matching, complete
+provenance, partial answers, abstention, source budgets, client isolation and private audit reports.
 
 Restart regressions also cover durable stop/resume, reservations, exhaustion, authentication
 blocks, throttle deadlines, circuit history, single recovery probes and abandoned probes.

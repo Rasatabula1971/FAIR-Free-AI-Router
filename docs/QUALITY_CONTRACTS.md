@@ -76,6 +76,91 @@ before inference. Sources remain untrusted data and are included in the model re
 Passing verification state: `SOURCE_DATA_MATCH`. This verifies exact extraction from the supplied
 data, not source credibility, real-world truth, freshness or arbitrary natural-language entailment.
 
+## Structured claims across sources
+
+`grounded_claims` checks requested facts against **all** supplied fact documents, including
+sources the model did not cite. It extends path extraction with explicit missing-evidence,
+contradiction, conflict and attribution checks. It does not infer facts from natural-language prose.
+
+```json
+{
+  "client_id": "my-app",
+  "task": "Report the supplied population fact",
+  "validation": {
+    "kind": "grounded_claims",
+    "claims": [{
+      "claim_id": "population",
+      "subject": "Example City",
+      "predicate": "population",
+      "context": "2025; residents"
+    }]
+  },
+  "evidence": [{
+    "source_id": "report",
+    "text": "{\"facts\":[{\"subject\":\"Example City\",\"predicate\":\"population\",\"context\":\"2025; residents\",\"value\":1000}]}"
+  }]
+}
+```
+
+The supported response is:
+
+```json
+{"claims":[{
+  "claim_id":"population",
+  "status":"answered",
+  "value":1000,
+  "sources":[{"source_id":"report","pointer":"/facts/0"}]
+}]}
+```
+
+The subject, predicate and context must match exactly, without case folding, synonym matching,
+unit conversion or date inference. The host must make context explicit: different reporting years,
+units or populations belong to different keys. Each key represents a single-valued fact; this
+contract does not represent multi-valued relations. All facts with that key must have the same
+strict JSON scalar value. `true`, `1` and `1.0` differ; `null` is a value, not an abstention.
+
+Every matching fact must appear once in the answer's provenance. Omitting a matching source,
+inventing a source, citing the wrong fact, duplicate references, unsupported values, missing
+requested claims and extra claims/fields cause rejection. Duplicate response claim IDs, including
+conflicting duplicate answers, are format failures. Claim and citation ordering may differ.
+No free-form explanation or uncaptured claim can accompany an accepted response.
+
+If another supplied document reports population `2000` for the same key, an unqualified answer
+of either `1000` or `2000` is rejected as `CLAIM_OVER_CONFLICTING_EVIDENCE`. The model cannot
+hide disagreement by omitting the other citation. An answer contrary to one consistent set of
+facts is `CONTRADICTED_CLAIM`; answering a key with no matching facts is `UNSUPPORTED_CLAIM`.
+These terms describe support within the supplied data, not independently established truth.
+
+When evidence is absent or conflicts, the appropriate response is:
+
+```json
+{"claims":[{"claim_id":"population","status":"abstained"}]}
+```
+
+Abstention yields `UNVERIFIED` with a null score and a claim status of `INSUFFICIENT_EVIDENCE`,
+`CONFLICTING_EVIDENCE`, or `ABSTAINED` when consistent evidence was available. It is not counted
+as a measured model failure. Any abstention prevents final acceptance, even when other claims
+are supported. If another claim is actually wrong, hard rejection still takes precedence.
+
+Passing verification state: `STRUCTURED_CLAIMS_SUPPORTED`. `quality.claim_checks` records
+requested claim IDs, statuses and matching evidence counts; raw source facts and rejected values
+are excluded from those reports and audit records. Accepted output and its provenance remain
+in client-owned request history. The existing `hallucination_events` metric additionally counts
+attempts with unsupported, contradicted or asserted-over-conflict claims; it is an evidence
+failure count, not a claim that the supplied evidence is true.
+
+Limits: 20 unique requested keys/IDs, 10 sources, 50 facts per source, 200 total facts, source
+text up to 10,000 characters, and scalar values up to 1,024 JSON-encoded characters. All source
+documents must contain only a `facts` array; each fact contains only `subject`, `predicate`,
+`context` and `value`. Malformed documents and budget violations fail request validation before
+any provider call. An empty facts array or no evidence is allowed, enabling explicit abstention.
+
+High-impact requests still require an independent eligible provider. Agreement ignores claim
+and citation ordering but preserves values and types; both answers must pass the grounding
+checks. Freshness, source credibility, prose entailment and unrelated task requirements remain
+outside this contract. Annotating prose as structured facts is the host's responsibility; this
+validator does not verify that annotation against the original prose.
+
 ## Bounded Python function tests
 
 ```json
@@ -181,7 +266,8 @@ subject/predicate/value assertions; they do not detect arbitrary prose contradic
 
 Fresh/current tasks remain unverified even when a narrow contract check passes. High-impact
 tasks require the independent cross-check described below before accepting a supported contract.
-Grounding is covered only for exact `grounded_json` extraction, and coding only for the
+Grounding is covered for exact `grounded_json` extraction and the `grounded_claims` contract,
+and coding only for the
 `python_function` / `native_python_function` subset. Other required capabilities are not covered.
 Source credibility evaluation and arbitrary Python execution are not implemented. Schema-only and general
 prose responses remain unverified even if multiple models return identical text.
@@ -248,9 +334,9 @@ checks passed. The final request may still escalate because its required cross-c
 Consequently an escalation can legitimately have a best local score of 100; that score never
 overrides the independent-verification gate.
 
-The engine version is `deterministic-v4`. Existing quality reports retain their original engine
+The engine version is `deterministic-v5`. Existing quality reports retain their original engine
 version; new validation kinds have separate model/task statistics. Migration `0004` adds the
 nullable model independence group; historical attempts default to the `PRIMARY` role when read.
 
-Full Sprint B remains open for broader code execution support, grounding/consistency
-checks, source credibility evaluation and quality calibration. Live providers remain disabled.
+Full Sprint B remains open for broader code execution support, prose grounding/consistency,
+source credibility evaluation and quality calibration. Live providers remain disabled.

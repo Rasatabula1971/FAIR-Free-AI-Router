@@ -63,6 +63,8 @@ requirements, not separate authorization for deployment, paid inference or publi
   source credibility evaluation and quality calibration. Scoped independent cross-checks are
   implemented in the fifth increment.
   Opt-in native execution of the bounded numeric subset is implemented in the seventh increment.
+  Multi-source structured claim grounding is implemented in the eighth increment; free-form
+  prose entailment remains outside the verified scope.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
@@ -206,3 +208,24 @@ below describe the results available at that time; current integration evidence 
   external packages and unattended orphan recovery are not verified/implemented. Broader
   grounding, source credibility and calibrated quality scoring remain open. Live providers
   remain disabled. See QUALITY_CONTRACTS.md for setup, limits and failure behavior.
+
+## Eighth increment: structured claim grounding across sources
+
+- Added `grounded_claims`, a bounded contract matching requested subject/predicate/context keys
+  against all supplied structured fact documents, not just the model's selected citations.
+- Rejects unsupported or contradicted answers, assertions over conflicting evidence, missing or
+  extra claims, malformed/duplicate responses, and incomplete or fabricated attribution.
+- Explicit abstention remains unverified with a null score. Missing/conflicting evidence does
+  not lower measured model quality when the model abstains. Partial support cannot accept a task.
+- Added per-claim statuses/evidence counts, `STRUCTURED_CLAIMS_SUPPORTED`, separate task metrics,
+  and additional grounding-failure accounting. Raw facts and rejected values remain outside
+  quality/audit reports. Independent verification handles reordered claims and references.
+- Engine version is `deterministic-v5`; no migration is required for these JSON report fields.
+- Local validation: 293 tests passed, 10 PostgreSQL/native Docker tests skipped, two upstream
+  warnings. Includes 55 new grounding tests; lint and formatting pass.
+- All four GitHub jobs passed for code commit `d4d6ea8`: core, PostgreSQL, Docker API smoke and
+  native sandbox. Evidence: [run 34301398979](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34301398979).
+- This completes the structured-data increment of the broader grounding step. Prose entailment,
+  source credibility, freshness and automatic conversion of prose into trusted facts are not
+  implemented. Live providers remain disabled. See QUALITY_CONTRACTS.md for the complete format,
+  examples and acceptance scope.
