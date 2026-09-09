@@ -11,7 +11,7 @@ from fair.benchmarks.registry import BenchmarkRegistry
 from fair.config import RoutingSettings, config_dir, load_yaml
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
-from fair.quality.sandbox import DockerSandbox
+from fair.quality.sandbox import DockerSandbox, SandboxUnavailable
 from fair.quality.source_reviews import SourceReviewRegistry
 from fair.router.orchestrator import Router
 from fair.schemas.api import SolveRequest, SolveResponse
@@ -77,7 +77,9 @@ def create_app(router=None, client_keys=None, admin_key=None):
                 RoutingSettings(**load_yaml("routing.yaml")),
                 load_yaml("quality_thresholds.yaml"),
                 sessions,
-                sandbox=DockerSandbox(os.environ["FAIR_SANDBOX_IMAGE"])
+                sandbox=DockerSandbox(
+                    os.environ["FAIR_SANDBOX_IMAGE"], owner=os.environ.get("FAIR_SANDBOX_OWNER")
+                )
                 if os.environ.get("FAIR_SANDBOX_IMAGE")
                 else None,
                 source_reviews=source_reviews,
@@ -85,9 +87,13 @@ def create_app(router=None, client_keys=None, admin_key=None):
             )
         else:
             app.state.router = router
-        yield
-        if engine:
-            engine.dispose()
+        try:
+            if app.state.router.sandbox is not None and app.state.router.sandbox.owner is not None:
+                await app.state.router.sandbox.recover()
+            yield
+        finally:
+            if engine:
+                engine.dispose()
 
     app = FastAPI(title="FAIR Free AI Router", version="0.1.0", lifespan=lifespan)
 
@@ -213,6 +219,21 @@ def create_app(router=None, client_keys=None, admin_key=None):
     @app.post("/v1/system/resume", dependencies=[Depends(administrator)])
     async def resume():
         return set_stop(False)
+
+    @app.post("/v1/system/sandbox/recover", dependencies=[Depends(administrator)])
+    async def recover_sandbox():
+        active = app.state.router
+        if active.sandbox is None or active.sandbox.owner is None:
+            raise HTTPException(409, "Owned sandbox recovery is not configured")
+        try:
+            result = await active.sandbox.recover()
+        except SandboxUnavailable:
+            result = {"healthy": False, "reason_code": "SANDBOX_RECOVERY_FAILED"}
+        with active.sessions.begin() as session:
+            active.audit(session, None, "admin", "SANDBOX_RECOVERY", result)
+        if not result["healthy"]:
+            raise HTTPException(503, "Sandbox recovery incomplete")
+        return result
 
     return app
 

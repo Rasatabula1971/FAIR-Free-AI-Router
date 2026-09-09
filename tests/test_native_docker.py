@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 from test_code_validation import GOOD, coding
+from test_expanded_code import PROGRAMS
 from test_native_validation import contract, request
 
 from fair.providers.mock import MockAdapter
@@ -139,3 +140,42 @@ async def test_real_interrupted_execution_removes_container(mode):
     code, _ = await command(["inspect", names[0]])
     assert code != 0
     assert executor.healthy
+
+
+@pytest.mark.parametrize("source,arguments,expected", PROGRAMS)
+async def test_real_native_expanded_language_matches_expected(source, arguments, expected):
+    checks = NativeFunctionValidation(
+        kind="native_python_function",
+        function_name="solve",
+        cases=[{"arguments": arguments, "expected": expected}],
+    )
+    assert await sandbox().validate(source, checks) == (True, None)
+
+
+async def test_real_owner_recovery_after_executor_restart_preserves_other_work():
+    from time import time
+
+    image = os.environ["FAIR_TEST_SANDBOX_IMAGE"]
+    owner = "test-" + uuid4().hex
+    abandoned = DockerSandbox(image, owner=owner, clock=lambda: time() - 130)
+    active = DockerSandbox(image, owner=owner)
+    foreign = DockerSandbox(image, owner="foreign-" + uuid4().hex, clock=lambda: time() - 130)
+    names = ["fair-sandbox-" + uuid4().hex for _ in range(3)]
+    try:
+        for executor, name in zip((abandoned, active, foreign), names, strict=True):
+            args = executor.create_args(name)
+            args[-1:] = ["-c", "import time; time.sleep(60)"]
+            code, _ = await executor._command(args)
+            assert code == 0
+        code, _ = await abandoned._command(["start", names[0]])
+        assert code == 0
+        restarted = DockerSandbox(image, owner=owner)
+        assert await restarted.recover() == {"removed": 1, "preserved": 1, "healthy": True}
+        assert (await restarted._command(["inspect", names[0]]))[0] != 0
+        for name in names[1:]:
+            assert (await restarted._command(["inspect", name]))[0] == 0
+        assert (await restarted.recover())["removed"] == 0
+        assert await restarted.validate(GOOD, contract()) == (True, None)
+    finally:
+        for executor, name in zip((abandoned, active, foreign), names, strict=True):
+            await executor._remove(name)

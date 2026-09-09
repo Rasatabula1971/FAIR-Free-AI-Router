@@ -8,7 +8,7 @@ import sys
 
 # -I excludes application paths; load only the trusted validator copied into this image.
 sys.path.insert(0, "/sandbox")
-from code_validator import bounded, parse_function, run_case  # noqa: E402
+from code_validator import SAFE_BUILTINS, bounded, parse_function, run_case  # noqa: E402
 
 
 def main():
@@ -39,10 +39,13 @@ def main():
             bounded(value)
         # Repeat the bounded admission check inside the image before native execution.
         run_case(function, args)
-        scope = {"__builtins__": {}}
+        scope = {"__builtins__": dict(SAFE_BUILTINS)}
         exec(compiled, scope)  # Native code executes only in this isolated container.
         values.append(bounded(scope[data["function_name"]](*args)))
-    print(json.dumps({"values": values}, allow_nan=False))
+    result = json.dumps({"values": values}, allow_nan=False)
+    if len(result) > 25000:
+        raise ValueError("Output budget exceeded")
+    print(result)
 
 
 if __name__ == "__main__":

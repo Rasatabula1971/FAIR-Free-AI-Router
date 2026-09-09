@@ -150,6 +150,6 @@ Review metadata is omitted from the provider's normalized prompt; evidence text 
 to the provider for grounding.
 
 Source review fields were introduced in `deterministic-v6`; the current engine is
-`deterministic-v7`. No database migration was needed for the source-review JSON report fields.
+`deterministic-v8`. No database migration was needed for the source-review JSON report fields.
 `freshness_required: true` remains unverified: a recently observed snapshot is not proof of
 live freshness. Automated credibility scoring, retrieval and prose entailment remain unfinished.

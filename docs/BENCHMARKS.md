@@ -199,7 +199,7 @@ selection/release returns `FAILED` / `VALIDATION_SERVICE_FAILED`. Existing polic
 their own reasons. Qualification does not establish broad factual truth, live freshness or
 general code correctness.
 
-Migration `0005` adds nullable model revisions; engine version is `deterministic-v7`, benchmark
+Migration `0005` adds nullable model revisions; engine version is `deterministic-v8`, benchmark
 runner version is `benchmark-v1`. Old quality reports retain their original engine version.
 Model or validator-version changes require a fresh workload run and operator review. This step
 does not implement live benchmark collection, shadow scheduling, drift detection or automated

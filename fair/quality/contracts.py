@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from pydantic import Field, JsonValue, StrictBool, StrictInt, field_validator
 
 from fair.quality.arithmetic import calculate
+from fair.quality.code_validator import SAFE_BUILTINS, bounded
 from fair.schemas.domain import DTO
 
 
@@ -88,17 +89,24 @@ class ClaimsValidation(DTO):
         return value
 
 
-class FunctionCase(DTO):
-    arguments: list[StrictInt | StrictBool] = Field(max_length=8)
-    expected: StrictInt | StrictBool
+CodeValue = StrictInt | StrictBool | Annotated[list[StrictInt | StrictBool], Field(max_length=64)]
 
-    @field_validator("arguments", "expected")
+
+class FunctionCase(DTO):
+    arguments: list[CodeValue] = Field(max_length=8)
+    expected: CodeValue
+
+    @field_validator("arguments")
     @classmethod
     def bounded_integers(cls, value):
-        values = value if isinstance(value, list) else [value]
-        if any(type(item) is int and item.bit_length() > 256 for item in values):
-            raise ValueError("Function inputs and expectations are limited to 256-bit integers")
+        for item in value:
+            bounded(item)
         return value
+
+    @field_validator("expected")
+    @classmethod
+    def bounded_expected(cls, value):
+        return bounded(value)
 
 
 class FunctionValidation(DTO):
@@ -111,13 +119,15 @@ class FunctionValidation(DTO):
     def consistent_arity(cls, value):
         if len({len(case.arguments) for case in value}) != 1:
             raise ValueError("Function test cases must use the same argument count")
+        if len(json.dumps([case.model_dump() for case in value])) > 24000:
+            raise ValueError("Function test data exceeds 24000-character budget")
         return value
 
     @field_validator("function_name")
     @classmethod
     def valid_name(cls, value):
-        if keyword.iskeyword(value):
-            raise ValueError("Function name must not be a keyword")
+        if keyword.iskeyword(value) or value in SAFE_BUILTINS:
+            raise ValueError("Function name must not be a keyword or reserved builtin")
         return value
 
 

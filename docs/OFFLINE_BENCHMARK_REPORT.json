@@ -7,8 +7,8 @@
     "model_id": "handwritten-responses",
     "model_revision": "fixture-v1",
     "observed_at": "2026-09-09T00:00:00Z",
-    "generated_at": "2026-09-09T13:01:57.590915Z",
-    "engine_version": "deterministic-v7",
+    "generated_at": "2026-09-09T18:45:45.425880Z",
+    "engine_version": "deterministic-v8",
     "runner_version": "benchmark-v1",
     "dataset_fingerprint": "abcf4366e23904db8146c68a9850bc6bd7f981a490bdbf4cc9af9393dde5c2f3",
     "metrics": [

@@ -185,16 +185,44 @@ the source and interprets an allowlisted AST subset itself; generated text is ne
 Python `exec`, `eval`, a shell or a subprocess. This is a restricted interpreter, not a general
 Python sandbox or evidence that code has run under native CPython.
 
-Supported features: integer/boolean parameters and constants; local assignments; `if`/`else`;
-`return`; `+ - * // %`; unary signs and `not`; comparisons; `and`/`or`; conditional expressions.
-Imports, calls, attributes, loops, recursion, decorators, annotations, default arguments,
-collections, strings and other statements are outside the contract and hard-rejected, including
-when they occur in unused branches. Incorrect outputs, missing returns and division by zero fail.
+Supported features: integer/boolean values and flat lists of them; local assignments;
+`if`/`else`; `return`; numeric `+ - * // %`; unary signs and `not`; comparisons; `and`/`or`;
+conditional expressions; `for` over a list or bounded `range`; and bounded `while` loops.
+Both loop types support `break`, `continue` and `else` with Python control-flow semantics.
+Lists support literals, concatenation and single-element indexing, including negative indices.
+Augmented assignments such as `+=` and `*=` support scalar targets only, preserving list aliases.
 
-Limits: 8,192 source characters, 128 AST nodes, eight parameters, 32 nonempty host test cases,
-256-bit integer values, 256 interpretation steps per test, and depth 20. Inputs and expected
-outputs must be strict integers or booleans; `True` does not match expected integer `1`.
+Allowed built-ins are `abs(x)`, `len(xs)`, `sum(xs)`, `sorted(xs)`, and `min`/`max` on one nonempty
+list or two to eight scalar arguments. `range` accepts one to three scalar arguments only as a
+`for` iterable. Built-in names are reserved and cannot be function names, parameters or assignment
+targets. Other calls, attributes, recursion, imports, decorators, annotations, default arguments,
+strings, nested collections, comprehensions, slices and list mutation are rejected, including in
+unused branches. Incorrect outputs, invalid indexing, missing returns and arithmetic errors fail.
+
+Limits: 8,192 source characters, 256 AST nodes, eight parameters, 32 nonempty host test cases,
+256-bit integer values, 64 elements per flat list, 4,096 interpretation steps per test, depth 20,
+and at most 1,024 iterations per loop. Nested loops share the same test's step budget; a complex
+loop may exhaust it before reaching the iteration limit. Total host test data is capped at 24,000
+JSON characters. Inputs and expected outputs use strict types, including every list element;
+`[True]` does not match expected `[1]`.
 Only all-tests-passing functions may be accepted. Test coverage remains the host's responsibility.
+
+For example, a list is one argument in this contract:
+
+```json
+{
+  "kind": "python_function",
+  "function_name": "solve",
+  "cases": [
+    {"arguments": [[3, -2, 5]], "expected": [6, 3]},
+    {"arguments": [[]], "expected": [0, 0]}
+  ]
+}
+```
+
+The corresponding function is `def solve(xs): return [sum(xs), len(xs)]`. More involved admitted
+examples include factorial with `for range`, Euclid's algorithm with `while`, and scans using
+`break`/`continue`. See `tests/test_expanded_code.py` for the tested examples.
 
 Passing verification state: `BOUNDED_CODE_TESTS`. Passing these cases does not establish correctness
 for untested inputs, native execution, external packages, filesystem/network access or arbitrary code.
@@ -203,9 +231,11 @@ for untested inputs, native execution, external packages, filesystem/network acc
 
 Use the same function name and case fields with `"kind": "native_python_function"` to require
 native CPython execution. Passing verification state: `NATIVE_CODE_TESTS`. The allowed language
-and host admission limits remain the numeric subset above; this is not arbitrary Python support.
+and host admission limits are the bounded numeric/list subset above; this is not arbitrary Python support.
 The bounded interpreter checks admission before Docker is contacted, and the trusted image
-repeats that check before compiling and executing the function. Each case gets a fresh namespace.
+repeats that check before compiling and executing the function. Each case gets a fresh namespace
+containing only the allowed built-ins. Host preflight also caps the aggregate returned values at
+24,000 JSON characters and serialized stdin at 65,536 bytes before contacting Docker.
 
 The executor creates a new container per candidate, with no network, host mounts, provider keys,
 expected answers or inherited host environment. Only source, function name and test arguments
@@ -226,9 +256,11 @@ Missing opt-in configuration yields `UNVERIFIED` with no invented quality score.
 timeouts, malformed output and cleanup failures produce `VALIDATION_SERVICE_FAILED`, withhold
 output and do not lower measured model quality. Candidate subset/test failures remain quality
 failures. Cancellation attempts forced container removal and persists cancelled lineage; an
-uncertain cleanup disables further native execution in that executor instance. An operator must
-resolve leftover containers/runtime failures before restarting it. A hard process/host crash can
-prevent cleanup, so this development executor is not an unattended sandbox service.
+uncertain cleanup disables further native execution until cleanup is established. Repeated
+cancellation cannot cancel the protected cleanup task. With a stable `FAIR_SANDBOX_OWNER`,
+startup and pre-execution recovery remove expired containers belonging to that owner and preserve
+unexpired or unrelated work. Without an owner, crash recovery remains manual. See
+[sandbox recovery](SANDBOX_RECOVERY.md) for lease timing, the audited admin endpoint and limits.
 
 The API factory enables this only when `FAIR_SANDBOX_IMAGE` holds a trusted, locally built image
 ID matching `sha256:` plus 64 lowercase hexadecimal characters. Tags and automatic image pulls
@@ -243,11 +275,13 @@ Example preparation from the repository root (Docker must already be installed):
 ```powershell
 docker build -f infra/sandbox/Dockerfile -t fair-native-sandbox .
 $env:FAIR_SANDBOX_IMAGE = docker image inspect fair-native-sandbox --format '{{.Id}}'
+$env:FAIR_SANDBOX_OWNER = 'fair-development'
 # Configure the database/client/admin keys and migrate as described in README.md, then:
 .\.venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 127.0.0.1 --port 8000 --workers 1
 ```
 
-Build this repository's dedicated sandbox image; do not substitute an unrelated image. Enabling
+Rebuild this repository's dedicated sandbox image after changing the validator; older images
+may reject the expanded language. Do not substitute an unrelated image. Enabling
 the executor does not add or activate any live provider, and demo fixtures are not coding models.
 
 ## Hard rejection and incomplete coverage
@@ -340,7 +374,7 @@ checks passed. The final request may still escalate because its required cross-c
 Consequently an escalation can legitimately have a best local score of 100; that score never
 overrides the independent-verification gate.
 
-The engine version is `deterministic-v7`. Existing quality reports retain their original engine
+The engine version is `deterministic-v8`. Existing quality reports retain their original engine
 version; new validation kinds have separate model/task statistics. Migration `0004` adds the
 nullable model independence group; historical attempts default to the `PRIMARY` role when read.
 

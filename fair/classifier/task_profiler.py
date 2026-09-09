@@ -65,9 +65,14 @@ def model_task(request):
                 + " positional parameters"
             )
             task += (
-                ". Use integer/boolean parameters, assignments, if/else, return, numeric comparisons, "
-                "boolean expressions, and + - * // % operators. No imports, calls, loops, decorators, "
-                "annotations, collections or other statements. Do not use markdown fences."
+                ". Use integers, booleans or flat lists of at most 64 such values; assignments, "
+                "if/else, return, bounded for/while loops with break/continue/else, list indexing, "
+                "numeric comparisons, boolean expressions and + - * // % operators. "
+                "Builtin calls allowed: abs, min, max, len, sum, sorted; range only as a for iterable. "
+                "Augmented assignment is scalar-only; lists support concatenation but no mutation. "
+                "At most 1024 iterations per loop and 4096 interpreter steps per case. "
+                "No imports, other calls, recursion, attributes, decorators, annotations, strings, "
+                "nested collections or markdown fences. Do not shadow builtin names."
             )
         elif request.validation.kind == "grounded_claims":
             task += (

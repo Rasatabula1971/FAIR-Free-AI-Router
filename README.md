@@ -35,10 +35,14 @@ answer and returns escalation or a service failure. Agreement does not establish
 See [quality contracts](docs/QUALITY_CONTRACTS.md) for the supported checks, verification
 labels, examples and limitations. These deterministic checks do not establish general
 factual correctness or validate arbitrary generated code. The default code validator interprets
-only a small numeric subset. An opt-in `native_python_function` contract executes that same subset
+bounded numeric/list functions with loops and selected built-ins. An opt-in `native_python_function` contract executes that same subset
 inside a constrained Docker container and reports `NATIVE_CODE_TESTS`. It is disabled unless
 a trusted local sandbox image is explicitly configured; see the quality contracts for setup
 and exact isolation limits.
+
+Step 4 expands both validators and adds [owner-scoped sandbox recovery](docs/SANDBOX_RECOVERY.md)
+after interruption or restart, with an audited admin endpoint. Imports, arbitrary calls and
+filesystem/network access remain outside the generated-code contract.
 
 ## Development
 

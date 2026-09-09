@@ -66,7 +66,9 @@ requirements, not separate authorization for deployment, paid inference or publi
   Multi-source structured claim grounding is implemented in the eighth increment; free-form
   prose entailment remains outside the verified scope. Operator-reviewed source policies are
   implemented in the ninth increment. Offline benchmark calibration and reviewed workload
-  qualification are implemented in the tenth increment. Step 4, expanding code validation, is next.
+  qualification are implemented in the tenth increment. Step 4 expands numeric/list code
+  validation and scoped sandbox recovery in the eleventh increment. Step 5, fair client
+  scheduling, is next.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
@@ -89,7 +91,7 @@ adapter observations cover request quotas; token/compute quota tracking is still
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment ten.
+validation notes describe the results available at that time; current evidence is in increment eleven.
 
 ## Validation of the first increment
 
@@ -289,3 +291,28 @@ examples and acceptance scope.
   workload recordings and independent operator review. Live collection, shadow scheduling,
   drift detection and general probabilistic confidence fitting remain future work. Live
   providers and the optional benchmark gate remain disabled by default.
+
+## Eleventh increment: expanded code validation and sandbox recovery (Step 4)
+
+- Both interpreted and native contracts support flat integer/boolean lists, indexing,
+  concatenation, scalar augmented assignments, bounded for/while loops with break/continue/else,
+  and a small allowlist of built-ins. Strict type matching extends to every returned list element.
+- Bounds cover source/AST size, list length, integer width, nesting, shared operation count,
+  loop iterations, total host test data and native input/output serialization. The interpreter
+  admits each case before Docker and the trusted image repeats admission before native execution.
+- Owner-labelled 120-second container leases support scoped recovery at startup, before native
+  execution and through an authenticated, audited admin endpoint. Complete inventory validation
+  precedes removal; unexpired and unrelated containers are preserved. Recovery is bounded and
+  missing-container cleanup is idempotent only after daemon-confirmed absence.
+- Repeated cancellation cannot cancel forced cleanup. Uncertain cleanup blocks more native work
+  until reconciliation establishes cleanup. Runtime failures do not penalize model quality.
+- Engine version is `deterministic-v8`; no database migration is required. Rebuild the sandbox
+  image for the expanded language and rerun/review any benchmark qualifications bound to v7.
+- Local validation: 457 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
+  two upstream deprecation warnings. Includes 74 new local regressions and 18 new real-container
+  checks prepared for CI. GitHub integration verification for this increment is pending.
+- See [quality contracts](QUALITY_CONTRACTS.md) for examples and exact limits, and
+  [sandbox recovery](SANDBOX_RECOVERY.md) for owner configuration and operating procedures.
+  Step 4's bounded expansion is complete. Arbitrary Python, packages, production hostile-code
+  isolation and Windows Docker verification remain outside the implemented scope. Next is
+  Step 5: fair client scheduling. Live providers remain disabled.
