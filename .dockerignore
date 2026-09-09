@@ -2,6 +2,7 @@
 .venv
 .env
 config/source_reviews.local.yaml
+config/benchmarks.local.yaml
 __pycache__
 *.db
 *.log

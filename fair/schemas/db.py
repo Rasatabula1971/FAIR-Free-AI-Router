@@ -52,6 +52,7 @@ class Model(Base):
     capabilities: Mapped[list] = mapped_column(JSON)
     active: Mapped[bool] = mapped_column(Boolean)
     independence_group: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    model_revision: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class ProviderQuotaState(Base):

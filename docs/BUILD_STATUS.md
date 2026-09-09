@@ -60,12 +60,13 @@ requirements, not separate authorization for deployment, paid inference or publi
 
 - B (in progress): deterministic acceptance and persistent performance are implemented below.
   Remaining work includes broader code execution support, grounding/consistency checks,
-  automated source credibility evaluation and quality calibration. Scoped independent cross-checks are
+  automated source credibility evaluation and calibration on actual model workloads. Scoped independent cross-checks are
   implemented in the fifth increment.
   Opt-in native execution of the bounded numeric subset is implemented in the seventh increment.
   Multi-source structured claim grounding is implemented in the eighth increment; free-form
   prose entailment remains outside the verified scope. Operator-reviewed source policies are
-  implemented in the ninth increment. Step 3, quality-score calibration, is next.
+  implemented in the ninth increment. Offline benchmark calibration and reviewed workload
+  qualification are implemented in the tenth increment. Step 4, expanding code validation, is next.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
@@ -88,7 +89,7 @@ adapter observations cover request quotas; token/compute quota tracking is still
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment nine.
+validation notes describe the results available at that time; current evidence is in increment ten.
 
 ## Validation of the first increment
 
@@ -254,3 +255,35 @@ examples and acceptance scope.
   review scope is complete. Automated source assessment, live freshness and prose entailment
   remain outside that scope. Next is Step 3: benchmark-based quality-score calibration.
   Live providers remain disabled.
+
+## Tenth increment: benchmark calibration and qualification (Step 3)
+
+- Added an offline runner for saved, independently labelled model responses with frozen
+  calibration/holdout splits, exact duplicate detection, per-task outcome counts, threshold
+  sweeps, disagreement diagnostics and 95% Wilson pass-rate bounds. Service/quota failures
+  stay outside quality samples. No provider calls or production statistics are generated.
+- Added ten explicitly synthetic diagnostic cases and a reproducible aggregate report. A
+  deliberately under-specified code contract exposes a false accept against its independent
+  label. Fixtures can never qualify a model; no live model rating has been invented.
+- Optional server benchmark policy requires operator-reviewed representative workloads for
+  the authenticated client and exact model/task/revision/engine. Both splits need enough
+  samples, no validation gaps or observed false accepts, and conservative scores meeting
+  the selected quality level. The thresholds now distinguish benchmark-qualified routes.
+- Qualification is checked at selection, dispatch and final release for the producer and
+  independent checker. Missing/stale/expired/mismatched ratings withhold output. High ratings
+  cannot override hard answer rejection or the existing governance gates.
+- Benchmark evidence seeds a bounded routing prior; live quality failures can reduce priority
+  while live success cannot raise the score above the reviewed qualification bound. Audits and
+  client-isolated history retain score/count/fingerprint reports without private benchmark data.
+- Migration `0005` adds nullable model revisions. Engine version is `deterministic-v7` and
+  benchmark runner version is `benchmark-v1`. Source-review checks remain supported.
+- See [BENCHMARKS.md](BENCHMARKS.md) for operator workflow, statistical interpretation, strict
+  limits, file configuration and renewal; [OFFLINE_BENCHMARK_REPORT.json](OFFLINE_BENCHMARK_REPORT.json)
+  is the generated diagnostic fixture report.
+- Local validation: 383 tests passed, 10 PostgreSQL/native Docker tests skipped locally,
+  two upstream deprecation warnings; lint, formatting and migration/schema checks pass.
+  GitHub integration verification for this increment is pending.
+- The Step 3 implementation is complete. Actual model qualification awaits representative
+  workload recordings and independent operator review. Live collection, shadow scheduling,
+  drift detection and general probabilistic confidence fitting remain future work. Live
+  providers and the optional benchmark gate remain disabled by default.

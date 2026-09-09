@@ -1,0 +1,80 @@
+{
+  "suite_id": "offline-contract-diagnostics",
+  "suite_revision": "v1",
+  "purpose": "FIXTURE",
+  "provider_id": "offline-recordings",
+  "model_id": "handwritten-responses",
+  "model_revision": "fixture-v1",
+  "observed_at": "2026-09-09T00:00:00Z",
+  "cases": [
+    {
+      "case_id": "decimal-exact",
+      "split": "calibration",
+      "request": {"client_id": "fixture", "task": "Calculate the expression", "validation": {"kind": "arithmetic", "expression": "0.1+0.2"}},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "0.3"},
+      "expected_acceptable": true
+    },
+    {
+      "case_id": "fraction-rounded",
+      "split": "holdout",
+      "request": {"client_id": "fixture", "task": "Calculate the exact fraction", "validation": {"kind": "arithmetic", "expression": "1/3"}},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "0.333"},
+      "expected_acceptable": false
+    },
+    {
+      "case_id": "strict-reference",
+      "split": "calibration",
+      "request": {"client_id": "fixture", "task": "Return the integer answer 42 in JSON", "validation": {"kind": "reference_json", "expected": {"answer": 42}}},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "{\"answer\":42}"},
+      "expected_acceptable": true
+    },
+    {
+      "case_id": "extra-reference-field",
+      "split": "holdout",
+      "request": {"client_id": "fixture", "task": "Return only the answer 7 in JSON", "validation": {"kind": "reference_json", "expected": {"answer": 7}}},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "{\"answer\":7,\"extra\":true}"},
+      "expected_acceptable": false
+    },
+    {
+      "case_id": "grounded-extraction",
+      "split": "calibration",
+      "request": {"client_id": "fixture", "task": "Extract the source count", "validation": {"kind": "grounded_json", "fields": [{"output_key": "count", "source_id": "report", "pointer": "/count"}]}, "evidence": [{"source_id": "report", "text": "{\"count\":3}"}]},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "{\"answer\":{\"count\":3},\"sources\":{\"count\":{\"source_id\":\"report\",\"pointer\":\"/count\"}}}"},
+      "expected_acceptable": true
+    },
+    {
+      "case_id": "grounded-wrong-attribution",
+      "split": "holdout",
+      "request": {"client_id": "fixture", "task": "Extract the source count", "validation": {"kind": "grounded_json", "fields": [{"output_key": "count", "source_id": "report", "pointer": "/count"}]}, "evidence": [{"source_id": "report", "text": "{\"count\":9}"}]},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "{\"answer\":{\"count\":9},\"sources\":{\"count\":{\"source_id\":\"invented\",\"pointer\":\"/count\"}}}"},
+      "expected_acceptable": false
+    },
+    {
+      "case_id": "numeric-function",
+      "split": "calibration",
+      "request": {"client_id": "fixture", "task": "Write a function that returns the sum of two integers", "validation": {"kind": "python_function", "function_name": "add", "cases": [{"arguments": [2, 3], "expected": 5}, {"arguments": [-1, 4], "expected": 3}]}},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "def add(a, b):\n    return a + b"},
+      "expected_acceptable": true
+    },
+    {
+      "case_id": "insufficient-host-tests",
+      "split": "holdout",
+      "request": {"client_id": "fixture", "task": "Write a function that adds one to any integer", "validation": {"kind": "python_function", "function_name": "increment", "cases": [{"arguments": [1], "expected": 2}]}},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "def increment(n):\n    return 2"},
+      "expected_acceptable": false
+    },
+    {
+      "case_id": "unsupported-prose",
+      "split": "holdout",
+      "request": {"client_id": "fixture", "task": "Write a friendly greeting"},
+      "response": {"provider_id": "offline-recordings", "model_id": "handwritten-responses", "text": "Hello!"},
+      "expected_acceptable": true
+    },
+    {
+      "case_id": "quota-outcome",
+      "split": "holdout",
+      "request": {"client_id": "fixture", "task": "Calculate the expression", "validation": {"kind": "arithmetic", "expression": "5+6"}},
+      "outcome": "QUOTA_FAILURE"
+    }
+  ]
+}

@@ -149,6 +149,7 @@ private review records separately if operators need to reconstruct a historical 
 Review metadata is omitted from the provider's normalized prompt; evidence text is supplied
 to the provider for grounding.
 
-Engine version: `deterministic-v6`. No database migration is needed for these JSON report fields.
+Source review fields were introduced in `deterministic-v6`; the current engine is
+`deterministic-v7`. No database migration was needed for the source-review JSON report fields.
 `freshness_required: true` remains unverified: a recently observed snapshot is not proof of
 live freshness. Automated credibility scoring, retrieval and prose entailment remain unfinished.

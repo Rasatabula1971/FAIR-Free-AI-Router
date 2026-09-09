@@ -10,6 +10,7 @@ from fair.quality.grounding import grounded_result
 from fair.schemas.domain import (
     DTO,
     Attempt,
+    BenchmarkCheck,
     Capability,
     CrossCheckReport,
     PrivacyClass,
@@ -87,5 +88,6 @@ class SolveResponse(DTO):
     model_disagreement: Literal["NOT_ASSESSED", "NONE", "DETECTED"] = "NOT_ASSESSED"
     cross_check: CrossCheckReport = Field(default_factory=CrossCheckReport)
     source_policy: SourcePolicyReport = Field(default_factory=SourcePolicyReport)
+    benchmark_checks: list[BenchmarkCheck] = Field(default_factory=list)
     recommended_capability: str = "VALIDATED_FREE_MODEL_OR_HOST_REVIEW"
     paid_inference_executed: Literal[False] = False

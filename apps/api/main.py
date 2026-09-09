@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException
 from sqlalchemy import select
 
+from fair.benchmarks.registry import BenchmarkRegistry
 from fair.config import RoutingSettings, config_dir, load_yaml
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
@@ -65,6 +66,12 @@ def create_app(router=None, client_keys=None, admin_key=None):
                 if review_path.exists() or os.environ.get("FAIR_SOURCE_REVIEWS_FILE")
                 else SourceReviewRegistry()
             )
+            benchmark_path = os.environ.get("FAIR_BENCHMARKS_FILE")
+            benchmarks = (
+                BenchmarkRegistry.from_file(benchmark_path)
+                if benchmark_path
+                else BenchmarkRegistry()
+            )
             app.state.router = Router(
                 registry,
                 RoutingSettings(**load_yaml("routing.yaml")),
@@ -74,6 +81,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
                 if os.environ.get("FAIR_SANDBOX_IMAGE")
                 else None,
                 source_reviews=source_reviews,
+                benchmarks=benchmarks,
             )
         else:
             app.state.router = router

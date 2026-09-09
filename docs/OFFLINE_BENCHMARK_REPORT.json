@@ -1,0 +1,445 @@
+{
+  "run": {
+    "suite_id": "offline-contract-diagnostics",
+    "suite_revision": "v1",
+    "purpose": "FIXTURE",
+    "provider_id": "offline-recordings",
+    "model_id": "handwritten-responses",
+    "model_revision": "fixture-v1",
+    "observed_at": "2026-09-09T00:00:00Z",
+    "generated_at": "2026-09-09T13:01:57.590915Z",
+    "engine_version": "deterministic-v7",
+    "runner_version": "benchmark-v1",
+    "dataset_fingerprint": "abcf4366e23904db8146c68a9850bc6bd7f981a490bdbf4cc9af9393dde5c2f3",
+    "metrics": [
+      {
+        "task_class": "arithmetic",
+        "split": "calibration",
+        "cases": 1,
+        "samples": 1,
+        "successes": 1,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "arithmetic",
+        "split": "holdout",
+        "cases": 2,
+        "samples": 1,
+        "successes": 0,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 1,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "general",
+        "split": "holdout",
+        "cases": 1,
+        "samples": 0,
+        "successes": 0,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 1,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "grounded_json",
+        "split": "calibration",
+        "cases": 1,
+        "samples": 1,
+        "successes": 1,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "grounded_json",
+        "split": "holdout",
+        "cases": 1,
+        "samples": 1,
+        "successes": 0,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "python_function",
+        "split": "calibration",
+        "cases": 1,
+        "samples": 1,
+        "successes": 1,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "python_function",
+        "split": "holdout",
+        "cases": 1,
+        "samples": 1,
+        "successes": 0,
+        "false_accepts": 1,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "reference_json",
+        "split": "calibration",
+        "cases": 1,
+        "samples": 1,
+        "successes": 1,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      },
+      {
+        "task_class": "reference_json",
+        "split": "holdout",
+        "cases": 1,
+        "samples": 1,
+        "successes": 0,
+        "false_accepts": 0,
+        "false_rejects": 0,
+        "unverified": 0,
+        "infrastructure_failures": 0,
+        "quota_failures": 0,
+        "validator_failures": 0
+      }
+    ]
+  },
+  "diagnostics": [
+    {
+      "task_class": "arithmetic",
+      "split": "calibration",
+      "pass_rate": 1.0,
+      "lower_95": 0.20654931437723745,
+      "upper_95": 1.0,
+      "brier_score": 0.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 1,
+          "false_accepts": 0
+        }
+      ]
+    },
+    {
+      "task_class": "arithmetic",
+      "split": "holdout",
+      "pass_rate": 0.0,
+      "lower_95": 0.0,
+      "upper_95": 0.7934506856227626,
+      "brier_score": 0.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 0,
+          "false_accepts": 0
+        }
+      ]
+    },
+    {
+      "task_class": "general",
+      "split": "holdout",
+      "pass_rate": null,
+      "lower_95": null,
+      "upper_95": null,
+      "brier_score": null,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 0,
+          "false_accepts": 0
+        }
+      ]
+    },
+    {
+      "task_class": "grounded_json",
+      "split": "calibration",
+      "pass_rate": 1.0,
+      "lower_95": 0.20654931437723745,
+      "upper_95": 1.0,
+      "brier_score": 0.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 1,
+          "false_accepts": 0
+        }
+      ]
+    },
+    {
+      "task_class": "grounded_json",
+      "split": "holdout",
+      "pass_rate": 0.0,
+      "lower_95": 0.0,
+      "upper_95": 0.7934506856227626,
+      "brier_score": 0.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 0,
+          "false_accepts": 0
+        }
+      ]
+    },
+    {
+      "task_class": "python_function",
+      "split": "calibration",
+      "pass_rate": 1.0,
+      "lower_95": 0.20654931437723745,
+      "upper_95": 1.0,
+      "brier_score": 0.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 1,
+          "false_accepts": 0
+        }
+      ]
+    },
+    {
+      "task_class": "python_function",
+      "split": "holdout",
+      "pass_rate": 0.0,
+      "lower_95": 0.0,
+      "upper_95": 0.7934506856227626,
+      "brier_score": 1.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 1,
+          "false_accepts": 1
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 1,
+          "false_accepts": 1
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 1,
+          "false_accepts": 1
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 1,
+          "false_accepts": 1
+        }
+      ]
+    },
+    {
+      "task_class": "reference_json",
+      "split": "calibration",
+      "pass_rate": 1.0,
+      "lower_95": 0.20654931437723745,
+      "upper_95": 1.0,
+      "brier_score": 0.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 1,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 1,
+          "false_accepts": 0
+        }
+      ]
+    },
+    {
+      "task_class": "reference_json",
+      "split": "holdout",
+      "pass_rate": 0.0,
+      "lower_95": 0.0,
+      "upper_95": 0.7934506856227626,
+      "brier_score": 0.0,
+      "threshold_sweep": [
+        {
+          "quality_level": "commodity",
+          "threshold": 75.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "standard",
+          "threshold": 82.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "advanced",
+          "threshold": 88.0,
+          "accepted": 0,
+          "false_accepts": 0
+        },
+        {
+          "quality_level": "high_impact_support",
+          "threshold": 92.0,
+          "accepted": 0,
+          "false_accepts": 0
+        }
+      ]
+    }
+  ],
+  "scope": "LOCAL_CONTRACT_REPLAY",
+  "provider_calls": 0,
+  "note": "Contract scores are binary test results. Benchmark pass rates describe this workload only; fixtures cannot qualify routes."
+}

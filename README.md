@@ -22,6 +22,11 @@ per structured claim. Server policies cannot be weakened by a request. See the
 [source review guide](docs/SOURCE_REVIEWS.md) for configuration, examples and renewal. These
 checks establish review-policy compliance, not source truth or live freshness.
 
+Step 3 adds [offline benchmarks and workload qualification](docs/BENCHMARKS.md): independently
+labelled saved responses, separate calibration/holdout results, uncertainty bounds, and an
+optional server gate tied to exact model revisions. Fixtures cannot qualify routes. The shipped
+diagnostic suite makes no provider calls; live model ratings require measured workload data.
+
 Set `cross_check_required: true` to require a second provider/model to solve and validate the
 same task independently. This is mandatory for `high_impact_support`. Both answers must pass
 the selected contract and agree within its scope; otherwise FAIR withholds the provisional

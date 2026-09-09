@@ -2,6 +2,7 @@ import asyncio
 from time import monotonic
 from uuid import uuid4
 
+from fair.benchmarks.registry import BenchmarkRegistry
 from fair.classifier.task_profiler import model_task, profile_task
 from fair.governor.kill_switch import KillSwitch
 from fair.governor.policy import admit_provider
@@ -14,6 +15,7 @@ from fair.quality.source_reviews import (
     SourceReviewRegistry,
     SourceReviewUnavailable,
 )
+from fair.quality.thresholds import validate_thresholds
 from fair.quota.governor import QuotaGovernor
 from fair.router.selector import Selector
 from fair.schemas.api import SolveResponse
@@ -28,17 +30,27 @@ from fair.schemas.domain import (
 
 
 class Router:
-    def __init__(self, registry, settings, thresholds, sessions, sandbox=None, source_reviews=None):
+    def __init__(
+        self,
+        registry,
+        settings,
+        thresholds,
+        sessions,
+        sandbox=None,
+        source_reviews=None,
+        benchmarks=None,
+    ):
         self.registry = registry
         self.settings = settings
-        self.thresholds = thresholds
+        self.thresholds = validate_thresholds(thresholds)
         self.sessions = sessions
         self.sandbox = sandbox
         self.source_reviews = source_reviews or SourceReviewRegistry()
+        self.benchmarks = benchmarks or BenchmarkRegistry()
         registry.persist(sessions)
         self.quota = QuotaGovernor(settings, sessions)
         self.performance = PerformanceRegistry(sessions)
-        self.selector = Selector(registry, self.quota, settings, self.performance)
+        self.selector = Selector(registry, self.quota, settings, self.performance, self.benchmarks)
         self.kill_switch = KillSwitch(sessions)
         # One worker until the shared scheduler/dispatch coordination is implemented.
         self.lock = asyncio.Lock()
@@ -82,10 +94,17 @@ class Router:
                 self.performance.record(session, attempt, profile.task_class)
             self.audit(session, request_id, request.client_id, "ATTEMPT_COMPLETED", detail)
 
-    async def _attempt(self, request_id, request, profile, route, number, role):
+    async def _attempt(self, request_id, request, profile, route, number, role, benchmark_checks):
         if self._source_report(request).state == "BLOCKED":
             raise SourcePolicyBlocked()
         score, spec, model = route
+        if self.settings.benchmark_policy is not None:
+            check = self.benchmarks.assess(
+                request, profile, spec, model, self.settings.benchmark_policy
+            )
+            benchmark_checks[(spec.provider_id, model.model_id)] = check
+            if check.state != "PASSED":
+                return None, None, False
         # Shared by production attempts and cross-checks: no second execution authority.
         admit_provider(spec)
         remaining = self.quota.remaining(spec)
@@ -208,6 +227,7 @@ class Router:
         primary_attempt,
         attempts,
         tried,
+        benchmark_checks,
     ):
         report = CrossCheckReport(
             required=True,
@@ -219,12 +239,22 @@ class Router:
             if self.stopped:
                 report.state = "STOPPED"
                 break
+            checker_qualifications = {}
             candidates = [
                 route
-                for route in self.selector.candidates(request, profile, tried)
+                for route in self.selector.candidates(
+                    request,
+                    profile,
+                    tried,
+                    checker_qualifications,
+                    lambda spec, model: independent(primary_route, (0, spec, model)),
+                )
                 if independent(primary_route, route)
             ]
+            benchmark_checks.update(checker_qualifications)
             if not candidates:
+                if any(check.state != "PASSED" for check in checker_qualifications.values()):
+                    report.state = "BENCHMARK_BLOCKED"
                 break
             route = candidates[0]
             # Recheck at the dispatch boundary, even if candidate selection changes later.
@@ -232,7 +262,13 @@ class Router:
                 break
             try:
                 attempt, response, failed = await self._attempt(
-                    request_id, request, profile, route, len(attempts) + 1, "CROSS_CHECK"
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    len(attempts) + 1,
+                    "CROSS_CHECK",
+                    benchmark_checks,
                 )
             except SourcePolicyBlocked:
                 report.state = "SOURCE_BLOCKED"
@@ -300,6 +336,7 @@ class Router:
         request_id = str(uuid4())
         profile = profile_task(request, self.thresholds)
         attempts, tried = [], set()
+        benchmark_checks = {}
         required = request.cross_check_required or request.quality_level == "high_impact_support"
         cross_check = CrossCheckReport(
             required=required, state="NOT_RUN" if required else "NOT_REQUESTED"
@@ -335,13 +372,19 @@ class Router:
             if self.stopped:
                 reason = "SYSTEM_STOPPED"
                 break
-            candidates = self.selector.candidates(request, profile, tried)
+            candidates = self.selector.candidates(request, profile, tried, benchmark_checks)
             if not candidates:
                 break
             route = candidates[0]
             try:
                 attempt, response, validator_failed = await self._attempt(
-                    request_id, request, profile, route, len(attempts) + 1, "PRIMARY"
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    len(attempts) + 1,
+                    "PRIMARY",
+                    benchmark_checks,
                 )
             except SourcePolicyBlocked:
                 reason = "SOURCE_POLICY_UNSATISFIED"
@@ -362,7 +405,15 @@ class Router:
                 continue
             if required:
                 cross_check, disagreement = await self._cross_check(
-                    request_id, request, profile, route, response, attempt, attempts, tried
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    response,
+                    attempt,
+                    attempts,
+                    tried,
+                    benchmark_checks,
                 )
                 validator_failed = cross_check.state == "SERVICE_FAILED"
                 if cross_check.state != "PASSED":
@@ -373,6 +424,7 @@ class Router:
                         "UNAVAILABLE": "INDEPENDENT_VERIFIER_UNAVAILABLE",
                         "SERVICE_FAILED": "VALIDATION_SERVICE_FAILED",
                         "SOURCE_BLOCKED": "SOURCE_POLICY_UNSATISFIED",
+                        "BENCHMARK_BLOCKED": "BENCHMARK_QUALIFICATION_UNSATISFIED",
                     }[cross_check.state]
                     break
             accepted_response, accepted_quality = response, attempt.quality
@@ -387,6 +439,30 @@ class Router:
                 reason = "ALL_FREE_MODELS_UNAVAILABLE"
         if validator_failed:
             reason = "VALIDATION_SERVICE_FAILED"
+        if self.settings.benchmark_policy is not None:
+            # Recheck every locally accepted role before releasing the primary answer.
+            # An expired checker qualification cannot be rescued by the producer's rating.
+            for attempt in attempts:
+                if attempt.disposition == "ACCEPTED":
+                    spec = self.registry.providers[attempt.provider_id]
+                    model = next(
+                        model for model in spec.models if model.model_id == attempt.model_id
+                    )
+                    check = self.benchmarks.assess(
+                        request, profile, spec, model, self.settings.benchmark_policy
+                    )
+                    benchmark_checks[(spec.provider_id, model.model_id)] = check
+                    if check.state != "PASSED" and accepted_response is not None:
+                        accepted_response = accepted_quality = None
+                        reason = "BENCHMARK_QUALIFICATION_UNSATISFIED"
+            blocked = [check for check in benchmark_checks.values() if check.state != "PASSED"]
+            if blocked and reason == "NO_ELIGIBLE_FREE_MODELS":
+                reason = "BENCHMARK_QUALIFICATION_UNSATISFIED"
+            if reason == "BENCHMARK_QUALIFICATION_UNSATISFIED" and any(
+                check.state == "SERVICE_FAILED" for check in blocked
+            ):
+                validator_failed = True
+                reason = "VALIDATION_SERVICE_FAILED"
         try:
             source_report = self._source_report(request)
         except Exception:
@@ -425,11 +501,24 @@ class Router:
             else "UNVERIFIED",
             cross_check=cross_check,
             source_policy=source_report,
+            benchmark_checks=list(benchmark_checks.values()),
             model_disagreement=disagreement,
         )
         with self.sessions.begin() as session:
             row = session.get(TaskRequest, request_id)
             row.status, row.result_json = result.status, result.model_dump(mode="json")
+            if benchmark_checks:
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "BENCHMARK_QUALIFICATION_CHECKED",
+                    {
+                        "checks": [
+                            check.model_dump(mode="json") for check in benchmark_checks.values()
+                        ]
+                    },
+                )
             if source_report.state != "NOT_REQUESTED":
                 self.audit(
                     session,

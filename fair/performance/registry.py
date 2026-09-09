@@ -43,14 +43,19 @@ class PerformanceRegistry:
                 row.hallucination_events += 1
         row.updated_at = utcnow()
 
-    def scores(self, provider_id, model_id, task_class):
+    def scores(self, provider_id, model_id, task_class, quality_prior=None):
         with self.sessions() as session:
             row = session.get(ModelTaskPerformance, (provider_id, model_id, task_class))
             if row is None:
-                return 0.5, 0.5
+                return quality_prior if quality_prior is not None else 0.5, 0.5
             # Five neutral prior observations dampen sparse samples. Infrastructure and
             # quota outcomes never enter the quality numerator or denominator.
-            quality = (row.quality_sum / 100 + 2.5) / (row.quality_samples + 5)
+            prior = quality_prior if quality_prior is not None else 0.5
+            quality = (row.quality_sum / 100 + 5 * prior) / (row.quality_samples + 5)
+            if quality_prior is not None:
+                # Production failures can reduce ranking, but accumulated history cannot
+                # promote a model above its independently measured qualification bound.
+                quality = min(quality_prior, quality)
             observed = row.attempts - row.quota_failures
             reliability = (observed - row.infra_failures + 2.5) / (observed + 5)
             return quality, reliability

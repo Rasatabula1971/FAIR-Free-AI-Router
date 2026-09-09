@@ -4,11 +4,13 @@ from pathlib import Path
 import yaml
 from pydantic import Field
 
+from fair.benchmarks.contracts import BenchmarkPolicy
 from fair.quality.contracts import SourcePolicy
 from fair.schemas.domain import DTO
 
 
 class RoutingSettings(DTO):
+    benchmark_policy: BenchmarkPolicy | None = None
     source_policy: SourcePolicy | None = None
     max_attempts: int = Field(default=3, ge=1, le=10)
     max_verification_attempts: int = Field(default=2, ge=1, le=3)

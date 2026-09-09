@@ -6,13 +6,14 @@ PRIVACY = {
 
 
 class Selector:
-    def __init__(self, registry, quota, settings, performance):
+    def __init__(self, registry, quota, settings, performance, benchmarks):
         self.registry = registry
         self.quota = quota
         self.settings = settings
         self.performance = performance
+        self.benchmarks = benchmarks
 
-    def candidates(self, request, profile, tried):
+    def candidates(self, request, profile, tried, benchmark_checks=None, eligible=None):
         candidates = []
         for spec in self.registry.providers.values():
             try:
@@ -30,8 +31,23 @@ class Selector:
                     continue
                 if profile.context_tokens_estimate > model.context_window:
                     continue
+                if eligible is not None and not eligible(spec, model):
+                    continue
+                quality_prior = None
+                if self.settings.benchmark_policy is not None:
+                    check = self.benchmarks.assess(
+                        request, profile, spec, model, self.settings.benchmark_policy
+                    )
+                    if benchmark_checks is not None:
+                        benchmark_checks[(spec.provider_id, model.model_id)] = check
+                    if check.state != "PASSED":
+                        continue
+                    quality_prior = check.conservative_score / 100
                 quality, reliability = self.performance.scores(
-                    spec.provider_id, model.model_id, profile.task_class
+                    spec.provider_id,
+                    model.model_id,
+                    profile.task_class,
+                    quality_prior=quality_prior,
                 )
                 remaining = self.quota.remaining(spec)
                 headroom = remaining / spec.request_limit if spec.request_limit else 0.5

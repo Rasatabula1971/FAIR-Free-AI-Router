@@ -318,7 +318,9 @@ and retained in client-isolated request history. Cancellation records the cancel
 
 `ACCEPTED` includes output, provider/model, quality report, attempts and the explicit verification
 state. An accepted deterministic score of 100 means all implemented contract checks passed;
-it is not a calibrated probability of truth. A known hard rejection scores 0. Missing validation
+it is not a calibrated probability of truth. Optional [benchmark qualification](BENCHMARKS.md)
+also requires the model's conservative workload score to meet the selected level, while every
+answer still passes its local contract and other runtime gates. A known hard rejection scores 0. Missing validation
 coverage has a null score and an `UNVERIFIED` attempt disposition. This additional disposition
 keeps unavailable validation separate from demonstrated model failure.
 
@@ -338,10 +340,11 @@ checks passed. The final request may still escalate because its required cross-c
 Consequently an escalation can legitimately have a best local score of 100; that score never
 overrides the independent-verification gate.
 
-The engine version is `deterministic-v6`. Existing quality reports retain their original engine
+The engine version is `deterministic-v7`. Existing quality reports retain their original engine
 version; new validation kinds have separate model/task statistics. Migration `0004` adds the
 nullable model independence group; historical attempts default to the `PRIMARY` role when read.
 
 Full Sprint B remains open for broader code execution support, prose grounding/consistency,
-automated source credibility evaluation and quality calibration. Operator-reviewed source
-policies are implemented; live providers remain disabled.
+automated source credibility evaluation and empirical calibration on actual live workloads.
+Operator-reviewed source policies and offline benchmark qualification are implemented; live
+providers remain disabled. Migration `0005` adds the model revision used to bind qualification.

@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from fair.quality.version import ENGINE_VERSION
+
 
 class AccessClass(StrEnum):
     FREE_RECURRING = "FREE_RECURRING"
@@ -64,6 +66,7 @@ class ModelDescriptor(DTO):
     capabilities: set[Capability] = Field(default_factory=set)
     active: bool = True
     independence_group: str | None = Field(default=None, min_length=1, max_length=128)
+    model_revision: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class ProviderSpec(DTO):
@@ -173,6 +176,32 @@ class SourcePolicyReport(DTO):
     policy_fingerprint: str | None = None
 
 
+class BenchmarkCheck(DTO):
+    provider_id: str
+    model_id: str
+    task_class: str
+    state: Literal[
+        "NOT_REQUESTED",
+        "UNAVAILABLE",
+        "FIXTURE",
+        "UNREVIEWED",
+        "VERSION_MISMATCH",
+        "EXPIRED",
+        "INSUFFICIENT",
+        "VALIDATION_GAP",
+        "FALSE_ACCEPTANCE",
+        "BELOW_THRESHOLD",
+        "PASSED",
+        "SERVICE_FAILED",
+    ] = "NOT_REQUESTED"
+    checked_at: datetime | None = None
+    calibration_samples: int = 0
+    holdout_samples: int = 0
+    conservative_score: float | None = None
+    minimum_required: float | None = None
+    benchmark_fingerprint: str | None = None
+
+
 class QualityReport(DTO):
     overall_score: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     hard_reject: bool = False
@@ -190,7 +219,7 @@ class QualityReport(DTO):
     validator_results: dict[str, str] = Field(default_factory=dict)
     claim_checks: list[ClaimCheck] = Field(default_factory=list)
     source_policy: SourcePolicyReport = Field(default_factory=SourcePolicyReport)
-    engine_version: str = "deterministic-v6"
+    engine_version: str = ENGINE_VERSION
     validation_fingerprint: str | None = None
 
 
@@ -219,6 +248,7 @@ class CrossCheckReport(DTO):
         "STOPPED",
         "SERVICE_FAILED",
         "SOURCE_BLOCKED",
+        "BENCHMARK_BLOCKED",
     ] = "NOT_REQUESTED"
     primary_attempt_number: int | None = None
     verification_attempt_number: int | None = None
