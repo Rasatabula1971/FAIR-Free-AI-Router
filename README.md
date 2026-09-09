@@ -56,6 +56,11 @@ The migration test verifies that existing audit history and the last stop comman
 an upgrade. A separate PostgreSQL migration/audit-trigger test runs when
 `FAIR_TEST_POSTGRES_URL` is set; GitHub Actions includes a PostgreSQL service for that check.
 
+GitHub Actions also builds and starts the actual Docker Compose package and runs
+`scripts/docker_smoke.py` against its HTTP API. This checks offline routing, authentication,
+request/audit persistence, and stop/resume across an API restart. The job uses disposable CI
+credentials and removes its database volume afterward; no live providers are enabled.
+
 ## Local service with PostgreSQL
 
 The Compose file is a development configuration with local database credentials. Docker

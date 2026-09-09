@@ -31,10 +31,11 @@ requirements, not separate authorization for deployment, paid inference or publi
 - Authenticated provider-health endpoint and provider summaries reflecting runtime blocks.
 - Restart regression tests, migration preservation checks and a PostgreSQL CI test job.
 
-## Remaining Sprint A verification
+## Sprint A integration verification
 
-- Live PostgreSQL migration, audit-trigger and Docker verification. Neither PostgreSQL nor Docker
-  is available on the local build machine; the PostgreSQL test is prepared but skipped locally.
+- PostgreSQL migration/audit-trigger tests and the packaged Docker API smoke check now pass
+  on GitHub Actions. See the sixth increment below for scope and evidence. Neither PostgreSQL
+  nor Docker is installed on the local Windows build machine; its PostgreSQL test stays skipped.
 - Production validation remains a gate before any live-provider integration.
 
 ## Third increment: first Sprint B quality path
@@ -82,7 +83,8 @@ database maintenance to clear; a scoped, audited recovery API is not implemented
 adapter observations cover request quotas; token/compute quota tracking is still future work.
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
-The GitHub workflow is prepared locally and has not been executed on GitHub.
+GitHub Actions now passes core, PostgreSQL and Docker jobs. Earlier increment validation notes
+below describe the results available at that time; current integration evidence is in increment six.
 
 ## Validation of the first increment
 
@@ -162,3 +164,20 @@ The GitHub workflow is prepared locally and has not been executed on GitHub.
   hidden producer answers/tests, code/JSON agreement, service failures and durable cancellation.
 - PostgreSQL/Docker, native sandboxing, general claim entailment and calibrated quality scoring
   remain unverified or unfinished. Live providers remain disabled; remote CI has not been run.
+
+## Sixth increment: PostgreSQL and Docker integration verification
+
+- Fixed GitHub Actions service health-command quoting so PostgreSQL starts before its tests.
+- Added a Docker job that builds the actual application image and starts the development
+  Compose stack with a disposable PostgreSQL volume and offline demo fixtures.
+- Added `scripts/docker_smoke.py`: checks readiness, inactive live providers, client/admin
+  authentication, offline routing with withheld unverified output, and persisted request/audit
+  history. Restarts the API and confirms that history and the stop switch survive, then resumes
+  routing. CI removes its disposable stack and volume even when a check fails.
+- Core tests, SQLite migration/schema checks, PostgreSQL migration round trips and append-only
+  audit triggers, and Docker smoke checks passed in
+  [GitHub run 34298968029](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34298968029)
+  for code commit `0f9ba14`.
+- This verifies the development package on GitHub's Linux runner. Local Windows Docker remains
+  untested; production deployment, live adapters and native generated-code sandboxing are still
+  outside the verified scope. Sprint B grounding and quality calibration work remains.
