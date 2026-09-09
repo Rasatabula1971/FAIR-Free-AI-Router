@@ -5,7 +5,7 @@ from jsonschema import Draft202012Validator, SchemaError
 from pydantic import Field, model_validator
 
 from fair.quality.claims import fact_index
-from fair.quality.contracts import Evidence, ValidationContract
+from fair.quality.contracts import Evidence, SourcePolicy, ValidationContract
 from fair.quality.grounding import grounded_result
 from fair.schemas.domain import (
     DTO,
@@ -14,6 +14,7 @@ from fair.schemas.domain import (
     CrossCheckReport,
     PrivacyClass,
     QualityReport,
+    SourcePolicyReport,
 )
 
 
@@ -29,9 +30,15 @@ class SolveRequest(DTO):
     cross_check_required: bool = False
     validation: ValidationContract | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=10)
+    source_policy: SourcePolicy | None = None
 
     @model_validator(mode="after")
     def unique_sources(self):
+        if self.source_policy is not None and (
+            self.validation is None
+            or self.validation.kind not in {"grounded_json", "grounded_claims"}
+        ):
+            raise ValueError("Source policies require a structured grounding contract")
         ids = [item.source_id for item in self.evidence]
         if len(ids) != len(set(ids)):
             raise ValueError("Evidence source IDs must be unique")
@@ -79,5 +86,6 @@ class SolveResponse(DTO):
     quality: QualityReport | None = None
     model_disagreement: Literal["NOT_ASSESSED", "NONE", "DETECTED"] = "NOT_ASSESSED"
     cross_check: CrossCheckReport = Field(default_factory=CrossCheckReport)
+    source_policy: SourcePolicyReport = Field(default_factory=SourcePolicyReport)
     recommended_capability: str = "VALIDATED_FREE_MODEL_OR_HOST_REVIEW"
     paid_inference_executed: Literal[False] = False

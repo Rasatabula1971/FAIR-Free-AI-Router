@@ -9,21 +9,32 @@ from fair.performance.registry import PerformanceRegistry
 from fair.providers.base import AuthenticationFailed, QuotaExceeded, RateLimited
 from fair.quality.consensus import compare, independent
 from fair.quality.engine import acceptable, evaluate
+from fair.quality.source_reviews import (
+    SourcePolicyBlocked,
+    SourceReviewRegistry,
+    SourceReviewUnavailable,
+)
 from fair.quota.governor import QuotaGovernor
 from fair.router.selector import Selector
 from fair.schemas.api import SolveResponse
 from fair.schemas.db import AuditEvent, EscalationRecord, QualityRecord, RoutingAttempt, TaskRequest
 from fair.schemas.db import TaskProfile as ProfileRow
-from fair.schemas.domain import Attempt, CrossCheckReport, NormalizedModelRequest
+from fair.schemas.domain import (
+    Attempt,
+    CrossCheckReport,
+    NormalizedModelRequest,
+    SourcePolicyReport,
+)
 
 
 class Router:
-    def __init__(self, registry, settings, thresholds, sessions, sandbox=None):
+    def __init__(self, registry, settings, thresholds, sessions, sandbox=None, source_reviews=None):
         self.registry = registry
         self.settings = settings
         self.thresholds = thresholds
         self.sessions = sessions
         self.sandbox = sandbox
+        self.source_reviews = source_reviews or SourceReviewRegistry()
         registry.persist(sessions)
         self.quota = QuotaGovernor(settings, sessions)
         self.performance = PerformanceRegistry(sessions)
@@ -72,6 +83,8 @@ class Router:
             self.audit(session, request_id, request.client_id, "ATTEMPT_COMPLETED", detail)
 
     async def _attempt(self, request_id, request, profile, route, number, role):
+        if self._source_report(request).state == "BLOCKED":
+            raise SourcePolicyBlocked()
         score, spec, model = route
         # Shared by production attempts and cross-checks: no second execution authority.
         admit_provider(spec)
@@ -134,7 +147,12 @@ class Router:
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
         else:
             try:
-                quality = evaluate(request, profile, response)
+                source_report = self._source_report(request)
+                quality = (
+                    evaluate(request, profile, response, source_review=source_report)
+                    if source_report.state != "NOT_REQUESTED"
+                    else evaluate(request, profile, response)
+                )
                 if (
                     request.validation is not None
                     and request.validation.kind == "native_python_function"
@@ -212,9 +230,16 @@ class Router:
             # Recheck at the dispatch boundary, even if candidate selection changes later.
             if not independent(primary_route, route):
                 break
-            attempt, response, failed = await self._attempt(
-                request_id, request, profile, route, len(attempts) + 1, "CROSS_CHECK"
-            )
+            try:
+                attempt, response, failed = await self._attempt(
+                    request_id, request, profile, route, len(attempts) + 1, "CROSS_CHECK"
+                )
+            except SourcePolicyBlocked:
+                report.state = "SOURCE_BLOCKED"
+                break
+            except SourceReviewUnavailable:
+                report.state = "SERVICE_FAILED"
+                break
             if attempt is None:
                 continue
             tried.add((attempt.provider_id, attempt.model_id))
@@ -265,6 +290,12 @@ class Router:
         async with self.lock:
             return await self._solve(request)
 
+    def _source_report(self, request):
+        try:
+            return self.source_reviews.evaluate(request, self.settings.source_policy)
+        except Exception as error:
+            raise SourceReviewUnavailable("SOURCE_REVIEW_SERVICE_FAILED") from error
+
     async def _solve(self, request):
         request_id = str(uuid4())
         profile = profile_task(request, self.thresholds)
@@ -308,9 +339,16 @@ class Router:
             if not candidates:
                 break
             route = candidates[0]
-            attempt, response, validator_failed = await self._attempt(
-                request_id, request, profile, route, len(attempts) + 1, "PRIMARY"
-            )
+            try:
+                attempt, response, validator_failed = await self._attempt(
+                    request_id, request, profile, route, len(attempts) + 1, "PRIMARY"
+                )
+            except SourcePolicyBlocked:
+                reason = "SOURCE_POLICY_UNSATISFIED"
+                break
+            except SourceReviewUnavailable:
+                validator_failed = True
+                break
             if attempt is None:
                 continue
             tried.add((attempt.provider_id, attempt.model_id))
@@ -334,6 +372,7 @@ class Router:
                         "REJECTED": "CROSS_CHECK_REJECTED",
                         "UNAVAILABLE": "INDEPENDENT_VERIFIER_UNAVAILABLE",
                         "SERVICE_FAILED": "VALIDATION_SERVICE_FAILED",
+                        "SOURCE_BLOCKED": "SOURCE_POLICY_UNSATISFIED",
                     }[cross_check.state]
                     break
             accepted_response, accepted_quality = response, attempt.quality
@@ -348,6 +387,19 @@ class Router:
                 reason = "ALL_FREE_MODELS_UNAVAILABLE"
         if validator_failed:
             reason = "VALIDATION_SERVICE_FAILED"
+        try:
+            source_report = self._source_report(request)
+        except Exception:
+            source_report = SourcePolicyReport(
+                state="SERVICE_FAILED", reasons=["SOURCE_REVIEW_SERVICE_FAILED"]
+            )
+            validator_failed = True
+            reason = "VALIDATION_SERVICE_FAILED"
+            accepted_response = accepted_quality = None
+        if source_report.state == "BLOCKED":
+            accepted_response = accepted_quality = None
+            if not validator_failed and reason != "SYSTEM_STOPPED":
+                reason = "SOURCE_POLICY_UNSATISFIED"
         scored = [
             a.quality.overall_score
             for a in attempts
@@ -372,11 +424,20 @@ class Router:
             if accepted_quality
             else "UNVERIFIED",
             cross_check=cross_check,
+            source_policy=source_report,
             model_disagreement=disagreement,
         )
         with self.sessions.begin() as session:
             row = session.get(TaskRequest, request_id)
             row.status, row.result_json = result.status, result.model_dump(mode="json")
+            if source_report.state != "NOT_REQUESTED":
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "SOURCE_POLICY_CHECKED",
+                    source_report.model_dump(mode="json"),
+                )
             if result.status == "ESCALATION_REQUIRED":
                 session.add(
                     EscalationRecord(

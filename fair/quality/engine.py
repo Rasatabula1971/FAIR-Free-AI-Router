@@ -8,10 +8,12 @@ from fair.quality.claims import validate_claims
 from fair.quality.code_validator import validate_function
 from fair.quality.grounding import grounded_result
 from fair.quality.json_data import strict_json
-from fair.schemas.domain import QualityReport
+from fair.schemas.domain import QualityReport, SourcePolicyReport
 
 
-def evaluate(request, profile, response, *, native_result=None) -> QualityReport:
+def evaluate(
+    request, profile, response, *, native_result=None, source_review=None
+) -> QualityReport:
     reasons = []
     checks = {}
     claim_checks = []
@@ -132,6 +134,16 @@ def evaluate(request, profile, response, *, native_result=None) -> QualityReport
         verification = "UNVERIFIED"
         if not reasons:
             score = None
+    source_review = source_review or SourcePolicyReport(
+        state="BLOCKED" if request.source_policy is not None else "NOT_REQUESTED",
+        reasons=["SOURCE_REVIEW_REQUIRED"] if request.source_policy is not None else [],
+    )
+    if source_review.state in {"BLOCKED", "SERVICE_FAILED"}:
+        checks["source_policy"] = source_review.state
+        verification = "UNVERIFIED"
+        score = None
+    elif source_review.state == "PASSED":
+        checks["source_policy"] = "REVIEWED_SNAPSHOT_POLICY_MET"
     if reasons:
         verification = "UNVERIFIED"
         score = 0.0
@@ -142,6 +154,7 @@ def evaluate(request, profile, response, *, native_result=None) -> QualityReport
         verification_state=verification,
         validator_results=checks,
         claim_checks=claim_checks,
+        source_policy=source_review,
         validation_fingerprint=hashlib.sha256(
             json.dumps(
                 {
@@ -150,6 +163,7 @@ def evaluate(request, profile, response, *, native_result=None) -> QualityReport
                     else None,
                     "schema": request.expected_schema,
                     "evidence": [source.model_dump() for source in request.evidence],
+                    "source_policy_fingerprint": source_review.policy_fingerprint,
                 },
                 sort_keys=True,
             ).encode()

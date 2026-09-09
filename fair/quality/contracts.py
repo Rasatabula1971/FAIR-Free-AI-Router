@@ -136,6 +136,15 @@ ValidationContract = Annotated[
 ]
 
 
+class SourcePolicy(DTO):
+    max_age_seconds: int = Field(default=86400, ge=1, le=31536000)
+    allowed_source_classes: set[Literal["PRIMARY", "SECONDARY"]] = Field(
+        default_factory=lambda: {"PRIMARY", "SECONDARY"}, min_length=1, max_length=2
+    )
+    min_independent_origins: int = Field(default=1, ge=1, le=10)
+
+
 class Evidence(DTO):
     source_id: str = Field(min_length=1, max_length=128)
     text: str = Field(min_length=1, max_length=10000)
+    review_id: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")

@@ -1,6 +1,7 @@
 .git
 .venv
 .env
+config/source_reviews.local.yaml
 __pycache__
 *.db
 *.log

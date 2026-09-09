@@ -2,14 +2,16 @@ import hmac
 import json
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from sqlalchemy import select
 
-from fair.config import RoutingSettings, load_yaml
+from fair.config import RoutingSettings, config_dir, load_yaml
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.quality.sandbox import DockerSandbox
+from fair.quality.source_reviews import SourceReviewRegistry
 from fair.router.orchestrator import Router
 from fair.schemas.api import SolveRequest, SolveResponse
 from fair.schemas.db import AuditEvent, ModelTaskPerformance, database
@@ -55,6 +57,14 @@ def create_app(router=None, client_keys=None, admin_key=None):
                         MockAdapter(name),
                     )
                     registry.adapters[name].models = registry.providers[name].models
+            review_path = Path(
+                os.environ.get("FAIR_SOURCE_REVIEWS_FILE", config_dir() / "source_reviews.yaml")
+            )
+            source_reviews = (
+                SourceReviewRegistry.from_file(review_path)
+                if review_path.exists() or os.environ.get("FAIR_SOURCE_REVIEWS_FILE")
+                else SourceReviewRegistry()
+            )
             app.state.router = Router(
                 registry,
                 RoutingSettings(**load_yaml("routing.yaml")),
@@ -63,6 +73,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
                 sandbox=DockerSandbox(os.environ["FAIR_SANDBOX_IMAGE"])
                 if os.environ.get("FAIR_SANDBOX_IMAGE")
                 else None,
+                source_reviews=source_reviews,
             )
         else:
             app.state.router = router

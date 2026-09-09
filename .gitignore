@@ -5,6 +5,7 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .env
+config/source_reviews.local.yaml
 *.db
 *.log
 build/

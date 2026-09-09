@@ -150,6 +150,29 @@ class ClaimCheck(DTO):
     evidence_count: int = Field(ge=0)
 
 
+class SourceCheck(DTO):
+    source_id: str
+    status: Literal[
+        "REVIEWED",
+        "REVIEW_UNAVAILABLE",
+        "CONTENT_MISMATCH",
+        "REJECTED",
+        "EXPIRED",
+        "STALE",
+        "FUTURE_REVIEW",
+        "SOURCE_CLASS_DISALLOWED",
+    ]
+
+
+class SourcePolicyReport(DTO):
+    state: Literal["NOT_REQUESTED", "PASSED", "BLOCKED", "SERVICE_FAILED"] = "NOT_REQUESTED"
+    checked_at: datetime | None = None
+    checks: list[SourceCheck] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+    independent_origins: dict[str, int] = Field(default_factory=dict)
+    policy_fingerprint: str | None = None
+
+
 class QualityReport(DTO):
     overall_score: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     hard_reject: bool = False
@@ -166,7 +189,8 @@ class QualityReport(DTO):
     ] = "UNVERIFIED"
     validator_results: dict[str, str] = Field(default_factory=dict)
     claim_checks: list[ClaimCheck] = Field(default_factory=list)
-    engine_version: str = "deterministic-v5"
+    source_policy: SourcePolicyReport = Field(default_factory=SourcePolicyReport)
+    engine_version: str = "deterministic-v6"
     validation_fingerprint: str | None = None
 
 
@@ -194,6 +218,7 @@ class CrossCheckReport(DTO):
         "DISAGREEMENT",
         "STOPPED",
         "SERVICE_FAILED",
+        "SOURCE_BLOCKED",
     ] = "NOT_REQUESTED"
     primary_attempt_number: int | None = None
     verification_attempt_number: int | None = None
