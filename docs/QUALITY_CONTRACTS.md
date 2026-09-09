@@ -269,7 +269,11 @@ tasks require the independent cross-check described below before accepting a sup
 Grounding is covered for exact `grounded_json` extraction and the `grounded_claims` contract,
 and coding only for the
 `python_function` / `native_python_function` subset. Other required capabilities are not covered.
-Source credibility evaluation and arbitrary Python execution are not implemented. Schema-only and general
+Operator-reviewed snapshot policies are available for both grounding contracts; see the
+[source review guide](SOURCE_REVIEWS.md) for exact-content binding, client authorization,
+source classes, age/expiry checks and per-claim corroboration. Passing a policy does not
+establish source truth or live freshness. Automated credibility evaluation and arbitrary Python
+execution are not implemented. Schema-only and general
 prose responses remain unverified even if multiple models return identical text.
 
 ## Independent cross-checks
@@ -334,9 +338,10 @@ checks passed. The final request may still escalate because its required cross-c
 Consequently an escalation can legitimately have a best local score of 100; that score never
 overrides the independent-verification gate.
 
-The engine version is `deterministic-v5`. Existing quality reports retain their original engine
+The engine version is `deterministic-v6`. Existing quality reports retain their original engine
 version; new validation kinds have separate model/task statistics. Migration `0004` adds the
 nullable model independence group; historical attempts default to the `PRIMARY` role when read.
 
 Full Sprint B remains open for broader code execution support, prose grounding/consistency,
-source credibility evaluation and quality calibration. Live providers remain disabled.
+automated source credibility evaluation and quality calibration. Operator-reviewed source
+policies are implemented; live providers remain disabled.

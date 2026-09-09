@@ -16,6 +16,12 @@ rejecting unsupported/contradicted claims and incomplete attribution. Missing or
 evidence supports explicit abstention, which remains unverified with no invented quality score.
 Unsupported tasks still escalate. Failed answers are withheld. Paid inference is never executed.
 
+Optional source policies require operator-reviewed evidence snapshots, enforce client access,
+content hashes, review expiry and observation age, and can require multiple configured origins
+per structured claim. Server policies cannot be weakened by a request. See the
+[source review guide](docs/SOURCE_REVIEWS.md) for configuration, examples and renewal. These
+checks establish review-policy compliance, not source truth or live freshness.
+
 Set `cross_check_required: true` to require a second provider/model to solve and validate the
 same task independently. This is mandatory for `high_impact_support`. Both answers must pass
 the selected contract and agree within its scope; otherwise FAIR withholds the provisional
@@ -57,6 +63,8 @@ Cross-check tests cover route diversity, alias groups, bounded failover, disagre
 answer isolation, high-impact enforcement and durable cancellation lineage.
 Claim-grounding tests cover cross-source conflicts, exact context/type matching, complete
 provenance, partial answers, abstention, source budgets, client isolation and private audit reports.
+Source-review tests cover tampering, missing/rejected/expired reviews, client permissions,
+server policy floors, per-claim corroboration, and expiry during independent verification.
 
 Restart regressions also cover durable stop/resume, reservations, exhaustion, authentication
 blocks, throttle deadlines, circuit history, single recovery probes and abandoned probes.

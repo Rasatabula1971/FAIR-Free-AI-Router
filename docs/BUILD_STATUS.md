@@ -60,11 +60,12 @@ requirements, not separate authorization for deployment, paid inference or publi
 
 - B (in progress): deterministic acceptance and persistent performance are implemented below.
   Remaining work includes broader code execution support, grounding/consistency checks,
-  source credibility evaluation and quality calibration. Scoped independent cross-checks are
+  automated source credibility evaluation and quality calibration. Scoped independent cross-checks are
   implemented in the fifth increment.
   Opt-in native execution of the bounded numeric subset is implemented in the seventh increment.
   Multi-source structured claim grounding is implemented in the eighth increment; free-form
-  prose entailment remains outside the verified scope.
+  prose entailment remains outside the verified scope. Operator-reviewed source policies are
+  implemented in the ninth increment. Step 3, quality-score calibration, is next.
 - C: fair scheduler, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling performance, shadow benchmarking and drift detection.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
@@ -86,8 +87,8 @@ database maintenance to clear; a scoped, audited recovery API is not implemented
 adapter observations cover request quotas; token/compute quota tracking is still future work.
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
-GitHub Actions now passes core, PostgreSQL and Docker jobs. Earlier increment validation notes
-below describe the results available at that time; current integration evidence is in increment six.
+GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
+validation notes describe the results available at that time; current evidence is in increment nine.
 
 ## Validation of the first increment
 
@@ -228,4 +229,28 @@ below describe the results available at that time; current integration evidence 
 - This completes the structured-data increment of the broader grounding step. Prose entailment,
   source credibility, freshness and automatic conversion of prose into trusted facts are not
   implemented. Live providers remain disabled. See QUALITY_CONTRACTS.md for the complete format,
-  examples and acceptance scope.
+examples and acceptance scope.
+
+## Ninth increment: operator-reviewed source policies (Step 2)
+
+- Reviews bind exact evidence text to a SHA-256 hash, authorized clients, a configured origin
+  group, source class, operator decision/rationale and timezone-aware observation/review/expiry
+  times. Requests cannot approve themselves by supplying trust labels.
+- Optional request and server policies combine conservatively. Missing, rejected, changed,
+  expired, stale or disallowed evidence blocks dispatch. Corroboration is checked per requested
+  fact; shared origin groups and identical content hashes cannot count twice.
+- Policies are checked before dispatch, after responses and before release, including
+  independent verification. Expiry withholds output without treating unavailable review
+  coverage as a model-quality failure. Grounding still rejects conflicting reviewed facts.
+- Reports and audit history retain check statuses and fingerprints without raw evidence or
+  private review metadata. File-backed reviews load at startup; restart after changes.
+- Added the [operator guide](SOURCE_REVIEWS.md) with complete review/request examples, server
+  configuration, renewal procedures, Docker configuration requirements and failure statuses.
+- Resumed validation on 2026-09-09: 332 tests passed, 10 PostgreSQL/native Docker tests skipped
+  locally, two upstream deprecation warnings. All four GitHub jobs passed for code commit
+  `dc4b2a8`: core, PostgreSQL, Docker API smoke and native sandbox. Evidence:
+  [run 34302245481](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34302245481).
+- Engine version is `deterministic-v6`; no database migration is required. Step 2's operator
+  review scope is complete. Automated source assessment, live freshness and prose entailment
+  remain outside that scope. Next is Step 3: benchmark-based quality-score calibration.
+  Live providers remain disabled.
