@@ -310,7 +310,9 @@ examples and acceptance scope.
   image for the expanded language and rerun/review any benchmark qualifications bound to v7.
 - Local validation: 457 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
   two upstream deprecation warnings. Includes 74 new local regressions and 18 new real-container
-  checks prepared for CI. GitHub integration verification for this increment is pending.
+  checks. All four GitHub jobs passed for code commit `610ab00`: core, PostgreSQL, packaged Docker
+  API and native sandbox, including expanded-language semantics and owner-scoped crash recovery.
+  Evidence: [run 34391099029](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34391099029).
 - See [quality contracts](QUALITY_CONTRACTS.md) for examples and exact limits, and
   [sandbox recovery](SANDBOX_RECOVERY.md) for owner configuration and operating procedures.
   Step 4's bounded expansion is complete. Arbitrary Python, packages, production hostile-code
