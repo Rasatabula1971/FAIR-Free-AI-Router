@@ -474,5 +474,7 @@ examples and acceptance scope.
   warnings. Lint, formatting and preflight tests pass. No migration or quality-engine change;
   schema remains `0008`. The packaged restore/container checks run in GitHub CI, with all model
   calls still using offline fixtures. Public deployment and live cloud qualification remain pending.
-- Step 10 implementation is complete within the documented single-process scope. GitHub
-  verification evidence will be recorded after the code is pushed.
+- Step 10 is complete within the documented single-process scope. All four GitHub jobs passed
+  for code commit `9000a4e`: core, PostgreSQL, native sandbox and packaged Docker API, including
+  the real backup/restore drill, readiness/preflight and build-context exclusion check. Evidence:
+  [run 34473296926](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34473296926).
