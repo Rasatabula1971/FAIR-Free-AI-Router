@@ -1,0 +1,7 @@
+# Enable only after configuring reviewed provider/model entries and account controls.
+enabled: false
+groq_free_plan_confirmed: false
+openrouter_free_account_confirmed: false
+ollama_local_only_confirmed: false
+ollama_url: http://127.0.0.1:11434
+review_max_age_days: 30

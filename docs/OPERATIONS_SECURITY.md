@@ -49,8 +49,9 @@ reflection of its exact credential. It blocks reflection, normalizes exception t
 typed quota/rate/authentication failures. Credential reflection produces a security block through
 the existing router; it is not a model-quality measurement. Normal cancellation propagates.
 
-This boundary is implemented and tested with fixtures for future live adapter integration; no
-live factory is enabled. Adapters remain trusted code: they can read process memory/environment,
+Step 8 uses this boundary for the opt-in Groq and OpenRouter factories; see
+[live adapter setup](LIVE_ADAPTERS.md). Factories remain disabled by default.
+Adapters remain trusted code: they can read process memory/environment,
 must use the key only for the intended provider transport, and must not log it. Exact-string
 checks cannot detect every encoding, transformation or independently obtained secret. `SecretStr`
 masks ordinary representations; it does not encrypt memory or prevent explicit extraction.

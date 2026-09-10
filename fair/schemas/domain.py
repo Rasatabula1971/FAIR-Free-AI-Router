@@ -116,11 +116,20 @@ class Assertion(DTO):
     value: str = Field(min_length=1, max_length=1024)
 
 
+class QuotaSnapshot(DTO):
+    provider_id: str
+    quota_unit: Literal["requests"] = "requests"
+    quota_limit: int | None = Field(default=None, ge=0)
+    quota_remaining_estimate: int | None = Field(default=None, ge=0)
+    reset_at: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
 class NormalizedModelResponse(DTO):
     provider_id: str
     model_id: str
     text: str = Field(max_length=100000)
     finish_reason: str = "stop"
+    quota: QuotaSnapshot | None = None
     citations: list[Citation] = Field(default_factory=list, max_length=50)
     assertions: list[Assertion] = Field(default_factory=list, max_length=50)
 
@@ -129,14 +138,6 @@ class ProviderHealth(DTO):
     provider_id: str
     state: ProviderState
     source: Literal["OBSERVED", "OFFLINE_FIXTURE"]
-
-
-class QuotaSnapshot(DTO):
-    provider_id: str
-    quota_unit: Literal["requests"] = "requests"
-    quota_limit: int | None = Field(default=None, ge=0)
-    quota_remaining_estimate: int | None = Field(default=None, ge=0)
-    reset_at: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class ClaimCheck(DTO):

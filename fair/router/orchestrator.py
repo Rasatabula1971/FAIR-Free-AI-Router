@@ -9,7 +9,7 @@ from fair.classifier.task_profiler import model_task, profile_task
 from fair.governor.kill_switch import KillSwitch
 from fair.governor.policy import admit_provider
 from fair.performance.registry import PerformanceRegistry
-from fair.providers.base import AuthenticationFailed, QuotaExceeded, RateLimited
+from fair.providers.base import AuthenticationFailed, BillingViolation, QuotaExceeded, RateLimited
 from fair.quality.consensus import compare, independent
 from fair.quality.engine import acceptable, evaluate
 from fair.quality.source_reviews import (
@@ -124,6 +124,7 @@ class Router:
         start = monotonic()
         quality = response = error_type = None
         validator_failed = cancelled = False
+        billing_violation = False
         with self.sessions.begin() as session:
             self.audit(
                 session,
@@ -157,12 +158,27 @@ class Router:
             )
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
                 raise ValueError("Response identity mismatch")
+            if response.quota is not None:
+                self.quota.observe(spec, response.quota)
             self.quota.success(spec.provider_id)
+        except BillingViolation:
+            billing_violation = True
+            self.quota.block_security(spec.provider_id)
+            self.stopped = True
+            disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
+            with self.sessions.begin() as session:
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "BILLING_POLICY_VIOLATION",
+                    {"provider_id": spec.provider_id, "system_stopped": True},
+                )
         except QuotaExceeded as error:
             self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
-        except RateLimited:
-            self.quota.throttle(spec.provider_id)
+        except RateLimited as error:
+            self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
         except AuthenticationFailed:
             self.quota.block_security(spec.provider_id)
@@ -221,6 +237,8 @@ class Router:
             role=role,
         )
         self._persist_attempt(request_id, request, profile, attempt)
+        if billing_violation:
+            raise BillingViolation("PROVIDER_COST_POLICY_VIOLATION")
         if cancelled:
             with self.sessions.begin() as session:
                 session.get(TaskRequest, request_id).status = "CANCELLED"

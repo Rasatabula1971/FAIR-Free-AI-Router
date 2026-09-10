@@ -90,13 +90,45 @@ class QuotaGovernor:
         row.blocked_until = self.clock() + self.settings.cooldown_seconds
         row.probe_until = 0
 
-    def throttle(self, provider_id):
+    def throttle(self, provider_id, retry_after=None):
         with self.sessions.begin() as session:
             row = self._row(session, provider_id)
-            row.blocked_until = self.clock() + self.settings.cooldown_seconds
             if row.circuit_state == "HALF_OPEN":
                 self._open(row)
+            delay = (
+                retry_after
+                if isinstance(retry_after, (int, float))
+                and isfinite(retry_after)
+                and 0 < retry_after <= 86400
+                else 0
+            )
+            row.blocked_until = max(
+                row.blocked_until, self.clock() + max(self.settings.cooldown_seconds, delay)
+            )
             self._event(session, row, "RATE_LIMITED")
+
+    def observe(self, spec, observation):
+        if observation.provider_id != spec.provider_id:
+            raise ValueError("Quota observation identity mismatch")
+        remaining = observation.quota_remaining_estimate
+        if (
+            remaining is None
+            or observation.quota_limit is None
+            or remaining > observation.quota_limit
+        ):
+            return
+        with self.sessions.begin() as session:
+            row = self._row(session, spec.provider_id)
+            if spec.request_limit is not None:
+                row.used = max(row.used, spec.request_limit - min(remaining, spec.request_limit))
+            if remaining == 0:
+                row.exhausted = True
+            if (
+                observation.reset_at is not None
+                and self.clock() < observation.reset_at <= self.clock() + 86400
+            ):
+                row.reset_at = observation.reset_at
+            self._event(session, row, "QUOTA_OBSERVED")
 
     def exhaust(self, provider_id, reset_at=None):
         """reset_at comes only from a trusted adapter's observed quota reset, if supplied."""

@@ -72,12 +72,13 @@ requirements, not separate authorization for deployment, paid inference or publi
 - C: distributed scheduling, retrieval capability boundaries and stronger operational isolation.
 - D: feedback, rolling metrics, optional shadow checks and drift tracking are implemented in
   Step 7; representative live collection and automated review/alerts remain future work.
-- E: two or three live adapters after current provider terms/quota/privacy verification.
+- E: Step 8 implements Groq, OpenRouter free and local Ollama adapters. Local inference is
+  verified; live cloud account/inference verification remains pending credentials and approval.
 - F: remaining verified adapters, Python/JavaScript SDKs, cache and operating runbooks.
 
 ## Known constraints
 
-All live providers are inactive; even local Ollama remains disabled until its adapter exists.
+All shipped live providers are inactive; Step 8 adds opt-in adapters and an isolated local smoke.
 Unknown provider costs fail admission. Unknown request limits have no invented allowance;
 exhaustion without reset information stays blocked across restarts. No provider
 credential is needed for this increment. JSON schema references are disabled to prevent
@@ -92,7 +93,7 @@ adapter observations cover request quotas; token/compute quota tracking is still
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment fourteen.
+validation notes describe the results available at that time; current evidence is in increment fifteen.
 
 ## Validation of the first increment
 
@@ -398,3 +399,27 @@ examples and acceptance scope.
   [run 34420585891](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34420585891).
   Step 7 is complete within the documented scope. Live providers and shadow collection remain
   disabled. Next is Step 8: implement and verify the first live provider adapters.
+
+## Fifteenth increment: first live text adapters (Step 8)
+
+- Implemented opt-in Groq, OpenRouter explicit free models and local Ollama adapters. Separate
+  account attestations, current cloud reviews, fixed endpoints, model allowlists, PUBLIC-only
+  cloud transport and text capability limits preserve admission boundaries. All shipped
+  provider statuses and live switches remain inactive.
+- Added current catalog/account preflight, zero-price OpenRouter routing constraints, local
+  GGUF/remote-marker/context/digest checks, bounded JSON transport and cancellation cleanup.
+  No paid fallback, cloud alias, proxy, redirect, tool execution or model pull is enabled.
+- Normalized request quota observations and Retry-After into durable governance. Nonzero,
+  invalid or missing OpenRouter cost reports stop dispatch, block the provider and withhold
+  the answer without a false zero-spend assertion. Existing quality evaluation remains intact.
+- Added an isolated `python -m fair.providers.smoke` command and dated
+  [provider review and activation guide](LIVE_ADAPTERS.md). A real installed Ollama 0.33.3 /
+  llama3.2:3b request was accepted in one attempt with deterministic arithmetic validation.
+  No model download or cloud inference was used. Groq/OpenRouter keys were absent, so real
+  cloud transport/account compatibility and representative workload qualification remain pending.
+- Added 77 adapter/integration regressions. Local validation: 634 passed, 28 PostgreSQL/native
+  Docker checks skipped locally, two upstream warnings. Lint, formatting and SQLite migration/
+  schema checks pass. No new migration or quality-engine version is required.
+- Step 8 implementation and local inference verification are complete within this scope;
+  cloud activation remains gated on operator credentials and account/model review. Step 9
+  follows with SDK and cache work. GitHub CI evidence will be recorded after this code is pushed.

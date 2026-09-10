@@ -25,7 +25,7 @@ class Registry:
             self.adapters[spec.provider_id] = adapter
 
     def register_credentialed(self, spec, factory, credentials):
-        """Future live factories receive only their scoped SecretStr after admission."""
+        """Live factories receive only their scoped SecretStr after admission."""
         admit_provider(spec)
         if spec.provider_id in self.providers:
             raise ValueError("Duplicate provider")

@@ -12,6 +12,8 @@ from fair.benchmarks.registry import BenchmarkRegistry
 from fair.config import RoutingSettings, config_dir, load_yaml
 from fair.governor.recovery import ProviderRecovery, Recovery, RecoveryDenied, RequestRecovery
 from fair.performance.feedback import FeedbackDenied, FeedbackRegistry, FeedbackRequest
+from fair.providers.base import BillingViolation
+from fair.providers.live import LiveSettings, register_live
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.quality.sandbox import DockerSandbox, SandboxUnavailable
@@ -37,8 +39,22 @@ def create_app(router=None, client_keys=None, admin_key=None):
                 )
             )
             registry = Registry()
-            for entry in load_yaml("providers.yaml")["providers"]:
-                registry.register(ProviderSpec.model_validate(entry))
+            live_path = config_dir() / "live_adapters.yaml"
+            live_settings = (
+                LiveSettings(**load_yaml("live_adapters.yaml"))
+                if live_path.exists()
+                else LiveSettings()
+            )
+            register_live(
+                registry,
+                [
+                    ProviderSpec.model_validate(entry)
+                    for entry in load_yaml("providers.yaml")["providers"]
+                ],
+                live_settings,
+            )
+            if live_settings.enabled and os.environ.get("FAIR_DEMO_MODE") == "1":
+                raise ValueError("Live adapters and demo mode cannot be combined")
             if os.environ.get("FAIR_DEMO_MODE") == "1":
                 for name in ("mock_primary", "mock_secondary"):
                     registry.register(
@@ -104,6 +120,17 @@ def create_app(router=None, client_keys=None, admin_key=None):
         # Framework validation errors otherwise echo input values, including secret extras.
         return JSONResponse(status_code=422, content={"detail": "Invalid request"})
 
+    @app.exception_handler(BillingViolation)
+    async def unexpected_cost(request, error):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "PROVIDER_COST_POLICY_VIOLATION",
+                "system_stopped": True,
+                "paid_inference_executed": None,
+            },
+        )
+
     @app.exception_handler(RecoveryDenied)
     @app.exception_handler(FeedbackDenied)
     async def recovery_denied(request, error):
@@ -122,7 +149,16 @@ def create_app(router=None, client_keys=None, admin_key=None):
 
     @app.get("/healthz")
     def health():
-        return {"status": "ok", "milestone": "B", "live_inference_enabled": False}
+        active = app.state.router
+        return {
+            "status": "ok",
+            "milestone": "B",
+            "live_inference_enabled": any(
+                getattr(adapter, "live_inference", False)
+                for adapter in active.registry.adapters.values()
+            )
+            and not active.stopped,
+        }
 
     @app.post("/v1/solve", response_model=SolveResponse)
     async def solve(request: SolveRequest, connection: Request, identity=Depends(client)):

@@ -1,4 +1,5 @@
-# All candidates deliberately inactive until live adapters and eligibility verification exist.
+# Candidates stay inactive until the operator verifies account and model eligibility.
+# Groq, OpenRouter free and local Ollama adapters are available; see docs/LIVE_ADAPTERS.md.
 # No quota values or current provider terms are inferred from the source seed.
 providers:
   - {provider_id: groq, access_class: FREE_RECURRING}

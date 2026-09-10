@@ -8,13 +8,15 @@ profiles tasks; filters models by capability, context and privacy; reserves requ
 and retries a bounded number of distinct free routes. It persists request, attempt and audit
 lineage and returns structured escalation when no eligible, verifiable answer exists.
 
-**No live adapters are included or enabled.** Demo mode uses offline fixtures. A non-empty
+**Groq, OpenRouter free models and local Ollama adapters are included, disabled by default.**
+See [live adapter setup and verification](docs/LIVE_ADAPTERS.md). Demo mode uses offline fixtures. A non-empty
 or schema-valid response is not evidence of factual correctness. Arithmetic, host-reference JSON,
 source-bound JSON extraction, and bounded Python-function test contracts can produce `ACCEPTED`.
 The `grounded_claims` contract additionally checks structured facts across all supplied sources,
 rejecting unsupported/contradicted claims and incomplete attribution. Missing or conflicting
 evidence supports explicit abstention, which remains unverified with no invented quality score.
-Unsupported tasks still escalate. Failed answers are withheld. Paid inference is never executed.
+Unsupported tasks still escalate. Failed answers are withheld. Paid routes are prohibited;
+unexpected OpenRouter cost reports stop dispatch and withhold the result.
 
 Optional source policies require operator-reviewed evidence snapshots, enforce client access,
 content hashes, review expiry and observation age, and can require multiple configured origins

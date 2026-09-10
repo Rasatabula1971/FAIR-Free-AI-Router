@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from fair.providers.base import (
     AuthenticationFailed,
+    BillingViolation,
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
@@ -16,6 +17,7 @@ class CredentialedAdapter:
             raise ValueError("Adapter identity mismatch")
         self.provider_id = provider_id
         self._adapter, self._credential = adapter, credential
+        self.live_inference = getattr(adapter, "live_inference", False)
 
     def _check(self, value):
         if isinstance(value, BaseModel):
@@ -35,12 +37,14 @@ class CredentialedAdapter:
         self._check(args)
         try:
             result = await method(*args)
+        except BillingViolation:
+            raise BillingViolation("PROVIDER_REPORTED_NONZERO_OR_INVALID_COST") from None
         except AuthenticationFailed:
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
         except QuotaExceeded as error:
             raise QuotaExceeded("QUOTA_EXHAUSTED", reset_at=error.reset_at) from None
-        except RateLimited:
-            raise RateLimited("RATE_LIMITED") from None
+        except RateLimited as error:
+            raise RateLimited("RATE_LIMITED", retry_after=error.retry_after) from None
         except Exception:
             raise ProviderUnavailable("PROVIDER_UNAVAILABLE") from None
         self._check(result)
