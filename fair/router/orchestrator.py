@@ -3,8 +3,10 @@ from time import monotonic
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from fair.benchmarks.registry import BenchmarkRegistry
+from fair.cache.exact import ExactCache
 from fair.classifier.task_profiler import model_task, profile_task
 from fair.governor.kill_switch import KillSwitch
 from fair.governor.policy import admit_provider
@@ -59,6 +61,7 @@ class Router:
         self.scheduler = FairScheduler(settings.scheduler)
         self.inflight = set()
         self.shadow_tasks = set()
+        self.cache = ExactCache(self)
 
     @property
     def stopped(self):
@@ -381,6 +384,7 @@ class Router:
                     TaskRequest.client_id == request.client_id,
                     TaskRequest.execution_kind == "PRIMARY",
                     TaskRequest.status == "ACCEPTED",
+                    TaskRequest.id.in_(select(RoutingAttempt.request_id)),
                 )
             )
             spent = session.scalar(
@@ -411,6 +415,7 @@ class Router:
             not self.settings.shadow_enabled
             or self.scheduler.closed
             or result.status != "ACCEPTED"
+            or result.cache_hit
             or request.privacy_class != "PUBLIC"
             or request.evidence
             or request.quality_level == "high_impact_support"
@@ -551,6 +556,10 @@ class Router:
                 },
             )
         reason = "NO_ELIGIBLE_FREE_MODELS"
+        if shadow_of is None:
+            cached = self.cache.get(request, profile, request_id)
+            if cached is not None:
+                return cached
         accepted_response = accepted_quality = None
         validator_failed = False
         for _ in range(1 if shadow_of is not None else self.settings.max_attempts):
@@ -784,4 +793,15 @@ class Router:
                     "paid_inference_executed": False,
                 },
             )
+        if shadow_of is None:
+            try:
+                self.cache.put(request, profile, result)
+            except SQLAlchemyError:
+                # Acceptance is already durable. An optional cache-write outage must not
+                # rewrite that terminal request as FAILED with an ACCEPTED result attached.
+                try:
+                    with self.sessions.begin() as session:
+                        self.audit(session, request_id, request.client_id, "CACHE_WRITE_FAILED", {})
+                except SQLAlchemyError:
+                    pass
         return result

@@ -48,6 +48,10 @@ filesystem/network access remain outside the generated-code contract.
 
 ## Development
 
+Step 9 adds [Python/JavaScript SDKs and client-isolated exact caching](docs/SDK_AND_CACHE.md).
+The optional cache revalidates supported results, records new request lineage and saves provider
+quota without adding model-quality samples. Apply migration `0008` before starting this version.
+
 Python 3.12+ is required. From PowerShell:
 
 ```powershell

@@ -21,6 +21,8 @@ from fair.schemas.domain import (
 
 
 class SolveRequest(DTO):
+    cache_mode: Literal["default", "bypass", "refresh"] = "default"
+    cache_ttl_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
     client_id: str = Field(min_length=1, max_length=128)
     priority: Priority = "P2"
     task: str = Field(min_length=1, max_length=100_000)
@@ -68,6 +70,8 @@ class SolveRequest(DTO):
 
 
 class SolveResponse(DTO):
+    cache_hit: bool = False
+    cached_from_request_id: str | None = None
     request_id: str
     execution_kind: Literal["PRIMARY", "SHADOW"] = "PRIMARY"
     parent_request_id: str | None = None

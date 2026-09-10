@@ -53,6 +53,13 @@ class CredentialedAdapter:
     async def complete(self, request):
         return await self._call(self._adapter.complete, request)
 
+    def check_admission(self):
+        try:
+            if hasattr(self._adapter, "check_admission"):
+                self._adapter.check_admission()
+        except Exception:
+            raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
+
     async def health(self):
         return await self._call(self._adapter.health)
 

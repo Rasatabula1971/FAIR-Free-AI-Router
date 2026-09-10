@@ -11,6 +11,9 @@ from fair.schemas.domain import DTO
 
 
 class RoutingSettings(DTO):
+    cache_enabled: bool = False
+    cache_ttl_seconds: int = Field(default=3600, ge=1, le=86400)
+    cache_max_entries: int = Field(default=1000, ge=1, le=100000)
     feedback_weight: float = Field(default=3, ge=0, le=5, allow_inf_nan=False)
     feedback_max_age_days: int = Field(default=30, ge=1, le=365)
     confidence_half_life_days: int = Field(default=30, ge=1, le=365)

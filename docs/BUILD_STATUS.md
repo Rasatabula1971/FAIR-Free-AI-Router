@@ -74,7 +74,8 @@ requirements, not separate authorization for deployment, paid inference or publi
   Step 7; representative live collection and automated review/alerts remain future work.
 - E: Step 8 implements Groq, OpenRouter free and local Ollama adapters. Local inference is
   verified; live cloud account/inference verification remains pending credentials and approval.
-- F: remaining verified adapters, Python/JavaScript SDKs, cache and operating runbooks.
+- F: Step 9 implements Python/JavaScript SDKs and bounded exact caching. Remaining verified
+  adapters, broader safe reuse and operating runbooks remain future work.
 
 ## Known constraints
 
@@ -93,7 +94,7 @@ adapter observations cover request quotas; token/compute quota tracking is still
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment fifteen.
+validation notes describe the results available at that time; current evidence is in increment sixteen.
 
 ## Validation of the first increment
 
@@ -425,3 +426,27 @@ examples and acceptance scope.
   follows with SDK and cache work. All four GitHub jobs passed for code commit `636186d`:
   core, PostgreSQL, packaged Docker API and native sandbox. Evidence:
   [run 34426623785](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34426623785).
+
+## Sixteenth increment: SDKs and exact caching (Step 9)
+
+- Added Python sync/async clients and a Node.js ESM client with TypeScript declarations.
+  Both bind authenticated client identity, support solve/history/audit/feedback/cache clearing,
+  normalize error diagnostics, bound responses, support cleanup/cancellation and avoid automatic
+  retries. The JavaScript package is private and has not been published to npm.
+- Added default-off exact caching for accepted arithmetic and host-reference JSON. Every client
+  has isolated keys covering contracts, privacy, model configuration and policy/engine versions.
+  Hits rerun validation, preserve origin attribution, create new owned request/audit lineage,
+  and consume no inference quota or quality sample. Scheduling and stop/security gates still apply.
+- TTL limits, bypass/refresh controls, bounded eviction, negative-feedback invalidation and
+  client-owned clearing prevent stale or unintended reuse. Hits cannot multiply feedback or
+  shadow sampling. Optional cache-write failure preserves the durable accepted request.
+  Grounded/fresh/native/high-impact/cross-checked and benchmark-gated work bypasses this cache.
+- Migration `0008` adds only owner/hash/expiry/source references; no raw prompts or duplicate
+  answers. Upgrade/downgrade checks preserve request history. No quality-engine change is required.
+  See [SDK and cache guide](SDK_AND_CACHE.md) for usage, exact scope and deployment migration.
+- Local validation: 693 passed, 28 PostgreSQL/native Docker checks skipped locally, two upstream
+  warnings. The 59 added regressions include an 11-case JavaScript suite with real HTTP API
+  integration. Lint, formatting, SQLite schema checks and npm package-content validation pass.
+  All inference tests use existing offline fixtures; no provider activation or cloud calls occur.
+- Step 9 is implemented within the documented single-process scope. GitHub CI evidence will
+  be recorded after this code is pushed.

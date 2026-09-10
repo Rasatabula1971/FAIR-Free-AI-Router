@@ -128,6 +128,47 @@ def migration_roundtrip(connection):
     command.check(cfg)
 
 
+def cache_migration_preserves_history(connection):
+    cfg = config(connection)
+    command.upgrade(cfg, "head")
+    connection.execute(
+        text(
+            "INSERT INTO task_requests (id, client_id, status, profile_json, result_json, created_at) VALUES ('cached-original', 'cache-client', 'ACCEPTED', '{}', '{}', :now)"
+        ).bindparams(bindparam("now", type_=DateTime(timezone=True))),
+        {"now": datetime.now(UTC)},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO cache_entries (client_id, key, source_request_id, created_at, expires_at) VALUES ('cache-client', 'test-key', 'cached-original', 1000, 2000)"
+        )
+    )
+    assert (
+        connection.execute(text("SELECT source_request_id FROM cache_entries")).scalar()
+        == "cached-original"
+    )
+    command.downgrade(cfg, "0007")
+    assert (
+        connection.execute(
+            text("SELECT status FROM task_requests WHERE id = 'cached-original'")
+        ).scalar()
+        == "ACCEPTED"
+    )
+    command.upgrade(cfg, "head")
+    command.check(cfg)
+    assert connection.execute(text("SELECT count(*) FROM cache_entries")).scalar() == 0
+
+
+def test_cache_migration_preserves_source_request(tmp_path):
+    from fair.schemas.db import database
+
+    engine, _ = database("sqlite:///" + (tmp_path / "cache-migration.db").as_posix())
+    try:
+        with engine.begin() as connection:
+            cache_migration_preserves_history(connection)
+    finally:
+        engine.dispose()
+
+
 def test_sqlite_migration_preserves_history_and_stop(tmp_path):
     engine = create_engine("sqlite:///" + (tmp_path / "migration.db").as_posix())
     try:
@@ -155,6 +196,7 @@ def test_postgres_migrations_and_audit_trigger():
                 recovery_roundtrip(connection)
                 command.downgrade(config(connection), "0006")
                 learning_migration_preserves_history(connection)
+                cache_migration_preserves_history(connection)
                 for statement in (
                     "UPDATE audit_events SET event_type = 'tampered'",
                     "DELETE FROM audit_events",

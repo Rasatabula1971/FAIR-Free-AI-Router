@@ -250,6 +250,10 @@ def create_app(router=None, client_keys=None, admin_key=None):
     async def feedback(request: FeedbackRequest, identity=Depends(client)):
         return FeedbackRegistry(app.state.router.sessions).submit(identity, request)
 
+    @app.delete("/v1/cache")
+    async def clear_cache(identity=Depends(client)):
+        return app.state.router.cache.clear(identity)
+
     @app.get("/v1/requests/{request_id}/feedback")
     def request_feedback(request_id: str, identity=Depends(client)):
         return FeedbackRegistry(app.state.router.sessions).read(identity, request_id)

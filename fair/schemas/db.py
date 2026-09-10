@@ -110,6 +110,15 @@ class RoutingAttempt(Base):
     detail_json: Mapped[dict] = mapped_column(JSON)
 
 
+class CacheEntry(Base):
+    __tablename__ = "cache_entries"
+    client_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_request_id: Mapped[str] = mapped_column(ForeignKey("task_requests.id"))
+    created_at: Mapped[float] = mapped_column(Float)
+    expires_at: Mapped[float] = mapped_column(Float, index=True)
+
+
 class TaskProfile(Base):
     __tablename__ = "task_profiles"
     request_id: Mapped[str] = mapped_column(ForeignKey("task_requests.id"), primary_key=True)

@@ -142,6 +142,10 @@ class TextAdapter:
         ):
             raise AuthenticationFailed("SERVER_TOOLS_NOT_SUPPORTED")
 
+    def check_admission(self):
+        """Recheck local policy without consuming provider quota."""
+        self._admit()
+
     def _observe(self, headers):
         return QuotaSnapshot(provider_id=self.provider_id)
 

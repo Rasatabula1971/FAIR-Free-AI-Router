@@ -65,6 +65,8 @@ class FeedbackRegistry:
             if task.status != "ACCEPTED" or task.execution_kind != "PRIMARY":
                 raise FeedbackDenied("FEEDBACK_REQUIRES_ACCEPTED_PRIMARY_RESULT")
             result = task.result_json or {}
+            if result.get("cache_hit"):
+                raise FeedbackDenied("FEEDBACK_USE_ORIGINAL_REQUEST")
             if not result.get("provider_id") or not result.get("model_id"):
                 raise FeedbackDenied("FEEDBACK_TARGET_UNAVAILABLE")
             score = (
