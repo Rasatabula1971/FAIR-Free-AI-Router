@@ -6,6 +6,9 @@ __pycache__/
 *.egg-info/
 .env
 secrets/
+backups/
+*.dump
+*.backup
 config/source_reviews.local.yaml
 config/benchmarks.local.yaml
 *.db

@@ -40,11 +40,120 @@ def wait_ready():
     raise RuntimeError("Packaged API did not become ready within 60 seconds")
 
 
+def restore_drill():
+    """Disposable CI database only; never replace or clear the running source database."""
+    compose = ["docker", "compose", "-f", "infra/docker/docker-compose.yml", "exec", "-T", "db"]
+
+    def run(*args):
+        result = subprocess.run(
+            compose + list(args), cwd=ROOT, check=True, capture_output=True, text=True, timeout=60
+        )
+        return result.stdout.strip()
+
+    def summary(name):
+        return run(
+            "psql",
+            "-X",
+            "-U",
+            "fair",
+            "-d",
+            name,
+            "-At",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "SELECT version_num FROM alembic_version; SELECT stopped FROM system_state WHERE id='global'; SELECT count(*) FROM task_requests; SELECT count(*) FROM audit_events; SELECT sum(used) FROM provider_quota_states;",
+        )
+
+    before = summary("fair")
+    run("pg_dump", "-U", "fair", "-d", "fair", "-Fc", "--file=/tmp/fair-smoke.dump")
+    run("createdb", "-U", "fair", "-T", "template0", "fair_restore_verify")
+    run(
+        "pg_restore",
+        "-U",
+        "fair",
+        "-d",
+        "fair_restore_verify",
+        "--exit-on-error",
+        "--single-transaction",
+        "/tmp/fair-smoke.dump",
+    )
+    assert summary("fair_restore_verify") == before
+    assert summary("fair") == before
+    assert before.splitlines()[1] == "t", "Restore must retain the maintenance stop"
+    # Database-enforced append-only audit protection must survive restore as well.
+    denied = subprocess.run(
+        compose
+        + [
+            "psql",
+            "-X",
+            "-U",
+            "fair",
+            "-d",
+            "fair_restore_verify",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "UPDATE audit_events SET event_type='tampered'",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert denied.returncode != 0 and "append-only" in denied.stderr
+
+
 def main():
     key = json.loads(os.environ["FAIR_CLIENT_KEYS"])["smoke"]
     admin = os.environ["FAIR_ADMIN_KEY"]
     payload = {"client_id": "smoke", "task": "Hello"}
     wait_ready()
+    assert request("/livez") == {"status": "alive"}
+    assert request("/readyz") == {"status": "ready"}
+    request("/v1/system/status", key=key, expected=403)
+    status = request("/v1/system/status", key=admin)
+    assert status["schema_current"] and status["credentials_configured"]
+    assert status["configured_live_adapters"] == 0
+    preflight = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            "infra/docker/docker-compose.yml",
+            "exec",
+            "-T",
+            "api",
+            "python",
+            "-m",
+            "fair.operations.preflight",
+            "--check-database",
+            "--allow-demo",
+        ],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert json.loads(preflight.stdout)["status"] == "PASS"
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            "infra/docker/docker-compose.yml",
+            "exec",
+            "-T",
+            "api",
+            "python",
+            "-c",
+            "from pathlib import Path; assert not Path('/app/secrets/build-context-canary').exists()",
+        ],
+        cwd=ROOT,
+        check=True,
+        timeout=15,
+    )
     request("/v1/providers", expected=401)
     providers = request("/v1/providers", key=key)
     active = {p["provider_id"] for p in providers if p["status"] == "ACTIVE"}
@@ -79,6 +188,9 @@ def main():
     )
     request("/v1/system/stop", key=key, payload={}, expected=403)
     assert request("/v1/system/stop", key=admin, payload={})["stopped"] is True
+    assert request("/readyz", expected=503) == {"status": "not_ready"}
+    assert request("/livez") == {"status": "alive"}
+    restore_drill()
     subprocess.run(
         ["docker", "compose", "-f", "infra/docker/docker-compose.yml", "restart", "api"],
         cwd=ROOT,
@@ -107,12 +219,13 @@ def main():
     )
     assert denied_recovery["detail"] == "NO_RECOVERY_NEEDED"
     assert request("/v1/system/resume", key=admin, payload={})["stopped"] is False
+    assert request("/readyz") == {"status": "ready"}
     resumed = request("/v1/solve", key=key, payload=payload)
     assert len(resumed["attempts"]) == 2
     assert resumed["status"] == "ESCALATION_REQUIRED"
     assert resumed["paid_inference_executed"] is False
     print(
-        "Docker smoke passed: authentication, offline routing, history, audit, stop/resume, restart"
+        "Docker smoke passed: routing, readiness, preflight, backup/restore, audit protection, restart"
     )
 
 

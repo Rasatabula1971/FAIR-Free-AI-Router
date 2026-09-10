@@ -11,6 +11,7 @@ from sqlalchemy import select
 from fair.benchmarks.registry import BenchmarkRegistry
 from fair.config import RoutingSettings, config_dir, load_yaml
 from fair.governor.recovery import ProviderRecovery, Recovery, RecoveryDenied, RequestRecovery
+from fair.operations.status import readiness, snapshot
 from fair.performance.feedback import FeedbackDenied, FeedbackRegistry, FeedbackRequest
 from fair.providers.base import BillingViolation
 from fair.providers.live import LiveSettings, register_live
@@ -159,6 +160,24 @@ def create_app(router=None, client_keys=None, admin_key=None):
             )
             and not active.stopped,
         }
+
+    @app.get("/livez")
+    def liveness():
+        return {"status": "alive"}
+
+    @app.get("/readyz")
+    def ready():
+        result = readiness(app.state.router, credentials)
+        return JSONResponse(status_code=200 if result["status"] == "ready" else 503, content=result)
+
+    @app.get("/v1/system/status", dependencies=[Depends(administrator)])
+    def operational_status():
+        try:
+            return snapshot(app.state.router, credentials)
+        except Exception:
+            return JSONResponse(
+                status_code=503, content={"detail": "OPERATIONAL_STATUS_UNAVAILABLE"}
+            )
 
     @app.post("/v1/solve", response_model=SolveResponse)
     async def solve(request: SolveRequest, connection: Request, identity=Depends(client)):

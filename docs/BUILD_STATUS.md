@@ -74,8 +74,9 @@ requirements, not separate authorization for deployment, paid inference or publi
   Step 7; representative live collection and automated review/alerts remain future work.
 - E: Step 8 implements Groq, OpenRouter free and local Ollama adapters. Local inference is
   verified; live cloud account/inference verification remains pending credentials and approval.
-- F: Step 9 implements Python/JavaScript SDKs and bounded exact caching. Remaining verified
-  adapters, broader safe reuse and operating runbooks remain future work.
+- F: Step 9 implements Python/JavaScript SDKs and bounded exact caching. Step 10 adds
+  operational checks, container restrictions and deployment/restore runbooks. Remaining
+  verified adapters and broader safe reuse remain future work.
 
 ## Known constraints
 
@@ -94,7 +95,7 @@ adapter observations cover request quotas; token/compute quota tracking is still
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment sixteen.
+validation notes describe the results available at that time; current evidence is in increment seventeen.
 
 ## Validation of the first increment
 
@@ -452,3 +453,26 @@ examples and acceptance scope.
   for code commit `912184f`: core (including Node HTTP integration), PostgreSQL cache/history
   migration checks, packaged Docker API and native sandbox. Evidence:
   [run 34472316595](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34472316595).
+
+## Seventeenth increment: operational readiness and restore runbooks (Step 10)
+
+- Added process-only liveness, generic schema/credential/stop-aware readiness, and admin-only
+  operational counts. Failures expose no raw database diagnostics, client identities or output.
+  Existing provider/performance endpoints remain available for investigation.
+- Added a read-only preflight CLI for credentials, routing/review/provider configuration and
+  optional database revision checks. It cannot migrate, recover, resume or call providers.
+  An isolated local CLI run passed with zero provider calls.
+- Restricted the Compose API container with a read-only root, temporary-storage/PID/memory
+  bounds, dropped capabilities, no privilege escalation and a liveness healthcheck. Excluded
+  private secrets, environment variants and backups from Docker build context; CI seeds a
+  nonsecret marker to check that the private directory does not enter the image.
+- Added a [deployment and recovery runbook](OPERATING_RUNBOOK.md) covering maintenance stop,
+  private backups, separate-database restore verification, upgrades, rollback and monitoring.
+  Extended the packaged smoke to verify preflight/readiness, custom PostgreSQL dump/restore,
+  preserved request/audit/quota/stop state and restored append-only enforcement.
+- Local validation: 710 passed, 28 PostgreSQL/native Docker checks skipped locally, two upstream
+  warnings. Lint, formatting and preflight tests pass. No migration or quality-engine change;
+  schema remains `0008`. The packaged restore/container checks run in GitHub CI, with all model
+  calls still using offline fixtures. Public deployment and live cloud qualification remain pending.
+- Step 10 implementation is complete within the documented single-process scope. GitHub
+  verification evidence will be recorded after the code is pushed.

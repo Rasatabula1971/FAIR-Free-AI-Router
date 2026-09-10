@@ -51,7 +51,10 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.13'}
       - name: Build and start the packaged application
-        run: docker compose -f infra/docker/docker-compose.yml up -d --build
+        # Nonsecret marker proves ignored private directories cannot enter the image.
+        run: |
+          python -c "from pathlib import Path; Path('secrets').mkdir(exist_ok=True); Path('secrets/build-context-canary').write_text('CI marker, not a credential')"
+          docker compose -f infra/docker/docker-compose.yml up -d --build
       - name: Verify HTTP routing and persistence across restart
         run: python scripts/docker_smoke.py
       - name: Show container diagnostics on failure

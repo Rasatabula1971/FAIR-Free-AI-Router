@@ -98,6 +98,10 @@ skipped locally unless `FAIR_TEST_SANDBOX_IMAGE` identifies an explicitly suppli
 
 ## Local service with PostgreSQL
 
+Step 10 adds [deployment checks, monitoring and backup/restore runbooks](docs/OPERATING_RUNBOOK.md).
+Use `python -m fair.operations.preflight --check-database` with the deployment environment
+before activation. The Compose API container uses bounded resources and a read-only root.
+
 The Compose file is a development configuration with local database credentials. Docker
 must be installed and running. Set distinct random keys before starting:
 
@@ -132,10 +136,14 @@ For an existing local PostgreSQL instance, set `FAIR_DATABASE_URL`, run
 | Endpoint | Access |
 | --- | --- |
 | `GET /healthz` | Public process health |
+| `GET /livez` | Public process-only liveness |
+| `GET /readyz` | Public generic readiness; 503 during maintenance or invalid state |
+| `GET /v1/system/status` | Admin-only operational counts and queue state |
 | `POST /v1/solve` | Client key; body identity must match key |
 | `POST /v1/feedback` | Owning client; one audited preference per accepted foreground result |
 | `GET /v1/requests/{id}/feedback` | Owning client only |
 | `GET /v1/providers` | Client key; safe registry summary |
+| `DELETE /v1/cache` | Client key; clear only owned cache entries |
 | `GET /v1/providers/{id}/health` | Client key; persisted quota and circuit observations |
 | `GET /v1/models/performance` | Admin key; up to 1,000 aggregate model/task records |
 | `GET /v1/system/scheduler` | Admin key; process-local queue and priority counts |
@@ -157,7 +165,7 @@ class. Urgent classes require operator configuration; requests default to P2. Se
 volatile single-process scope.
 Step 7 adds [feedback, recent metrics, drift tracking and opt-in shadow checks](docs/LEARNING.md).
 Feedback changes only the owner's routing preferences. Shadow checks are off by default and
-withhold output. Apply migration `0007` before starting this version.
+withhold output. Apply all migrations through `0008` before starting this version.
 API key digests are held in application authentication closures; tasks and keys are not stored
 in request/audit rows. Audit ORM updates/deletes are rejected, and the PostgreSQL migration
 adds a database trigger rejecting update/delete/truncate. Database-owner DDL is outside that

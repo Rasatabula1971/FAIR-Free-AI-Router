@@ -1,6 +1,12 @@
 .git
 .venv
 .env
+.env.*
+secrets/
+backups/
+*.dump
+*.backup
+sdk/javascript/node_modules/
 config/source_reviews.local.yaml
 config/benchmarks.local.yaml
 __pycache__

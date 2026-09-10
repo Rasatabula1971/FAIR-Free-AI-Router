@@ -20,6 +20,19 @@ services:
       db: {condition: service_healthy}
   api:
     build: {context: ../.., dockerfile: infra/docker/Dockerfile}
+    read_only: true
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=64m']
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    pids_limit: 128
+    mem_limit: 512m
+    stop_grace_period: 45s
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/livez', timeout=2).close()"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
     ports: ["127.0.0.1:8000:8000"]
     environment:
       FAIR_DATABASE_URL: postgresql+psycopg://fair:fair@db:5432/fair

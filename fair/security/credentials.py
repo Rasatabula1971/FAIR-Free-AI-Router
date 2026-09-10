@@ -98,12 +98,16 @@ class APIKeys:
                 return identity
         return None
 
+    @property
+    def configured(self):
+        return bool(self._clients) and self._admin is not None
+
 
 class ProviderCredentials:
     """Resolve only operator-mapped environment variables for a trusted adapter factory.
 
     Factories receive one SecretStr, not the resolver or the entire environment. There are
-    no live adapter factories yet; this boundary is tested for their later integration.
+    reviewed live factories use this boundary without receiving other providers' keys.
     """
 
     def __init__(self, bindings):
