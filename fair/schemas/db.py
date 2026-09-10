@@ -91,6 +91,12 @@ class TaskRequest(Base):
     __tablename__ = "task_requests"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     client_id: Mapped[str] = mapped_column(String(128), index=True)
+    execution_kind: Mapped[str] = mapped_column(
+        String(16), default="PRIMARY", server_default="PRIMARY"
+    )
+    parent_request_id: Mapped[str | None] = mapped_column(
+        ForeignKey("task_requests.id"), nullable=True, unique=True, index=True
+    )
     status: Mapped[str] = mapped_column(String(32))
     profile_json: Mapped[dict] = mapped_column(JSON)
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -145,7 +151,31 @@ class ModelTaskPerformance(Base):
     quality_sum: Mapped[float] = mapped_column(Float, default=0)
     latency_sum_ms: Mapped[float] = mapped_column(Float, default=0)
     recent_quality: Mapped[list] = mapped_column(JSON, default=list)
+    recent_outcomes: Mapped[list] = mapped_column(JSON, default=list, server_default="[]")
+    last_quality_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FeedbackEvent(Base):
+    __tablename__ = "feedback_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["provider_id", "model_id"], ["models.provider_id", "models.model_id"]
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    request_id: Mapped[str] = mapped_column(ForeignKey("task_requests.id"), unique=True)
+    client_id: Mapped[str] = mapped_column(String(128), index=True)
+    provider_id: Mapped[str] = mapped_column(String(128))
+    model_id: Mapped[str] = mapped_column(String(256))
+    task_class: Mapped[str] = mapped_column(String(64))
+    accepted: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    score: Mapped[float] = mapped_column(Float)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    reason_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    correction_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class EscalationRecord(Base):

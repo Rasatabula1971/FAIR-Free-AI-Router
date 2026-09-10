@@ -53,6 +53,52 @@ def recovery_roundtrip(connection):
     assert result["recovered"] == 1
 
 
+def learning_migration_preserves_history(connection):
+    cfg = config(connection)
+    command.upgrade(cfg, "0006")
+    # Real parent data with dependent append-only audit rows must survive in-place migration.
+    connection.execute(
+        text(
+            "INSERT INTO task_requests (id, client_id, status, profile_json, result_json, created_at) VALUES ('legacy-learning', 'alice', 'ACCEPTED', '{}', '{}', :now)"
+        ).bindparams(bindparam("now", type_=DateTime(timezone=True))),
+        {"now": datetime.now(UTC)},
+    )
+    connection.execute(
+        text(
+            "INSERT INTO audit_events (id, request_id, actor_id, event_type, payload_json, created_at) VALUES (:id, 'legacy-learning', 'alice', 'ACCEPTED', '{}', :now)"
+        ).bindparams(bindparam("now", type_=DateTime(timezone=True))),
+        {"id": str(uuid4()), "now": datetime.now(UTC)},
+    )
+    command.upgrade(cfg, "head")
+    command.check(cfg)
+    assert (
+        connection.execute(
+            text("SELECT execution_kind FROM task_requests WHERE id = 'legacy-learning'")
+        ).scalar()
+        == "PRIMARY"
+    )
+    assert (
+        connection.execute(
+            text("SELECT count(*) FROM audit_events WHERE request_id = 'legacy-learning'")
+        ).scalar()
+        == 1
+    )
+    command.downgrade(cfg, "0006")
+    command.upgrade(cfg, "head")
+    command.check(cfg)
+
+
+def test_learning_migration_preserves_existing_foreign_keys(tmp_path):
+    from fair.schemas.db import database
+
+    engine, _ = database("sqlite:///" + (tmp_path / "learning.db").as_posix())
+    try:
+        with engine.begin() as connection:
+            learning_migration_preserves_history(connection)
+    finally:
+        engine.dispose()
+
+
 def config(connection):
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
@@ -107,6 +153,8 @@ def test_postgres_migrations_and_audit_trigger():
                 connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
                 migration_roundtrip(connection)
                 recovery_roundtrip(connection)
+                command.downgrade(config(connection), "0006")
+                learning_migration_preserves_history(connection)
                 for statement in (
                     "UPDATE audit_events SET event_type = 'tampered'",
                     "DELETE FROM audit_events",

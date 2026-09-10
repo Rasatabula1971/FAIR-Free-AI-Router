@@ -70,7 +70,8 @@ requirements, not separate authorization for deployment, paid inference or publi
   validation and scoped sandbox recovery in the eleventh increment. Step 5 adds bounded
   fair client scheduling in the twelfth increment.
 - C: distributed scheduling, retrieval capability boundaries and stronger operational isolation.
-- D: feedback, rolling performance, shadow benchmarking and drift detection.
+- D: feedback, rolling metrics, optional shadow checks and drift tracking are implemented in
+  Step 7; representative live collection and automated review/alerts remain future work.
 - E: two or three live adapters after current provider terms/quota/privacy verification.
 - F: remaining verified adapters, Python/JavaScript SDKs, cache and operating runbooks.
 
@@ -91,7 +92,7 @@ adapter observations cover request quotas; token/compute quota tracking is still
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment thirteen.
+validation notes describe the results available at that time; current evidence is in increment fourteen.
 
 ## Validation of the first increment
 
@@ -372,3 +373,25 @@ examples and acceptance scope.
   [run 34419489805](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34419489805).
   Step 6 is complete within its documented scope. Live providers remain disabled. Step 7
   follows with feedback, rolling performance and drift tracking.
+
+## Fourteenth increment: feedback, performance learning and shadow checks (Step 7)
+
+- Added owned, idempotent feedback for accepted foreground results, atomically audit-logged.
+  Optional correction/reason text is hashed, never stored raw or executed. A finite window of
+  weighted feedback influences only that client's model/task preference, not another client's
+  ranking, answer verification, measured quality samples or reliability.
+- Kept lifetime metrics and added recent quality/operational windows, freshness-based sample
+  confidence and a baseline-vs-recent mean-drop heuristic. Material drift reduces route ranking
+  and marks the model/task for benchmark review. Sparse samples remain explicitly insufficient.
+- Added disabled-by-default PUBLIC-only P4 shadow checks, a persistent per-client rate budget,
+  known quota-headroom gates and one-attempt execution through existing governance/validation.
+  Aliases, sensitive/evidence-bearing and high-impact tasks are excluded. Shadow output is
+  withheld from responses and storage; comparisons and parent lineage remain audited.
+- Migration `0007` adds feedback, operational freshness and shadow lineage, preserving existing
+  history and foreign keys. The quality engine remains `deterministic-v8`. See
+  [LEARNING.md](LEARNING.md) for formulas, defaults, API contracts and limits.
+- Local validation: 557 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
+  two upstream deprecation warnings. Includes 25 learning regressions plus a migration with
+  existing foreign-key-linked history. Lint, formatting and SQLite schema checks pass.
+  GitHub integration validation is pending. Live providers and shadow collection remain disabled.
+  Next is Step 8: implement and verify the first live provider adapters.

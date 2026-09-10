@@ -69,6 +69,8 @@ class SolveRequest(DTO):
 
 class SolveResponse(DTO):
     request_id: str
+    execution_kind: Literal["PRIMARY", "SHADOW"] = "PRIMARY"
+    parent_request_id: str | None = None
     status: Literal["ACCEPTED", "ESCALATION_REQUIRED", "FAILED"]
     reason_code: str
     attempts: list[Attempt]

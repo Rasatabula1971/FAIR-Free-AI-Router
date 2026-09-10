@@ -58,6 +58,7 @@ def main():
     assert result["status"] == "ESCALATION_REQUIRED"
     assert result["paid_inference_executed"] is False
     assert result["output"] is None
+    assert result["execution_kind"] == "PRIMARY"
     assert len(result["attempts"]) == 2
     assert {a["provider_id"] for a in result["attempts"]} == active
     history_path = f"/v1/requests/{result['request_id']}"
@@ -65,6 +66,17 @@ def main():
     audit = request(history_path + "/audit", key=key)
     assert audit
     assert [event["event_type"] for event in audit[:3]] == ["QUEUED", "SCHEDULED", "PROFILED"]
+    feedback = request(
+        "/v1/feedback",
+        key=key,
+        payload={"request_id": result["request_id"], "accepted": True},
+        expected=409,
+    )
+    assert feedback["detail"] == "FEEDBACK_REQUIRES_ACCEPTED_PRIMARY_RESULT"
+    metrics = request("/v1/models/performance", key=admin)
+    assert metrics and all(
+        "drift_state" in row and "observation_confidence" in row for row in metrics
+    )
     request("/v1/system/stop", key=key, payload={}, expected=403)
     assert request("/v1/system/stop", key=admin, payload={})["stopped"] is True
     subprocess.run(

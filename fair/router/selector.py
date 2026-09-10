@@ -48,6 +48,7 @@ class Selector:
                     model.model_id,
                     profile.task_class,
                     quality_prior=quality_prior,
+                    client_id=request.client_id,
                 )
                 remaining = self.quota.remaining(spec)
                 headroom = remaining / spec.request_limit if spec.request_limit else 0.5

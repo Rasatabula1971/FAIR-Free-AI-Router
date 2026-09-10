@@ -11,6 +11,13 @@ from fair.schemas.domain import DTO
 
 
 class RoutingSettings(DTO):
+    feedback_weight: float = Field(default=3, ge=0, le=5, allow_inf_nan=False)
+    feedback_max_age_days: int = Field(default=30, ge=1, le=365)
+    confidence_half_life_days: int = Field(default=30, ge=1, le=365)
+    drift_drop_points: float = Field(default=15, gt=0, le=100, allow_inf_nan=False)
+    shadow_enabled: bool = False
+    shadow_min_headroom: float = Field(default=0.7, ge=0.4, le=0.95, allow_inf_nan=False)
+    shadow_max_rate: float = Field(default=0.1, gt=0, le=0.1, allow_inf_nan=False)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
     benchmark_policy: BenchmarkPolicy | None = None
     source_policy: SourcePolicy | None = None

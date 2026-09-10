@@ -2,6 +2,8 @@ import asyncio
 from time import monotonic
 from uuid import uuid4
 
+from sqlalchemy import func, select
+
 from fair.benchmarks.registry import BenchmarkRegistry
 from fair.classifier.task_profiler import model_task, profile_task
 from fair.governor.kill_switch import KillSwitch
@@ -26,6 +28,7 @@ from fair.schemas.domain import (
     Attempt,
     CrossCheckReport,
     NormalizedModelRequest,
+    NormalizedModelResponse,
     SourcePolicyReport,
 )
 
@@ -50,11 +53,12 @@ class Router:
         self.benchmarks = benchmarks or BenchmarkRegistry()
         registry.persist(sessions)
         self.quota = QuotaGovernor(settings, sessions)
-        self.performance = PerformanceRegistry(sessions)
+        self.performance = PerformanceRegistry(sessions, settings)
         self.selector = Selector(registry, self.quota, settings, self.performance, self.benchmarks)
         self.kill_switch = KillSwitch(sessions)
         self.scheduler = FairScheduler(settings.scheduler)
         self.inflight = set()
+        self.shadow_tasks = set()
 
     @property
     def stopped(self):
@@ -97,10 +101,14 @@ class Router:
                 self.performance.record(session, attempt, profile.task_class)
             self.audit(session, request_id, request.client_id, "ATTEMPT_COMPLETED", detail)
 
-    async def _attempt(self, request_id, request, profile, route, number, role, benchmark_checks):
+    async def _attempt(
+        self, request_id, request, profile, route, number, role, benchmark_checks, shadow_of=None
+    ):
         if self._source_report(request).state == "BLOCKED":
             raise SourcePolicyBlocked()
         score, spec, model = route
+        if shadow_of is not None and not self._shadow_candidate(shadow_of, spec, model):
+            return None, None, False
         if self.settings.benchmark_policy is not None:
             check = self.benchmarks.assess(
                 request, profile, spec, model, self.settings.benchmark_policy
@@ -325,7 +333,97 @@ class Router:
             )
         return report, disagreement
 
-    async def solve(self, request):
+    def _shadow_candidate(self, parent, spec, model):
+        primary = self.registry.providers.get(parent.provider_id)
+        original = (
+            next((item for item in primary.models if item.model_id == parent.model_id), None)
+            if primary
+            else None
+        )
+        if original is None or spec.request_limit is None:
+            return False
+        if model.model_id.strip().casefold() == original.model_id.strip().casefold():
+            return False
+        if (model.independence_group or model.model_id).strip().casefold() == (
+            original.independence_group or original.model_id
+        ).strip().casefold():
+            return False
+        if (spec.provider_id, model.model_id) == (parent.provider_id, parent.model_id):
+            return False
+        return self.quota.remaining(spec) / spec.request_limit > self.settings.shadow_min_headroom
+
+    async def _shadow(self, request, parent):
+        if self.scheduler.closed or self.stopped:
+            return
+        with self.sessions() as session:
+            foreground = session.scalar(
+                select(func.count())
+                .select_from(TaskRequest)
+                .where(
+                    TaskRequest.client_id == request.client_id,
+                    TaskRequest.execution_kind == "PRIMARY",
+                    TaskRequest.status == "ACCEPTED",
+                )
+            )
+            spent = session.scalar(
+                select(func.count())
+                .select_from(TaskRequest)
+                .where(
+                    TaskRequest.client_id == request.client_id,
+                    TaskRequest.execution_kind == "SHADOW",
+                )
+            )
+        if spent + 1 > foreground * self.settings.shadow_max_rate:
+            return
+        profile = profile_task(request, self.thresholds)
+        if not self.selector.candidates(
+            request,
+            profile,
+            set(),
+            eligible=lambda spec, model: self._shadow_candidate(parent, spec, model),
+        ):
+            return
+        await self.solve(
+            request.model_copy(update={"priority": "P4", "cross_check_required": False}),
+            shadow_of=parent,
+        )
+
+    def _queue_shadow(self, request, result):
+        if (
+            not self.settings.shadow_enabled
+            or self.scheduler.closed
+            or result.status != "ACCEPTED"
+            or request.privacy_class != "PUBLIC"
+            or request.evidence
+            or request.quality_level == "high_impact_support"
+        ):
+            return
+        task = asyncio.create_task(self._shadow(request, result.model_copy(deep=True)))
+        self.shadow_tasks.add(task)
+
+        def finished(done):
+            self.shadow_tasks.discard(done)
+            if not done.cancelled():
+                done.exception()  # solve persists normalized failure; never log private exceptions.
+
+        task.add_done_callback(finished)
+
+    async def close(self):
+        self.scheduler.closed = True
+        tasks = list(self.shadow_tasks)
+        for task in tasks:
+            if not task.cancelling():
+                task.cancel()
+        if tasks:
+            cleanup = asyncio.gather(*tasks, return_exceptions=True)
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+        await self.scheduler.close()
+
+    async def solve(self, request, *, shadow_of=None):
         # Freeze mutable caller data before it waits for a turn.
         request = request.model_copy(deep=True)
         request_id = str(uuid4())
@@ -336,6 +434,8 @@ class Router:
                     id=request_id,
                     client_id=request.client_id,
                     status="RECEIVED",
+                    execution_kind="SHADOW" if shadow_of is not None else "PRIMARY",
+                    parent_request_id=shadow_of.request_id if shadow_of is not None else None,
                     profile_json=profile.model_dump(mode="json"),
                 )
             )
@@ -362,13 +462,19 @@ class Router:
                     "SCHEDULED",
                     {"priority": request.priority, "wait_ms": (monotonic() - queued_at) * 1000},
                 )
-            return await self._solve(request, request_id, profile)
+            if shadow_of is not None:
+                return await self._solve(request, request_id, profile, shadow_of=shadow_of)
+            result = await self._solve(request, request_id, profile)
+            self._queue_shadow(request, result)
+            return result
         except SchedulingRejected as error:
             required = (
                 request.cross_check_required or request.quality_level == "high_impact_support"
             )
             result = SolveResponse(
                 request_id=request_id,
+                execution_kind="SHADOW" if shadow_of is not None else "PRIMARY",
+                parent_request_id=shadow_of.request_id if shadow_of is not None else None,
                 status="FAILED",
                 reason_code=error.reason,
                 attempts=[],
@@ -403,7 +509,7 @@ class Router:
         except Exception as error:
             raise SourceReviewUnavailable("SOURCE_REVIEW_SERVICE_FAILED") from error
 
-    async def _solve(self, request, request_id, profile):
+    async def _solve(self, request, request_id, profile, shadow_of=None):
         attempts, tried = [], set()
         benchmark_checks = {}
         required = request.cross_check_required or request.quality_level == "high_impact_support"
@@ -429,11 +535,21 @@ class Router:
         reason = "NO_ELIGIBLE_FREE_MODELS"
         accepted_response = accepted_quality = None
         validator_failed = False
-        for _ in range(self.settings.max_attempts):
+        for _ in range(1 if shadow_of is not None else self.settings.max_attempts):
             if self.stopped:
                 reason = "SYSTEM_STOPPED"
                 break
-            candidates = self.selector.candidates(request, profile, tried, benchmark_checks)
+            candidates = self.selector.candidates(
+                request,
+                profile,
+                tried,
+                benchmark_checks,
+                **(
+                    {"eligible": lambda spec, model: self._shadow_candidate(shadow_of, spec, model)}
+                    if shadow_of is not None
+                    else {}
+                ),
+            )
             if not candidates:
                 break
             route = candidates[0]
@@ -446,6 +562,7 @@ class Router:
                     len(attempts) + 1,
                     "PRIMARY",
                     benchmark_checks,
+                    shadow_of=shadow_of,
                 )
             except SourcePolicyBlocked:
                 reason = "SOURCE_POLICY_UNSATISFIED"
@@ -544,6 +661,8 @@ class Router:
         ]
         result = SolveResponse(
             request_id=request_id,
+            execution_kind="SHADOW" if shadow_of is not None else "PRIMARY",
+            parent_request_id=shadow_of.request_id if shadow_of is not None else None,
             status="FAILED"
             if validator_failed
             else "ACCEPTED"
@@ -553,7 +672,7 @@ class Router:
             attempts=attempts,
             minimum_required=profile.minimum_quality_score,
             best_quality_score=max(scored) if scored else None,
-            output=accepted_response.text if accepted_response else None,
+            output=accepted_response.text if accepted_response and shadow_of is None else None,
             provider_id=accepted_response.provider_id if accepted_response else None,
             model_id=accepted_response.model_id if accepted_response else None,
             quality=accepted_quality,
@@ -568,6 +687,46 @@ class Router:
         with self.sessions.begin() as session:
             row = session.get(TaskRequest, request_id)
             row.status, row.result_json = result.status, result.model_dump(mode="json")
+            if shadow_of is not None:
+                agreement, basis = (
+                    compare(
+                        request,
+                        NormalizedModelResponse(
+                            provider_id=shadow_of.provider_id,
+                            model_id=shadow_of.model_id,
+                            text=shadow_of.output,
+                        ),
+                        accepted_response,
+                        True,
+                    )
+                    if accepted_response
+                    else (None, "NOT_ASSESSED")
+                )
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "SHADOW_COMPARISON",
+                    {
+                        "parent_request_id": shadow_of.request_id,
+                        "agreement": agreement,
+                        "basis": basis,
+                        "output_withheld": True,
+                    },
+                )
+                self.audit(
+                    session,
+                    shadow_of.request_id,
+                    request.client_id,
+                    "SHADOW_COMPLETED",
+                    {
+                        "shadow_request_id": request_id,
+                        "status": result.status,
+                        "agreement": agreement,
+                        "basis": basis,
+                        "output_withheld": True,
+                    },
+                )
             if benchmark_checks:
                 self.audit(
                     session,

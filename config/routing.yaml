@@ -7,6 +7,13 @@ cooldown_seconds: 60
 quality_weight: 0.65
 quota_weight: 0.20
 reliability_weight: 0.15
+feedback_weight: 3
+feedback_max_age_days: 30
+confidence_half_life_days: 30
+drift_drop_points: 15
+shadow_enabled: false
+shadow_min_headroom: 0.7
+shadow_max_rate: 0.1
 scheduler:
   max_queued: 128
   max_queued_per_client: 16

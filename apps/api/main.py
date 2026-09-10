@@ -11,6 +11,7 @@ from sqlalchemy import select
 from fair.benchmarks.registry import BenchmarkRegistry
 from fair.config import RoutingSettings, config_dir, load_yaml
 from fair.governor.recovery import ProviderRecovery, Recovery, RecoveryDenied, RequestRecovery
+from fair.performance.feedback import FeedbackDenied, FeedbackRegistry, FeedbackRequest
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.quality.sandbox import DockerSandbox, SandboxUnavailable
@@ -91,7 +92,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
             yield
         finally:
             try:
-                await app.state.router.scheduler.close()
+                await app.state.router.close()
             finally:
                 if engine:
                     engine.dispose()
@@ -104,6 +105,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return JSONResponse(status_code=422, content={"detail": "Invalid request"})
 
     @app.exception_handler(RecoveryDenied)
+    @app.exception_handler(FeedbackDenied)
     async def recovery_denied(request, error):
         return JSONResponse(status_code=error.status, content={"detail": error.reason})
 
@@ -197,6 +199,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
                     else None,
                     "hallucination_events": row.hallucination_events,
                     "recent_quality": row.recent_quality,
+                    **app.state.router.performance.describe(row),
                 }
                 for row in rows
             ]
@@ -206,6 +209,14 @@ def create_app(router=None, client_keys=None, admin_key=None):
         with app.state.router.sessions() as session:
             row = owned(session, request_id, identity)
             return row.result_json or {"request_id": row.id, "status": row.status}
+
+    @app.post("/v1/feedback")
+    async def feedback(request: FeedbackRequest, identity=Depends(client)):
+        return FeedbackRegistry(app.state.router.sessions).submit(identity, request)
+
+    @app.get("/v1/requests/{request_id}/feedback")
+    def request_feedback(request_id: str, identity=Depends(client)):
+        return FeedbackRegistry(app.state.router.sessions).read(identity, request_id)
 
     @app.get("/v1/requests/{request_id}/audit")
     def request_audit(request_id: str, identity=Depends(client)):

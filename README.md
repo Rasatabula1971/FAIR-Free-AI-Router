@@ -127,6 +127,8 @@ For an existing local PostgreSQL instance, set `FAIR_DATABASE_URL`, run
 | --- | --- |
 | `GET /healthz` | Public process health |
 | `POST /v1/solve` | Client key; body identity must match key |
+| `POST /v1/feedback` | Owning client; one audited preference per accepted foreground result |
+| `GET /v1/requests/{id}/feedback` | Owning client only |
 | `GET /v1/providers` | Client key; safe registry summary |
 | `GET /v1/providers/{id}/health` | Client key; persisted quota and circuit observations |
 | `GET /v1/models/performance` | Admin key; up to 1,000 aggregate model/task records |
@@ -147,6 +149,9 @@ The bounded scheduler uses strict P0–P4 priority and round-robin client turns 
 class. Urgent classes require operator configuration; requests default to P2. See
 [SCHEDULING.md](docs/SCHEDULING.md) for queue limits, cancellation, failure codes and the
 volatile single-process scope.
+Step 7 adds [feedback, recent metrics, drift tracking and opt-in shadow checks](docs/LEARNING.md).
+Feedback changes only the owner's routing preferences. Shadow checks are off by default and
+withhold output. Apply migration `0007` before starting this version.
 API key digests are held in application authentication closures; tasks and keys are not stored
 in request/audit rows. Audit ORM updates/deletes are rejected, and the PostgreSQL migration
 adds a database trigger rejecting update/delete/truncate. Database-owner DDL is outside that
