@@ -448,5 +448,7 @@ examples and acceptance scope.
   warnings. The 59 added regressions include an 11-case JavaScript suite with real HTTP API
   integration. Lint, formatting, SQLite schema checks and npm package-content validation pass.
   All inference tests use existing offline fixtures; no provider activation or cloud calls occur.
-- Step 9 is implemented within the documented single-process scope. GitHub CI evidence will
-  be recorded after this code is pushed.
+- Step 9 is complete within the documented single-process scope. All four GitHub jobs passed
+  for code commit `912184f`: core (including Node HTTP integration), PostgreSQL cache/history
+  migration checks, packaged Docker API and native sandbox. Evidence:
+  [run 34472316595](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34472316595).
