@@ -422,4 +422,6 @@ examples and acceptance scope.
   schema checks pass. No new migration or quality-engine version is required.
 - Step 8 implementation and local inference verification are complete within this scope;
   cloud activation remains gated on operator credentials and account/model review. Step 9
-  follows with SDK and cache work. GitHub CI evidence will be recorded after this code is pushed.
+  follows with SDK and cache work. All four GitHub jobs passed for code commit `636186d`:
+  core, PostgreSQL, packaged Docker API and native sandbox. Evidence:
+  [run 34426623785](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34426623785).
