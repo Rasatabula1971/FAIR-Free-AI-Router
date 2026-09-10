@@ -393,5 +393,8 @@ examples and acceptance scope.
 - Local validation: 557 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
   two upstream deprecation warnings. Includes 25 learning regressions plus a migration with
   existing foreign-key-linked history. Lint, formatting and SQLite schema checks pass.
-  GitHub integration validation is pending. Live providers and shadow collection remain disabled.
-  Next is Step 8: implement and verify the first live provider adapters.
+  All four GitHub jobs passed for code commit `d5642b0`: core, PostgreSQL (including existing
+  request/audit preservation), packaged Docker API and native sandbox. Evidence:
+  [run 34420585891](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34420585891).
+  Step 7 is complete within the documented scope. Live providers and shadow collection remain
+  disabled. Next is Step 8: implement and verify the first live provider adapters.
