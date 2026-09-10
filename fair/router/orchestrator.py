@@ -54,6 +54,7 @@ class Router:
         self.selector = Selector(registry, self.quota, settings, self.performance, self.benchmarks)
         self.kill_switch = KillSwitch(sessions)
         self.scheduler = FairScheduler(settings.scheduler)
+        self.inflight = set()
 
     @property
     def stopped(self):
@@ -339,6 +340,7 @@ class Router:
                 )
             )
         ticket = None
+        self.inflight.add(request_id)
         try:
             if self.stopped:
                 raise SchedulingRejected("SYSTEM_STOPPED")
@@ -393,6 +395,7 @@ class Router:
         finally:
             if ticket is not None:
                 self.scheduler.release(ticket)
+            self.inflight.discard(request_id)
 
     def _source_report(self, request):
         try:

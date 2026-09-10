@@ -67,6 +67,8 @@ class ProviderQuotaState(Base):
     circuit_state: Mapped[str] = mapped_column(String(16), default="CLOSED")
     probe_until: Mapped[float] = mapped_column(Float, default=0)
     failures: Mapped[list] = mapped_column(JSON, default=list)
+    last_reserved_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_quota_reset_at: Mapped[float | None] = mapped_column(Float, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

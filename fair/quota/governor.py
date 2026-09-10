@@ -8,7 +8,7 @@ from fair.schemas.db import ProviderHealthEvent, ProviderQuotaState, utcnow
 
 
 class QuotaGovernor:
-    """Durable conservative reservations. Run one API worker until scheduling is built."""
+    """Durable conservative reservations behind the single-process scheduler."""
 
     def __init__(self, settings: RoutingSettings, sessions, clock=time):
         self.settings = settings
@@ -36,6 +36,7 @@ class QuotaGovernor:
     def _recover(self, session, row):
         now = self.clock()
         if row.reset_at is not None and now >= row.reset_at:
+            row.last_quota_reset_at = max(row.last_quota_reset_at or 0, row.reset_at)
             row.used = 0
             row.exhausted = False
             row.reset_at = None
@@ -80,6 +81,7 @@ class QuotaGovernor:
                 row.probe_until = self.clock() + self.settings.timeout_seconds + 5
                 self._event(session, row, "PROBE_STARTED")
             row.used += 1
+            row.last_reserved_at = self.clock()
             row.updated_at = utcnow()
             return True
 

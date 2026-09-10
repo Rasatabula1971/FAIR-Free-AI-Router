@@ -1,15 +1,16 @@
 import asyncio
-import hmac
-import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
 from fair.benchmarks.registry import BenchmarkRegistry
 from fair.config import RoutingSettings, config_dir, load_yaml
+from fair.governor.recovery import ProviderRecovery, Recovery, RecoveryDenied, RequestRecovery
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.quality.sandbox import DockerSandbox, SandboxUnavailable
@@ -19,15 +20,11 @@ from fair.schemas.api import SolveRequest, SolveResponse
 from fair.schemas.db import AuditEvent, ModelTaskPerformance, database
 from fair.schemas.db import TaskRequest as TaskRow
 from fair.schemas.domain import ProviderSpec
+from fair.security.credentials import APIKeys
 
 
 def create_app(router=None, client_keys=None, admin_key=None):
-    keys = (
-        client_keys
-        if client_keys is not None
-        else json.loads(os.environ.get("FAIR_CLIENT_KEYS", "{}"))
-    )
-    admin = admin_key if admin_key is not None else os.environ.get("FAIR_ADMIN_KEY", "")
+    credentials = APIKeys.load(client_keys, admin_key)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -101,14 +98,23 @@ def create_app(router=None, client_keys=None, admin_key=None):
 
     app = FastAPI(title="FAIR Free AI Router", version="0.1.0", lifespan=lifespan)
 
-    def client(x_api_key: str = Header(default="")):
-        for identity, key in keys.items():
-            if key and hmac.compare_digest(x_api_key, key):
-                return identity
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request, error):
+        # Framework validation errors otherwise echo input values, including secret extras.
+        return JSONResponse(status_code=422, content={"detail": "Invalid request"})
+
+    @app.exception_handler(RecoveryDenied)
+    async def recovery_denied(request, error):
+        return JSONResponse(status_code=error.status, content={"detail": error.reason})
+
+    def client(x_api_key: list[str] = Header(default=[])):
+        identity = credentials.authenticate(x_api_key)
+        if identity is not None:
+            return identity
         raise HTTPException(401, "Valid client API key required")
 
-    def administrator(x_api_key: str = Header(default="")):
-        if not admin or not hmac.compare_digest(x_api_key, admin):
+    def administrator(x_api_key: list[str] = Header(default=[])):
+        if credentials.authenticate(x_api_key, administrator=True) is None:
             raise HTTPException(403, "Administrator API key required")
         return "admin"
 
@@ -222,7 +228,19 @@ def create_app(router=None, client_keys=None, admin_key=None):
 
     @app.get("/v1/system/scheduler", dependencies=[Depends(administrator)])
     async def scheduler_status():
-        return app.state.router.scheduler.snapshot()
+        return app.state.router.scheduler.snapshot() | {"inflight": len(app.state.router.inflight)}
+
+    @app.get("/v1/system/providers/{provider_id}/recovery", dependencies=[Depends(administrator)])
+    async def inspect_recovery(provider_id: str):
+        return Recovery(app.state.router).inspect_provider(provider_id)
+
+    @app.post("/v1/system/providers/{provider_id}/recover", dependencies=[Depends(administrator)])
+    async def recover_provider(provider_id: str, request: ProviderRecovery):
+        return Recovery(app.state.router).provider(provider_id, request)
+
+    @app.post("/v1/system/requests/recover", dependencies=[Depends(administrator)])
+    async def recover_requests(request: RequestRecovery):
+        return Recovery(app.state.router).requests(request)
 
     @app.get("/v1/providers/{provider_id}/health")
     def provider_health(provider_id: str, identity=Depends(client)):

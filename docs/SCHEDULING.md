@@ -122,7 +122,8 @@ memory; the database retains profile metadata and audit events, not a replayable
 schema migration or quality-engine version change is needed.
 
 The queue is local and volatile. A hard process crash loses queued payloads and may leave
-nonterminal request rows; startup does not reconcile those rows or replay work. This increment
+nonterminal request rows; startup does not reconcile those rows or replay work. Step 6 adds
+[manual stopped-and-idle reconciliation](OPERATIONS_SECURITY.md) without replay. This increment
 does not implement a distributed scheduler, durable queue recovery or production resource
-isolation. Run one worker. Operational recovery is the next build step; live providers remain
+isolation. Run one worker. Live providers remain
 disabled.

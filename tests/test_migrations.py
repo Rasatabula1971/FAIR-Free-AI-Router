@@ -8,8 +8,49 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import DateTime, bindparam, create_engine, inspect, text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import sessionmaker
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def recovery_roundtrip(connection):
+    from conftest import provider
+
+    from fair.config import RoutingSettings
+    from fair.governor.recovery import ProviderRecovery, Recovery, RequestRecovery
+    from fair.providers.registry import Registry
+    from fair.router.orchestrator import Router
+    from fair.schemas.db import TaskRequest
+
+    sessions = sessionmaker(bind=connection, expire_on_commit=False)
+    registry = Registry()
+    registry.register(provider())
+    router = Router(registry, RoutingSettings(), {"standard": 82}, sessions)
+    router.stopped = True
+    router.quota.block_security("a")
+    recovery = Recovery(router)
+    request = ProviderRecovery(
+        action="clear_authentication",
+        expected_state=recovery.inspect_provider("a")["expected_state"],
+        review_reference="migration-test",
+    )
+    recovery.provider("a", request)
+    assert not router.quota.state("a").security_blocked
+    with sessions.begin() as session:
+        session.add(
+            TaskRequest(
+                id="interrupted-json-null",
+                client_id="alice",
+                status="QUEUED",
+                profile_json={},
+                result_json=None,
+                created_at=datetime(2020, 1, 1, tzinfo=UTC),
+            )
+        )
+    result = recovery.requests(
+        RequestRecovery(created_before=datetime.now(UTC), review_reference="migration-test")
+    )
+    assert result["recovered"] == 1
 
 
 def config(connection):
@@ -46,6 +87,7 @@ def test_sqlite_migration_preserves_history_and_stop(tmp_path):
     try:
         with engine.begin() as connection:
             migration_roundtrip(connection)
+            recovery_roundtrip(connection)
     finally:
         engine.dispose()
 
@@ -64,6 +106,7 @@ def test_postgres_migrations_and_audit_trigger():
                 connection.execute(text(f'CREATE SCHEMA "{schema}"'))
                 connection.execute(text(f'SET LOCAL search_path TO "{schema}"'))
                 migration_roundtrip(connection)
+                recovery_roundtrip(connection)
                 for statement in (
                     "UPDATE audit_events SET event_type = 'tampered'",
                     "DELETE FROM audit_events",

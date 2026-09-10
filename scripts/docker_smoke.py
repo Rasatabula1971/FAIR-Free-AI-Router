@@ -80,6 +80,20 @@ def main():
     assert stopped["reason_code"] == "SYSTEM_STOPPED"
     assert stopped["attempts"] == []
     assert stopped["paid_inference_executed"] is False
+    recovery = request("/v1/system/providers/mock_primary/recovery", key=admin)
+    assert recovery["state"]["used"] == 1
+    request("/v1/system/providers/mock_primary/recovery", key=key, expected=403)
+    denied_recovery = request(
+        "/v1/system/providers/mock_primary/recover",
+        key=admin,
+        payload={
+            "action": "clear_authentication",
+            "expected_state": recovery["expected_state"],
+            "review_reference": "ci-smoke",
+        },
+        expected=409,
+    )
+    assert denied_recovery["detail"] == "NO_RECOVERY_NEEDED"
     assert request("/v1/system/resume", key=admin, payload={})["stopped"] is False
     resumed = request("/v1/solve", key=key, payload=payload)
     assert len(resumed["attempts"]) == 2

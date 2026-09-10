@@ -131,6 +131,9 @@ For an existing local PostgreSQL instance, set `FAIR_DATABASE_URL`, run
 | `GET /v1/providers/{id}/health` | Client key; persisted quota and circuit observations |
 | `GET /v1/models/performance` | Admin key; up to 1,000 aggregate model/task records |
 | `GET /v1/system/scheduler` | Admin key; process-local queue and priority counts |
+| `GET /v1/system/providers/{id}/recovery` | Admin key; stored state and recovery fingerprint |
+| `POST /v1/system/providers/{id}/recover` | Admin key; stopped, idle, audited provider recovery |
+| `POST /v1/system/requests/recover` | Admin key; bounded reconciliation of interrupted requests |
 | `GET /v1/requests/{id}` | Owning client only |
 | `GET /v1/requests/{id}/audit` | Owning client only |
 | `POST /v1/system/stop` | Separate admin key |
@@ -144,7 +147,7 @@ The bounded scheduler uses strict P0–P4 priority and round-robin client turns 
 class. Urgent classes require operator configuration; requests default to P2. See
 [SCHEDULING.md](docs/SCHEDULING.md) for queue limits, cancellation, failure codes and the
 volatile single-process scope.
-API keys are held only in application authentication closures; tasks and keys are not stored
+API key digests are held in application authentication closures; tasks and keys are not stored
 in request/audit rows. Audit ORM updates/deletes are rejected, and the PostgreSQL migration
 adds a database trigger rejecting update/delete/truncate. Database-owner DDL is outside that
 boundary. SQLite is for tests only.
@@ -153,7 +156,8 @@ Provider YAML remains the authority for configured eligibility and models. Start
 relational snapshots without clearing runtime blocks or quota consumption. A quota reset
 must be explicitly observed by the adapter; no daily/monthly reset is invented. Exhaustion
 without a known reset, and authentication blocks, remain blocked across restarts. An operator
-recovery workflow for those states is still pending. Health reads report stored observations;
+recovery workflow is available in [OPERATIONS_SECURITY.md](docs/OPERATIONS_SECURITY.md), including
+credential rotation, explicit quota-reset evidence and migration `0006`. Health reads report stored observations;
 they do not make live provider calls. Deadline fields use UTC Unix seconds.
 
 After pulling a schema change, run `alembic upgrade head` before starting the service.

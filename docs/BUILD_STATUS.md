@@ -85,13 +85,13 @@ time with bounded, process-local client fairness within each priority class. Do 
 production deployment or enable live inference before the subsequent gates are met.
 
 Provider configuration remains file-backed, with relational snapshots for inspection. Runtime
-state is durable. Unknown exhaustion and authentication blocks currently require operator
-database maintenance to clear; a scoped, audited recovery API is not implemented. Normalized
+state is durable. Unknown exhaustion and authentication blocks have a scoped, audited operator
+recovery API in Step 6; quota resets require explicit new-window observations. Normalized
 adapter observations cover request quotas; token/compute quota tracking is still future work.
 
 The HTTP test dependencies currently emit upstream deprecation warnings; tests still pass.
 GitHub Actions now passes core, PostgreSQL, Docker and native-sandbox jobs. Earlier increment
-validation notes describe the results available at that time; current evidence is in increment twelve.
+validation notes describe the results available at that time; current evidence is in increment thirteen.
 
 ## Validation of the first increment
 
@@ -347,3 +347,25 @@ examples and acceptance scope.
   [run 34392674807](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34392674807).
   Step 5 is complete within the single-process scope. Next is Step 6: operational security and
   recovery. Live providers remain disabled.
+
+## Thirteenth increment: operational security and recovery (Step 6)
+
+- API authentication keeps key digests, rejects overlapping client/admin credentials and
+  duplicate headers, supports bounded mounted-file sources, and masks configuration errors.
+  Generic validation failures no longer echo submitted input. Rotation takes effect on restart.
+- Added a scoped provider credential resolver and guarded adapter registration for later live
+  integration. Exact credential reflection is blocked across inference/discovery, typed errors
+  are normalized, and tests scan normalized requests, serialized results, ORM rows and logs.
+- Added stopped-and-idle admin recovery with state fingerprints and atomic before/after audits.
+  Authentication recovery preserves quota; circuit recovery permits one existing probe; quota
+  resets require an operator-observed boundary newer than reservations and prior reset evidence.
+  Provider eligibility and the global stop remain unchanged by recovery.
+- Manual bounded request reconciliation marks crash-interrupted metadata failed without replay,
+  output release, quota refunds or changes to existing terminal results. History stays isolated.
+- Migration `0006` persists quota observation boundaries, conservatively backfilling legacy usage.
+  The [operator guide](OPERATIONS_SECURITY.md) documents credential sources, recovery actions,
+  evidence requirements and the single-process/trusted-adapter limitations.
+- Local validation: 531 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
+  two upstream deprecation warnings. Lint, formatting and SQLite migration/recovery checks pass.
+  GitHub integration validation is pending. Live providers remain disabled. Step 7 follows with
+  feedback, rolling performance and drift tracking.
