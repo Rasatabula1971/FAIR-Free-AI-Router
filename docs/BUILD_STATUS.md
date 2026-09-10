@@ -367,5 +367,8 @@ examples and acceptance scope.
   evidence requirements and the single-process/trusted-adapter limitations.
 - Local validation: 531 tests passed, 28 PostgreSQL/native Docker checks skipped locally,
   two upstream deprecation warnings. Lint, formatting and SQLite migration/recovery checks pass.
-  GitHub integration validation is pending. Live providers remain disabled. Step 7 follows with
-  feedback, rolling performance and drift tracking.
+  All four GitHub jobs passed for code commit `a17b91a`: core, PostgreSQL, packaged Docker API
+  and native sandbox. Evidence:
+  [run 34419489805](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34419489805).
+  Step 6 is complete within its documented scope. Live providers remain disabled. Step 7
+  follows with feedback, rolling performance and drift tracking.
