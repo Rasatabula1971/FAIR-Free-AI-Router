@@ -445,6 +445,9 @@ class Router:
                 except asyncio.CancelledError:
                     continue
         await self.scheduler.close()
+        for adapter in self.registry.adapters.values():
+            if hasattr(adapter, "close"):
+                await adapter.close()
 
     async def solve(self, request, *, shadow_of=None):
         # Freeze mutable caller data before it waits for a turn.

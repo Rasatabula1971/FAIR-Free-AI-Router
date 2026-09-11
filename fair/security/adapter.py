@@ -60,6 +60,10 @@ class CredentialedAdapter:
         except Exception:
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
 
+    async def close(self):
+        if hasattr(self._adapter, "close"):
+            await self._adapter.close()
+
     async def health(self):
         return await self._call(self._adapter.health)
 

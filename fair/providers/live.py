@@ -95,8 +95,11 @@ class TextAdapter:
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
-        self._credential, self._transport, self.clock = credential, transport, clock
+        self._credential, self.clock = credential, clock
         self._quota = QuotaSnapshot(provider_id=self.provider_id)
+        self._client = httpx.AsyncClient(
+            timeout=30, trust_env=False, follow_redirects=False, transport=transport
+        )
         self._admit()
 
     def _admit(self):
@@ -146,6 +149,9 @@ class TextAdapter:
         """Recheck local policy without consuming provider quota."""
         self._admit()
 
+    async def close(self):
+        await self._client.aclose()
+
     def _observe(self, headers):
         return QuotaSnapshot(provider_id=self.provider_id)
 
@@ -171,35 +177,32 @@ class TextAdapter:
         if self._credential is not None:
             headers["Authorization"] = "Bearer " + self._credential.get_secret_value()
         try:
-            async with httpx.AsyncClient(
-                timeout=30, trust_env=False, follow_redirects=False, transport=self._transport
-            ) as client:
-                async with client.stream(
-                    method, self.base_url + path, headers=headers, json=payload
-                ) as response:
-                    self._error(response.status_code, response.headers)
-                    if response.headers.get("content-encoding", "identity") != "identity":
-                        raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
-                    chunks, size = [], 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > 4_000_000:
-                            raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
-                        chunks.append(chunk)
-                    value = strict_json(b"".join(chunks).decode("utf-8"))
-                    if not isinstance(value, dict):
-                        raise ValueError()
-                    if "error" in value:
-                        error = value["error"]
-                        self._error(
-                            error.get("code", 500)
-                            if isinstance(error, dict) and type(error.get("code")) is int
-                            else 500,
-                            response.headers,
-                        )
-                        raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
-                    self._quota = self._observe(response.headers)
-                    return value
+            async with self._client.stream(
+                method, self.base_url + path, headers=headers, json=payload
+            ) as response:
+                self._error(response.status_code, response.headers)
+                if response.headers.get("content-encoding", "identity") != "identity":
+                    raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
+                chunks, size = [], 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > 4_000_000:
+                        raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
+                    chunks.append(chunk)
+                value = strict_json(b"".join(chunks).decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise ValueError()
+                if "error" in value:
+                    error = value["error"]
+                    self._error(
+                        error.get("code", 500)
+                        if isinstance(error, dict) and type(error.get("code")) is int
+                        else 500,
+                        response.headers,
+                    )
+                    raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
+                self._quota = self._observe(response.headers)
+                return value
         except httpx.HTTPError:
             raise ProviderUnavailable("PROVIDER_TRANSPORT_FAILED") from None
         except (ValueError, UnicodeError, RecursionError):
