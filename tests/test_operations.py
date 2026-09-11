@@ -178,7 +178,7 @@ def test_preflight_database_check_does_not_migrate(preflight_config, monkeypatch
     assert check(preflight_config, check_database=True)["status"] == "FAIL"
     with engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
-        connection.execute(text("UPDATE alembic_version SET version_num='0009'"))
+        connection.execute(text("UPDATE alembic_version SET version_num='0010'"))
     assert check(preflight_config, check_database=True)["status"] == "PASS"
     engine.dispose()
 

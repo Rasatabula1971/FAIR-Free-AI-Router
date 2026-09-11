@@ -226,7 +226,9 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return row
 
     @app.get("/v1/models/performance", dependencies=[Depends(administrator)])
-    def performance():
+    def performance(limit: int = 100, offset: int = 0):
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
         with app.state.router.sessions() as session:
             rows = session.scalars(
                 select(ModelTaskPerformance)
@@ -235,7 +237,8 @@ def create_app(router=None, client_keys=None, admin_key=None):
                     ModelTaskPerformance.model_id,
                     ModelTaskPerformance.task_class,
                 )
-                .limit(1000)
+                .limit(limit)
+                .offset(offset)
             )
             return [
                 {
@@ -278,13 +281,17 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return FeedbackRegistry(app.state.router.sessions).read(identity, request_id)
 
     @app.get("/v1/requests/{request_id}/audit")
-    def request_audit(request_id: str, identity=Depends(client)):
+    def request_audit(request_id: str, limit: int = 200, offset: int = 0, identity=Depends(client)):
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
         with app.state.router.sessions() as session:
             owned(session, request_id, identity)
             rows = session.scalars(
                 select(AuditEvent)
                 .where(AuditEvent.request_id == request_id)
                 .order_by(AuditEvent.created_at, AuditEvent.id)
+                .limit(limit)
+                .offset(offset)
             )
             return [
                 {"event_type": r.event_type, "payload": r.payload_json, "created_at": r.created_at}

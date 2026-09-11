@@ -7,7 +7,7 @@ from fair.schemas.db import AuditEvent, CacheEntry, ProviderQuotaState, SystemSt
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_REVISION = "0009"
+SCHEMA_REVISION = "0010"
 
 
 def schema_current(session):
