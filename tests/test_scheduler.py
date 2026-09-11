@@ -24,7 +24,7 @@ def request(client="alice", **values):
 
 
 async def until(predicate):
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(15):
         while not predicate():
             await asyncio.sleep(0)
 

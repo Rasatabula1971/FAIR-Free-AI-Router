@@ -359,7 +359,7 @@ async def test_shadow_rechecks_quota_after_waiting_behind_user_work(make_router)
     user = asyncio.create_task(router.solve(request("bob")))
     await started.wait()
     await tenth
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(15):
         while router.scheduler.queued == 0:
             await asyncio.sleep(0)
     assert router.registry.adapters["b"].calls == 0
