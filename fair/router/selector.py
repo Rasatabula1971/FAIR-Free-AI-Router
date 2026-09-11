@@ -22,10 +22,14 @@ class Selector:
                 admit_provider(spec)
             except AdmissionDenied:
                 continue
-            if spec.provider_id not in self.registry.adapters or not await self.quota.available(spec):
+            if spec.provider_id not in self.registry.adapters:
+                continue
+            avail, remaining = await self.quota.available_with_remaining(spec)
+            if not avail:
                 continue
             if PRIVACY[request.privacy_class] > PRIVACY[spec.max_data_class]:
                 continue
+            headroom = remaining / spec.request_limit if spec.request_limit else 0.5
             for model in spec.models:
                 if not model.active or (spec.provider_id, model.model_id) in tried:
                     continue
@@ -56,8 +60,6 @@ class Selector:
                     quality_prior=quality_prior,
                     client_id=request.client_id,
                 )
-                remaining = await self.quota.remaining(spec)
-                headroom = remaining / spec.request_limit if spec.request_limit else 0.5
                 score = (
                     self.settings.quality_weight * quality
                     + self.settings.quota_weight * headroom

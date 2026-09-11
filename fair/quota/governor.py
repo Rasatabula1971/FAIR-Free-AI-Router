@@ -58,8 +58,7 @@ class QuotaGovernor:
         return await asyncio.to_thread(_do)
 
     async def remaining(self, spec):
-        state = await self.state(spec.provider_id)
-        return None if spec.request_limit is None else max(0, spec.request_limit - state.used)
+        return self._remaining(await self.state(spec.provider_id), spec)
 
     def _available(self, row, spec):
         return (
@@ -73,13 +72,21 @@ class QuotaGovernor:
     async def available(self, spec):
         return self._available(await self.state(spec.provider_id), spec)
 
-    async def reserve(self, spec):
+    def _remaining(self, row, spec):
+        return None if spec.request_limit is None else max(0, spec.request_limit - row.used)
+
+    async def available_with_remaining(self, spec):
+        row = await self.state(spec.provider_id)
+        return self._available(row, spec), self._remaining(row, spec)
+
+    async def reserve_with_info(self, spec):
         def _do():
             with self.sessions.begin() as session:
                 row = self._row(session, spec.provider_id)
                 self._recover(session, row)
+                remaining = self._remaining(row, spec)
                 if not self._available(row, spec):
-                    return False
+                    return False, remaining
                 if row.circuit_state == "OPEN":
                     row.circuit_state = "HALF_OPEN"
                     row.probe_until = self.clock() + self.settings.timeout_seconds + 5
@@ -87,8 +94,12 @@ class QuotaGovernor:
                 row.used += 1
                 row.last_reserved_at = self.clock()
                 row.updated_at = utcnow()
-                return True
+                return True, remaining
         return await asyncio.to_thread(_do)
+
+    async def reserve(self, spec):
+        reserved, _ = await self.reserve_with_info(spec)
+        return reserved
 
     def _open(self, row):
         row.circuit_state = "OPEN"

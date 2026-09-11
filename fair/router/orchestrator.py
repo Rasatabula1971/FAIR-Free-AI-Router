@@ -122,8 +122,8 @@ class Router:
             if check.state != "PASSED":
                 return None, None, False
         admit_provider(spec)
-        remaining = await self.quota.remaining(spec)
-        if not await self.quota.reserve(spec):
+        reserved, remaining = await self.quota.reserve_with_info(spec)
+        if not reserved:
             return None, None, False
         start = monotonic()
         quality = response = error_type = None

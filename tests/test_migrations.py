@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import DateTime, bindparam, create_engine, inspect, text
+from sqlalchemy import DateTime, bindparam, create_engine, inspect, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
@@ -20,14 +20,18 @@ def recovery_roundtrip(connection):
     from fair.governor.recovery import ProviderRecovery, Recovery, RequestRecovery
     from fair.providers.registry import Registry
     from fair.router.orchestrator import Router
-    from fair.schemas.db import TaskRequest
+    from fair.schemas.db import ProviderQuotaState, TaskRequest
 
     sessions = sessionmaker(bind=connection, expire_on_commit=False)
     registry = Registry()
     registry.register(provider())
     router = Router(registry, RoutingSettings(), {"standard": 82}, sessions)
     router.stopped = True
-    router.quota.block_security("a")
+    with sessions.begin() as session:
+        row = session.scalar(
+            select(ProviderQuotaState).where(ProviderQuotaState.provider_id == "a")
+        )
+        row.security_blocked = True
     recovery = Recovery(router)
     request = ProviderRecovery(
         action="clear_authentication",
@@ -35,7 +39,8 @@ def recovery_roundtrip(connection):
         review_reference="migration-test",
     )
     recovery.provider("a", request)
-    assert not router.quota.state("a").security_blocked
+    with sessions() as session:
+        assert not session.get(ProviderQuotaState, "a").security_blocked
     with sessions.begin() as session:
         session.add(
             TaskRequest(
