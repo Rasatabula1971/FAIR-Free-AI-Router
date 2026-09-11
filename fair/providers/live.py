@@ -93,10 +93,14 @@ class TextAdapter:
     expected_access = ""
     catalog_path = "/models"
 
+    _catalog_ttl = 60
+
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
         self._credential, self.clock = credential, clock
         self._quota = QuotaSnapshot(provider_id=self.provider_id)
+        self._model_cache = None
+        self._model_cache_at = 0.0
         self._client = httpx.AsyncClient(
             timeout=30, trust_env=False, follow_redirects=False, transport=transport
         )
@@ -220,6 +224,15 @@ class TextAdapter:
         return self._quota.model_copy(deep=True)
 
     async def list_models(self):
+        now = self.clock()
+        if self._model_cache is not None and now - self._model_cache_at < self._catalog_ttl:
+            return [m.model_copy(deep=True) for m in self._model_cache]
+        result = await self._fetch_models()
+        self._model_cache = result
+        self._model_cache_at = now
+        return result
+
+    async def _fetch_models(self):
         data = await self._json("GET", self.catalog_path)
         entries = data.get("data")
         if not isinstance(entries, list) or len(entries) > 4096:
@@ -368,7 +381,7 @@ class OllamaLocalAdapter(TextAdapter):
         self.base_url = settings.ollama_url.rstrip("/")
         super().__init__(spec, settings, **kwargs)
 
-    async def list_models(self):
+    async def _fetch_models(self):
         data = await self._json("GET", "/api/tags")
         entries = data.get("models")
         if not isinstance(entries, list) or len(entries) > 4096:
