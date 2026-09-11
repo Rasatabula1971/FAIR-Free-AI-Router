@@ -1,10 +1,13 @@
+import logging
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, text
 
 from fair.schemas.db import AuditEvent, CacheEntry, ProviderQuotaState, SystemState, TaskRequest
 
-SCHEMA_REVISION = "0008"
+logger = logging.getLogger(__name__)
+
+SCHEMA_REVISION = "0009"
 
 
 def schema_current(session):
@@ -27,6 +30,7 @@ def readiness(router, credentials):
             )
         return {"status": "ready" if ready else "not_ready"}
     except Exception:
+        logger.warning("Readiness check failed", exc_info=True)
         return {"status": "not_ready"}
 
 

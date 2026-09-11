@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from time import monotonic
 from uuid import uuid4
 
@@ -33,6 +34,8 @@ from fair.schemas.domain import (
     NormalizedModelResponse,
     SourcePolicyReport,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Router:
@@ -71,6 +74,7 @@ class Router:
     def stopped(self, value):
         self.kill_switch.set(value)
         if value:
+            logger.critical("System stopped — rejecting all pending requests")
             self.scheduler.reject_pending("SYSTEM_STOPPED")
 
     def audit(self, session, request_id, client_id, event_type, payload):
@@ -83,26 +87,28 @@ class Router:
             )
         )
 
-    def _persist_attempt(self, request_id, request, profile, attempt):
-        with self.sessions.begin() as session:
-            detail = attempt.model_dump(mode="json")
-            row = RoutingAttempt(request_id=request_id, detail_json=detail)
-            session.add(row)
-            session.flush()
-            quality = attempt.quality
-            if quality is not None:
-                session.add(
-                    QualityRecord(
-                        attempt_id=row.id,
-                        overall_score=quality.overall_score,
-                        hard_reject=quality.hard_reject,
-                        verification_state=quality.verification_state,
-                        report_json=quality.model_dump(mode="json"),
+    async def _persist_attempt(self, request_id, request, profile, attempt):
+        def _do():
+            with self.sessions.begin() as session:
+                detail = attempt.model_dump(mode="json")
+                row = RoutingAttempt(request_id=request_id, detail_json=detail)
+                session.add(row)
+                session.flush()
+                quality = attempt.quality
+                if quality is not None:
+                    session.add(
+                        QualityRecord(
+                            attempt_id=row.id,
+                            overall_score=quality.overall_score,
+                            hard_reject=quality.hard_reject,
+                            verification_state=quality.verification_state,
+                            report_json=quality.model_dump(mode="json"),
+                        )
                     )
-                )
-            if attempt.disposition != "CANCELLED":
-                self.performance.record(session, attempt, profile.task_class)
-            self.audit(session, request_id, request.client_id, "ATTEMPT_COMPLETED", detail)
+                if attempt.disposition != "CANCELLED":
+                    self.performance.record(session, attempt, profile.task_class)
+                self.audit(session, request_id, request.client_id, "ATTEMPT_COMPLETED", detail)
+        await asyncio.to_thread(_do)
 
     async def _attempt(
         self, request_id, request, profile, route, number, role, benchmark_checks, shadow_of=None
@@ -110,7 +116,7 @@ class Router:
         if self._source_report(request).state == "BLOCKED":
             raise SourcePolicyBlocked()
         score, spec, model = route
-        if shadow_of is not None and not self._shadow_candidate(shadow_of, spec, model):
+        if shadow_of is not None and not await self._shadow_candidate(shadow_of, spec, model):
             return None, None, False
         if self.settings.benchmark_policy is not None:
             check = self.benchmarks.assess(
@@ -119,33 +125,36 @@ class Router:
             benchmark_checks[(spec.provider_id, model.model_id)] = check
             if check.state != "PASSED":
                 return None, None, False
-        # Shared by production attempts and cross-checks: no second execution authority.
         admit_provider(spec)
-        remaining = self.quota.remaining(spec)
-        if not self.quota.reserve(spec):
+        reserved, remaining = await self.quota.reserve_with_info(spec)
+        if not reserved:
             return None, None, False
         start = monotonic()
         quality = response = error_type = None
         validator_failed = cancelled = False
         billing_violation = False
-        with self.sessions.begin() as session:
-            self.audit(
-                session,
-                request_id,
-                request.client_id,
-                "EXECUTING",
-                {
-                    "provider_id": spec.provider_id,
-                    "model_id": model.model_id,
-                    "attempt_number": number,
-                    "role": role,
-                    "selection_score": score,
-                    "quota_remaining": remaining,
-                },
-            )
+
+        def _audit_executing():
+            with self.sessions.begin() as session:
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "EXECUTING",
+                    {
+                        "provider_id": spec.provider_id,
+                        "model_id": model.model_id,
+                        "attempt_number": number,
+                        "role": role,
+                        "selection_score": score,
+                        "quota_remaining": remaining,
+                    },
+                )
         try:
-            # Both roles receive the same task/evidence. No producer answer, reference answer
-            # or host test case is exposed to the independently solving provider.
+            await asyncio.to_thread(_audit_executing)
+        except SQLAlchemyError:
+            logger.warning("Failed to audit EXECUTING for request %s", request_id, exc_info=True)
+        try:
             response = await asyncio.wait_for(
                 self.registry.adapters[spec.provider_id].complete(
                     NormalizedModelRequest(
@@ -162,38 +171,66 @@ class Router:
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
                 raise ValueError("Response identity mismatch")
             if response.quota is not None:
-                self.quota.observe(spec, response.quota)
-            self.quota.success(spec.provider_id)
+                await self.quota.observe(spec, response.quota)
+            await self.quota.success(spec.provider_id)
         except BillingViolation:
             billing_violation = True
-            self.quota.block_security(spec.provider_id)
             self.stopped = True
+            logger.critical("Billing violation from provider %s — system stopped", spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
-            with self.sessions.begin() as session:
-                self.audit(
-                    session,
-                    request_id,
-                    request.client_id,
-                    "BILLING_POLICY_VIOLATION",
-                    {"provider_id": spec.provider_id, "system_stopped": True},
-                )
+            try:
+                await self.quota.block_security(spec.provider_id)
+            except SQLAlchemyError:
+                logger.warning("Failed to block provider %s after billing violation", spec.provider_id, exc_info=True)
+
+            def _audit_billing():
+                with self.sessions.begin() as session:
+                    self.audit(
+                        session,
+                        request_id,
+                        request.client_id,
+                        "BILLING_POLICY_VIOLATION",
+                        {"provider_id": spec.provider_id, "system_stopped": True},
+                    )
+            try:
+                await asyncio.to_thread(_audit_billing)
+            except SQLAlchemyError:
+                logger.warning("Failed to audit billing violation for request %s", request_id, exc_info=True)
         except QuotaExceeded as error:
-            self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
+            logger.info("Quota exhausted for provider %s", spec.provider_id)
+            try:
+                await self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
+            except SQLAlchemyError:
+                logger.warning("Failed to persist quota exhaustion for provider %s", spec.provider_id, exc_info=True)
         except RateLimited as error:
-            self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
+            logger.info("Rate limited by provider %s, retry_after=%s", spec.provider_id, error.retry_after)
+            try:
+                await self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
+            except SQLAlchemyError:
+                logger.warning("Failed to persist throttle for provider %s", spec.provider_id, exc_info=True)
         except AuthenticationFailed:
-            self.quota.block_security(spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "AUTHENTICATION_FAILED"
+            logger.error("Authentication failed for provider %s", spec.provider_id)
+            try:
+                await self.quota.block_security(spec.provider_id)
+            except SQLAlchemyError:
+                logger.warning("Failed to block provider %s after auth failure", spec.provider_id, exc_info=True)
         except asyncio.CancelledError:
             cancelled = True
-            self.quota.failure(spec.provider_id)
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
+            try:
+                await self.quota.failure(spec.provider_id)
+            except (SQLAlchemyError, asyncio.CancelledError):
+                logger.debug("Could not record failure for provider %s after cancellation", spec.provider_id)
         except Exception:
-            # Never persist raw exception text or provider payloads.
-            self.quota.failure(spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
+            logger.warning("Provider %s unavailable for request %s", spec.provider_id, request_id, exc_info=True)
+            try:
+                await self.quota.failure(spec.provider_id)
+            except SQLAlchemyError:
+                logger.warning("Failed to record failure for provider %s", spec.provider_id, exc_info=True)
         else:
             try:
                 source_report = self._source_report(request)
@@ -239,13 +276,15 @@ class Router:
             quality=quality,
             role=role,
         )
-        self._persist_attempt(request_id, request, profile, attempt)
+        await self._persist_attempt(request_id, request, profile, attempt)
         if billing_violation:
             raise BillingViolation("PROVIDER_COST_POLICY_VIOLATION")
         if cancelled:
-            with self.sessions.begin() as session:
-                session.get(TaskRequest, request_id).status = "CANCELLED"
-                self.audit(session, request_id, request.client_id, "CANCELLED", {})
+            def _mark_cancelled():
+                with self.sessions.begin() as session:
+                    session.get(TaskRequest, request_id).status = "CANCELLED"
+                    self.audit(session, request_id, request.client_id, "CANCELLED", {})
+            await asyncio.to_thread(_mark_cancelled)
             raise asyncio.CancelledError
         return attempt, response, validator_failed
 
@@ -274,7 +313,7 @@ class Router:
             checker_qualifications = {}
             candidates = [
                 route
-                for route in self.selector.candidates(
+                for route in await self.selector.candidates(
                     request,
                     profile,
                     tried,
@@ -289,7 +328,6 @@ class Router:
                     report.state = "BENCHMARK_BLOCKED"
                 break
             route = candidates[0]
-            # Recheck at the dispatch boundary, even if candidate selection changes later.
             if not independent(primary_route, route):
                 break
             try:
@@ -339,22 +377,24 @@ class Router:
                 report.state = "PASSED"
             else:
                 report.state = "REJECTED"
-            # Never shop for agreement after a measured rejection/disagreement.
             break
-        with self.sessions.begin() as session:
-            self.audit(
-                session,
-                request_id,
-                request.client_id,
-                "CROSS_CHECK_COMPLETED",
-                {
-                    **report.model_dump(mode="json"),
-                    "model_disagreement": disagreement,
-                },
-            )
+
+        def _audit_cross_check():
+            with self.sessions.begin() as session:
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "CROSS_CHECK_COMPLETED",
+                    {
+                        **report.model_dump(mode="json"),
+                        "model_disagreement": disagreement,
+                    },
+                )
+        await asyncio.to_thread(_audit_cross_check)
         return report, disagreement
 
-    def _shadow_candidate(self, parent, spec, model):
+    async def _shadow_candidate(self, parent, spec, model):
         primary = self.registry.providers.get(parent.provider_id)
         original = (
             next((item for item in primary.models if item.model_id == parent.model_id), None)
@@ -371,34 +411,39 @@ class Router:
             return False
         if (spec.provider_id, model.model_id) == (parent.provider_id, parent.model_id):
             return False
-        return self.quota.remaining(spec) / spec.request_limit > self.settings.shadow_min_headroom
+        remaining = await self.quota.remaining(spec)
+        return remaining / spec.request_limit > self.settings.shadow_min_headroom
 
     async def _shadow(self, request, parent):
         if self.scheduler.closed or self.stopped:
             return
-        with self.sessions() as session:
-            foreground = session.scalar(
-                select(func.count())
-                .select_from(TaskRequest)
-                .where(
-                    TaskRequest.client_id == request.client_id,
-                    TaskRequest.execution_kind == "PRIMARY",
-                    TaskRequest.status == "ACCEPTED",
-                    TaskRequest.id.in_(select(RoutingAttempt.request_id)),
+
+        def _count():
+            with self.sessions() as session:
+                foreground = session.scalar(
+                    select(func.count())
+                    .select_from(TaskRequest)
+                    .where(
+                        TaskRequest.client_id == request.client_id,
+                        TaskRequest.execution_kind == "PRIMARY",
+                        TaskRequest.status == "ACCEPTED",
+                        TaskRequest.id.in_(select(RoutingAttempt.request_id)),
+                    )
                 )
-            )
-            spent = session.scalar(
-                select(func.count())
-                .select_from(TaskRequest)
-                .where(
-                    TaskRequest.client_id == request.client_id,
-                    TaskRequest.execution_kind == "SHADOW",
+                spent = session.scalar(
+                    select(func.count())
+                    .select_from(TaskRequest)
+                    .where(
+                        TaskRequest.client_id == request.client_id,
+                        TaskRequest.execution_kind == "SHADOW",
+                    )
                 )
-            )
+                return foreground, spent
+        foreground, spent = await asyncio.to_thread(_count)
         if spent + 1 > foreground * self.settings.shadow_max_rate:
             return
         profile = profile_task(request, self.thresholds)
-        if not self.selector.candidates(
+        if not await self.selector.candidates(
             request,
             profile,
             set(),
@@ -427,7 +472,7 @@ class Router:
         def finished(done):
             self.shadow_tasks.discard(done)
             if not done.cancelled():
-                done.exception()  # solve persists normalized failure; never log private exceptions.
+                done.exception()
 
         task.add_done_callback(finished)
 
@@ -445,23 +490,29 @@ class Router:
                 except asyncio.CancelledError:
                     continue
         await self.scheduler.close()
+        for adapter in self.registry.adapters.values():
+            if hasattr(adapter, "close"):
+                await adapter.close()
 
     async def solve(self, request, *, shadow_of=None):
-        # Freeze mutable caller data before it waits for a turn.
         request = request.model_copy(deep=True)
         request_id = str(uuid4())
         profile = profile_task(request, self.thresholds)
-        with self.sessions.begin() as session:
-            session.add(
-                TaskRequest(
-                    id=request_id,
-                    client_id=request.client_id,
-                    status="RECEIVED",
-                    execution_kind="SHADOW" if shadow_of is not None else "PRIMARY",
-                    parent_request_id=shadow_of.request_id if shadow_of is not None else None,
-                    profile_json=profile.model_dump(mode="json"),
+        profile_dict = profile.model_dump(mode="json")
+
+        def _create_request():
+            with self.sessions.begin() as session:
+                session.add(
+                    TaskRequest(
+                        id=request_id,
+                        client_id=request.client_id,
+                        status="RECEIVED",
+                        execution_kind="SHADOW" if shadow_of is not None else "PRIMARY",
+                        parent_request_id=shadow_of.request_id if shadow_of is not None else None,
+                        profile_json=profile_dict,
+                    )
                 )
-            )
+        await asyncio.to_thread(_create_request)
         ticket = None
         self.inflight.add(request_id)
         try:
@@ -471,23 +522,36 @@ class Router:
                 request.client_id, request.priority, len(request.model_dump_json().encode("utf-8"))
             )
             queued_at = monotonic()
-            with self.sessions.begin() as session:
-                session.get(TaskRequest, request_id).status = "QUEUED"
-                self.audit(
-                    session, request_id, request.client_id, "QUEUED", {"priority": request.priority}
-                )
+
+            def _mark_queued():
+                with self.sessions.begin() as session:
+                    session.get(TaskRequest, request_id).status = "QUEUED"
+                    self.audit(
+                        session,
+                        request_id,
+                        request.client_id,
+                        "QUEUED",
+                        {"priority": request.priority},
+                    )
+            await asyncio.to_thread(_mark_queued)
             await self.scheduler.wait(ticket)
-            with self.sessions.begin() as session:
-                self.audit(
-                    session,
-                    request_id,
-                    request.client_id,
-                    "SCHEDULED",
-                    {"priority": request.priority, "wait_ms": (monotonic() - queued_at) * 1000},
-                )
+
+            def _audit_scheduled():
+                with self.sessions.begin() as session:
+                    self.audit(
+                        session,
+                        request_id,
+                        request.client_id,
+                        "SCHEDULED",
+                        {
+                            "priority": request.priority,
+                            "wait_ms": (monotonic() - queued_at) * 1000,
+                        },
+                    )
+            await asyncio.to_thread(_audit_scheduled)
             if shadow_of is not None:
-                return await self._solve(request, request_id, profile, shadow_of=shadow_of)
-            result = await self._solve(request, request_id, profile)
+                return await self._solve(request, request_id, profile, profile_dict, shadow_of=shadow_of)
+            result = await self._solve(request, request_id, profile, profile_dict)
             self._queue_shadow(request, result)
             return result
         except SchedulingRejected as error:
@@ -506,20 +570,32 @@ class Router:
                     required=required, state="NOT_RUN" if required else "NOT_REQUESTED"
                 ),
             )
-            with self.sessions.begin() as session:
-                row = session.get(TaskRequest, request_id)
-                row.status, row.result_json = result.status, result.model_dump(mode="json")
-                self.audit(
-                    session, request_id, request.client_id, "FAILED", {"reason_code": error.reason}
-                )
+
+            reason_code = error.reason
+
+            def _persist_rejected():
+                with self.sessions.begin() as session:
+                    row = session.get(TaskRequest, request_id)
+                    row.status, row.result_json = result.status, result.model_dump(mode="json")
+                    self.audit(
+                        session,
+                        request_id,
+                        request.client_id,
+                        "FAILED",
+                        {"reason_code": reason_code},
+                    )
+            await asyncio.to_thread(_persist_rejected)
             return result
         except BaseException as error:
             status = "CANCELLED" if isinstance(error, asyncio.CancelledError) else "FAILED"
-            with self.sessions.begin() as session:
-                row = session.get(TaskRequest, request_id)
-                if row.status != status:
-                    row.status = status
-                    self.audit(session, request_id, request.client_id, status, {})
+
+            def _persist_error():
+                with self.sessions.begin() as session:
+                    row = session.get(TaskRequest, request_id)
+                    if row.status != status:
+                        row.status = status
+                        self.audit(session, request_id, request.client_id, status, {})
+            await asyncio.to_thread(_persist_error)
             raise
         finally:
             if ticket is not None:
@@ -532,7 +608,7 @@ class Router:
         except Exception as error:
             raise SourceReviewUnavailable("SOURCE_REVIEW_SERVICE_FAILED") from error
 
-    async def _solve(self, request, request_id, profile, shadow_of=None):
+    async def _solve(self, request, request_id, profile, profile_dict, shadow_of=None):
         attempts, tried = [], set()
         benchmark_checks = {}
         required = request.cross_check_required or request.quality_level == "high_impact_support"
@@ -540,24 +616,31 @@ class Router:
             required=required, state="NOT_RUN" if required else "NOT_REQUESTED"
         )
         disagreement = "NOT_ASSESSED"
-        with self.sessions.begin() as session:
-            session.get(TaskRequest, request_id).status = "PROFILED"
-            session.add(ProfileRow(request_id=request_id, **profile.model_dump(mode="json")))
-            self.audit(
-                session,
-                request_id,
-                request.client_id,
-                "PROFILED",
-                {
-                    **profile.model_dump(mode="json"),
-                    "cross_check_required": required,
-                    "max_primary_attempts": self.settings.max_attempts,
-                    "max_verification_attempts": self.settings.max_verification_attempts,
-                },
-            )
+
+        def _mark_profiled():
+            with self.sessions.begin() as session:
+                session.get(TaskRequest, request_id).status = "PROFILED"
+                session.add(ProfileRow(request_id=request_id, **profile_dict))
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "PROFILED",
+                    {
+                        **profile_dict,
+                        "cross_check_required": required,
+                        "max_primary_attempts": self.settings.max_attempts,
+                        "max_verification_attempts": self.settings.max_verification_attempts,
+                    },
+                )
+        await asyncio.to_thread(_mark_profiled)
         reason = "NO_ELIGIBLE_FREE_MODELS"
         if shadow_of is None:
-            cached = self.cache.get(request, profile, request_id)
+            try:
+                cached = await self.cache.get(request, profile, request_id)
+            except SQLAlchemyError:
+                logger.warning("Cache lookup failed for request %s", request_id, exc_info=True)
+                cached = None
             if cached is not None:
                 return cached
         accepted_response = accepted_quality = None
@@ -566,13 +649,17 @@ class Router:
             if self.stopped:
                 reason = "SYSTEM_STOPPED"
                 break
-            candidates = self.selector.candidates(
+            candidates = await self.selector.candidates(
                 request,
                 profile,
                 tried,
                 benchmark_checks,
                 **(
-                    {"eligible": lambda spec, model: self._shadow_candidate(shadow_of, spec, model)}
+                    {
+                        "eligible": lambda spec, model: self._shadow_candidate(
+                            shadow_of, spec, model
+                        )
+                    }
                     if shadow_of is not None
                     else {}
                 ),
@@ -645,8 +732,6 @@ class Router:
         if validator_failed:
             reason = "VALIDATION_SERVICE_FAILED"
         if self.settings.benchmark_policy is not None:
-            # Recheck every locally accepted role before releasing the primary answer.
-            # An expired checker qualification cannot be rescued by the producer's rating.
             for attempt in attempts:
                 if attempt.disposition == "ACCEPTED":
                     spec = self.registry.providers[attempt.provider_id]
@@ -711,97 +796,105 @@ class Router:
             benchmark_checks=list(benchmark_checks.values()),
             model_disagreement=disagreement,
         )
-        with self.sessions.begin() as session:
-            row = session.get(TaskRequest, request_id)
-            row.status, row.result_json = result.status, result.model_dump(mode="json")
-            if shadow_of is not None:
-                agreement, basis = (
-                    compare(
-                        request,
-                        NormalizedModelResponse(
-                            provider_id=shadow_of.provider_id,
-                            model_id=shadow_of.model_id,
-                            text=shadow_of.output,
-                        ),
-                        accepted_response,
-                        True,
+
+        def _persist_result():
+            with self.sessions.begin() as session:
+                result_dict = result.model_dump(mode="json")
+                row = session.get(TaskRequest, request_id)
+                row.status, row.result_json = result.status, result_dict
+                if shadow_of is not None:
+                    agreement, basis = (
+                        compare(
+                            request,
+                            NormalizedModelResponse(
+                                provider_id=shadow_of.provider_id,
+                                model_id=shadow_of.model_id,
+                                text=shadow_of.output,
+                            ),
+                            accepted_response,
+                            True,
+                        )
+                        if accepted_response
+                        else (None, "NOT_ASSESSED")
                     )
-                    if accepted_response
-                    else (None, "NOT_ASSESSED")
-                )
-                self.audit(
-                    session,
-                    request_id,
-                    request.client_id,
-                    "SHADOW_COMPARISON",
-                    {
-                        "parent_request_id": shadow_of.request_id,
-                        "agreement": agreement,
-                        "basis": basis,
-                        "output_withheld": True,
-                    },
-                )
-                self.audit(
-                    session,
-                    shadow_of.request_id,
-                    request.client_id,
-                    "SHADOW_COMPLETED",
-                    {
-                        "shadow_request_id": request_id,
-                        "status": result.status,
-                        "agreement": agreement,
-                        "basis": basis,
-                        "output_withheld": True,
-                    },
-                )
-            if benchmark_checks:
-                self.audit(
-                    session,
-                    request_id,
-                    request.client_id,
-                    "BENCHMARK_QUALIFICATION_CHECKED",
-                    {
-                        "checks": [
-                            check.model_dump(mode="json") for check in benchmark_checks.values()
-                        ]
-                    },
-                )
-            if source_report.state != "NOT_REQUESTED":
-                self.audit(
-                    session,
-                    request_id,
-                    request.client_id,
-                    "SOURCE_POLICY_CHECKED",
-                    source_report.model_dump(mode="json"),
-                )
-            if result.status == "ESCALATION_REQUIRED":
-                session.add(
-                    EscalationRecord(
-                        request_id=request_id,
-                        reason_code=reason,
-                        detail_json=result.model_dump(mode="json"),
+                    self.audit(
+                        session,
+                        request_id,
+                        request.client_id,
+                        "SHADOW_COMPARISON",
+                        {
+                            "parent_request_id": shadow_of.request_id,
+                            "agreement": agreement,
+                            "basis": basis,
+                            "output_withheld": True,
+                        },
                     )
+                    self.audit(
+                        session,
+                        shadow_of.request_id,
+                        request.client_id,
+                        "SHADOW_COMPLETED",
+                        {
+                            "shadow_request_id": request_id,
+                            "status": result.status,
+                            "agreement": agreement,
+                            "basis": basis,
+                            "output_withheld": True,
+                        },
+                    )
+                if benchmark_checks:
+                    self.audit(
+                        session,
+                        request_id,
+                        request.client_id,
+                        "BENCHMARK_QUALIFICATION_CHECKED",
+                        {
+                            "checks": [
+                                check.model_dump(mode="json")
+                                for check in benchmark_checks.values()
+                            ]
+                        },
+                    )
+                if source_report.state != "NOT_REQUESTED":
+                    self.audit(
+                        session,
+                        request_id,
+                        request.client_id,
+                        "SOURCE_POLICY_CHECKED",
+                        source_report.model_dump(mode="json"),
+                    )
+                if result.status == "ESCALATION_REQUIRED":
+                    session.add(
+                        EscalationRecord(
+                            request_id=request_id,
+                            reason_code=reason,
+                            detail_json=result_dict,
+                        )
+                    )
+                self.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    result.status,
+                    {
+                        "reason_code": reason,
+                        "attempts_count": len(attempts),
+                        "paid_inference_executed": False,
+                    },
                 )
-            self.audit(
-                session,
-                request_id,
-                request.client_id,
-                result.status,
-                {
-                    "reason_code": reason,
-                    "attempts_count": len(attempts),
-                    "paid_inference_executed": False,
-                },
-            )
+        await asyncio.to_thread(_persist_result)
         if shadow_of is None:
             try:
-                self.cache.put(request, profile, result)
+                await self.cache.put(request, profile, result)
             except SQLAlchemyError:
-                # Acceptance is already durable. An optional cache-write outage must not
-                # rewrite that terminal request as FAILED with an ACCEPTED result attached.
+                logger.warning("Cache write failed for request %s", request_id, exc_info=True)
                 try:
-                    with self.sessions.begin() as session:
-                        self.audit(session, request_id, request.client_id, "CACHE_WRITE_FAILED", {})
+                    def _audit_cache_fail():
+                        with self.sessions.begin() as session:
+                            self.audit(
+                                session, request_id, request.client_id, "CACHE_WRITE_FAILED", {}
+                            )
+                    await asyncio.to_thread(_audit_cache_fail)
                 except SQLAlchemyError:
-                    pass
+                    logger.warning("Failed to audit cache write failure for request %s", request_id)
         return result

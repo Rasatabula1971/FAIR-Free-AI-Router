@@ -1,5 +1,7 @@
 """Guard a trusted provider adapter against accidental credential reflection."""
 
+import logging
+
 from pydantic import BaseModel
 
 from fair.providers.base import (
@@ -9,6 +11,8 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CredentialedAdapter:
@@ -24,6 +28,7 @@ class CredentialedAdapter:
             value = value.model_dump(mode="json")
         if isinstance(value, str):
             if self._credential.get_secret_value() in value:
+                logger.error("Credential exposure blocked for provider %s", self.provider_id)
                 raise AuthenticationFailed("CREDENTIAL_EXPOSURE_BLOCKED")
         elif isinstance(value, dict):
             for key, item in value.items():
@@ -38,14 +43,19 @@ class CredentialedAdapter:
         try:
             result = await method(*args)
         except BillingViolation:
+            logger.error("Billing violation from provider %s", self.provider_id)
             raise BillingViolation("PROVIDER_REPORTED_NONZERO_OR_INVALID_COST") from None
         except AuthenticationFailed:
+            logger.error("Authentication failed for provider %s", self.provider_id)
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
         except QuotaExceeded as error:
+            logger.info("Quota exceeded for provider %s", self.provider_id)
             raise QuotaExceeded("QUOTA_EXHAUSTED", reset_at=error.reset_at) from None
         except RateLimited as error:
+            logger.info("Rate limited by provider %s", self.provider_id)
             raise RateLimited("RATE_LIMITED", retry_after=error.retry_after) from None
         except Exception:
+            logger.warning("Provider %s unavailable", self.provider_id)
             raise ProviderUnavailable("PROVIDER_UNAVAILABLE") from None
         self._check(result)
         return result
@@ -59,6 +69,10 @@ class CredentialedAdapter:
                 self._adapter.check_admission()
         except Exception:
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
+
+    async def close(self):
+        if hasattr(self._adapter, "close"):
+            await self._adapter.close()
 
     async def health(self):
         return await self._call(self._adapter.health)

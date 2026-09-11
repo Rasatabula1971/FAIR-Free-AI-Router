@@ -57,7 +57,7 @@ async def test_hit_revalidates_with_new_lineage_and_no_quota_or_samples(make_rou
         second.request_id != first.request_id and second.cached_from_request_id == first.request_id
     )
     assert second.attempts == [] and second.verification_state == "DETERMINISTIC_ARITHMETIC"
-    assert mock.calls == router.quota.state("a").used == 1
+    assert mock.calls == (await router.quota.state("a")).used == 1
     with router.sessions() as session:
         assert session.scalar(select(func.count()).select_from(RoutingAttempt)) == 1
         assert session.scalar(select(ModelTaskPerformance)).quality_samples == 1
@@ -80,7 +80,7 @@ async def test_clients_never_share_entries(make_router, privacy):
     again = await router.solve(request(privacy_class=privacy))
     assert not bob.cache_hit and again.cached_from_request_id == first.request_id
     assert mock.calls == 2
-    router.cache.clear("alice")
+    await router.cache.clear("alice")
     assert (await router.solve(request(client_id="bob", privacy_class=privacy))).cache_hit
     assert not (await router.solve(request(privacy_class=privacy))).cache_hit
 
@@ -194,7 +194,7 @@ async def test_stop_security_block_and_disabled_provider_cannot_release_cache(ma
     router.stopped = True
     assert (await router.solve(request())).reason_code == "SYSTEM_STOPPED"
     router.stopped = False
-    router.quota.block_security("a")
+    await router.quota.block_security("a")
     assert (await router.solve(request())).status != "ACCEPTED"
     router.registry.providers["a"].status = "DISABLED"
     assert (await router.solve(request())).status != "ACCEPTED"
@@ -204,9 +204,9 @@ async def test_stop_security_block_and_disabled_provider_cannot_release_cache(ma
 async def test_exhausted_quota_allows_validated_reuse(make_router):
     router, mock = build(make_router)
     await router.solve(request())
-    router.quota.exhaust("a")
+    await router.quota.exhaust("a")
     assert (await router.solve(request())).cache_hit
-    assert mock.calls == 1 and router.quota.state("a").exhausted
+    assert mock.calls == 1 and (await router.quota.state("a")).exhausted
 
 
 async def test_invalid_cached_output_is_revalidated_and_replaced(make_router):

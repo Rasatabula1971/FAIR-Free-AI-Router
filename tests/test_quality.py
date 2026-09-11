@@ -211,9 +211,9 @@ async def test_learning_changes_ranking_and_survives_router_restart(make_router)
     restarted = Router(router.registry, router.settings, router.thresholds, router.sessions)
     result = await restarted.solve(arithmetic())
     assert len(result.attempts) == 1 and result.provider_id == "b"
-    assert restarted.performance.scores("b", "model", "arithmetic")[0] > 0.5
-    assert restarted.performance.scores("a", "model", "arithmetic")[0] < 0.5
-    assert restarted.performance.scores("a", "model", "general")[0] == 0.5
+    assert (await restarted.performance.scores("b", "model", "arithmetic"))[0] > 0.5
+    assert (await restarted.performance.scores("a", "model", "arithmetic"))[0] < 0.5
+    assert (await restarted.performance.scores("a", "model", "general"))[0] == 0.5
 
 
 @pytest.mark.parametrize("error", [RateLimited(), ProviderUnavailable()])
@@ -221,10 +221,10 @@ async def test_infrastructure_does_not_reduce_measured_quality(make_router, erro
     adapter = MockAdapter("a", text="0.3")
     router = make_router([(provider(), adapter)])
     await router.solve(arithmetic())
-    before = router.performance.scores("a", "model", "arithmetic")[0]
+    before = (await router.performance.scores("a", "model", "arithmetic"))[0]
     adapter.error = error
     await router.solve(arithmetic())
-    assert router.performance.scores("a", "model", "arithmetic")[0] == before
+    assert (await router.performance.scores("a", "model", "arithmetic"))[0] == before
     with router.sessions() as session:
         row = session.get(ModelTaskPerformance, ("a", "model", "arithmetic"))
         assert row.quality_samples == 1 and row.quality_sum == 100

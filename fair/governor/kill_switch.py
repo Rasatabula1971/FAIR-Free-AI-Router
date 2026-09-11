@@ -1,6 +1,10 @@
+import logging
+
 from sqlalchemy import select
 
 from fair.schemas.db import AuditEvent, SystemState
+
+logger = logging.getLogger(__name__)
 
 
 class KillSwitch:
@@ -28,3 +32,4 @@ class KillSwitch:
                     payload_json={"stopped": stopped},
                 )
             )
+            logger.warning("System %s by %s", "stopped" if stopped else "resumed", actor_id)

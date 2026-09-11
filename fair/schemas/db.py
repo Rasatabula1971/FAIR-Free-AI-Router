@@ -14,7 +14,6 @@ from sqlalchemy import (
     event,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 
 def utcnow():
@@ -97,10 +96,10 @@ class TaskRequest(Base):
     parent_request_id: Mapped[str | None] = mapped_column(
         ForeignKey("task_requests.id"), nullable=True, unique=True, index=True
     )
-    status: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), index=True)
     profile_json: Mapped[dict] = mapped_column(JSON)
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class RoutingAttempt(Base):
@@ -197,9 +196,9 @@ class EscalationRecord(Base):
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    request_id: Mapped[str | None] = mapped_column(ForeignKey("task_requests.id"), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(ForeignKey("task_requests.id"), nullable=True, index=True)
     actor_id: Mapped[str] = mapped_column(String(128))
-    event_type: Mapped[str] = mapped_column(String(64))
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
     payload_json: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -215,7 +214,20 @@ def database(url):
     if url.startswith("sqlite"):
         kwargs = {"connect_args": {"check_same_thread": False}}
         if ":memory:" in url:
-            kwargs["poolclass"] = StaticPool
+            import sqlite3
+
+            from sqlalchemy.pool import QueuePool
+
+            name = uuid4().hex
+            kwargs["creator"] = lambda: sqlite3.connect(
+                f"file:{name}?mode=memory&cache=shared",
+                uri=True,
+                check_same_thread=False,
+            )
+            kwargs["poolclass"] = QueuePool
+            kwargs["pool_size"] = 1
+            kwargs["max_overflow"] = 0
+            url = "sqlite://"
     engine = create_engine(url, **kwargs)
     if url.startswith("sqlite"):
 

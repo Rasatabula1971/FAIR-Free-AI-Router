@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import Field, model_validator
 
+from fair.constants import SECONDS_IN_DAY
 from fair.governor.policy import admit_provider
 from fair.providers.base import (
     AuthenticationFailed,
@@ -62,7 +63,7 @@ def retry_seconds(value, now):
             seconds = parsedate_to_datetime(value).timestamp() - now
         except (ValueError, TypeError, OverflowError):
             return None
-    return seconds if 0 < seconds <= 86400 else None
+    return seconds if 0 < seconds <= SECONDS_IN_DAY else None
 
 
 def duration(value):
@@ -72,7 +73,7 @@ def duration(value):
         float(number) * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[unit]
         for number, unit in re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", value)
     )
-    return seconds if 0 < seconds <= 86400 else None
+    return seconds if 0 < seconds <= SECONDS_IN_DAY else None
 
 
 def zero(value):
@@ -93,10 +94,17 @@ class TextAdapter:
     expected_access = ""
     catalog_path = "/models"
 
+    _catalog_ttl = 60
+
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
-        self._credential, self._transport, self.clock = credential, transport, clock
+        self._credential, self.clock = credential, clock
         self._quota = QuotaSnapshot(provider_id=self.provider_id)
+        self._model_cache = None
+        self._model_cache_at = 0.0
+        self._client = httpx.AsyncClient(
+            timeout=30, trust_env=False, follow_redirects=False, transport=transport
+        )
         self._admit()
 
     def _admit(self):
@@ -122,7 +130,7 @@ class TextAdapter:
             if reviewed is None or reviewed.tzinfo is None:
                 raise AuthenticationFailed("CURRENT_TERMS_REVIEW_REQUIRED")
             age = self.clock() - reviewed.timestamp()
-            if not 0 <= age <= self.settings.review_max_age_days * 86400:
+            if not 0 <= age <= self.settings.review_max_age_days * SECONDS_IN_DAY:
                 raise AuthenticationFailed("CURRENT_TERMS_REVIEW_REQUIRED")
             if self.spec.max_data_class != "PUBLIC":
                 raise AuthenticationFailed("REMOTE_ADAPTER_PUBLIC_ONLY")
@@ -145,6 +153,9 @@ class TextAdapter:
     def check_admission(self):
         """Recheck local policy without consuming provider quota."""
         self._admit()
+
+    async def close(self):
+        await self._client.aclose()
 
     def _observe(self, headers):
         return QuotaSnapshot(provider_id=self.provider_id)
@@ -171,35 +182,32 @@ class TextAdapter:
         if self._credential is not None:
             headers["Authorization"] = "Bearer " + self._credential.get_secret_value()
         try:
-            async with httpx.AsyncClient(
-                timeout=30, trust_env=False, follow_redirects=False, transport=self._transport
-            ) as client:
-                async with client.stream(
-                    method, self.base_url + path, headers=headers, json=payload
-                ) as response:
-                    self._error(response.status_code, response.headers)
-                    if response.headers.get("content-encoding", "identity") != "identity":
-                        raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
-                    chunks, size = [], 0
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        if size > 4_000_000:
-                            raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
-                        chunks.append(chunk)
-                    value = strict_json(b"".join(chunks).decode("utf-8"))
-                    if not isinstance(value, dict):
-                        raise ValueError()
-                    if "error" in value:
-                        error = value["error"]
-                        self._error(
-                            error.get("code", 500)
-                            if isinstance(error, dict) and type(error.get("code")) is int
-                            else 500,
-                            response.headers,
-                        )
-                        raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
-                    self._quota = self._observe(response.headers)
-                    return value
+            async with self._client.stream(
+                method, self.base_url + path, headers=headers, json=payload
+            ) as response:
+                self._error(response.status_code, response.headers)
+                if response.headers.get("content-encoding", "identity") != "identity":
+                    raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
+                chunks, size = [], 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > 4_000_000:
+                        raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
+                    chunks.append(chunk)
+                value = strict_json(b"".join(chunks).decode("utf-8"))
+                if not isinstance(value, dict):
+                    raise ValueError()
+                if "error" in value:
+                    error = value["error"]
+                    self._error(
+                        error.get("code", 500)
+                        if isinstance(error, dict) and type(error.get("code")) is int
+                        else 500,
+                        response.headers,
+                    )
+                    raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
+                self._quota = self._observe(response.headers)
+                return value
         except httpx.HTTPError:
             raise ProviderUnavailable("PROVIDER_TRANSPORT_FAILED") from None
         except (ValueError, UnicodeError, RecursionError):
@@ -217,6 +225,15 @@ class TextAdapter:
         return self._quota.model_copy(deep=True)
 
     async def list_models(self):
+        now = self.clock()
+        if self._model_cache is not None and now - self._model_cache_at < self._catalog_ttl:
+            return [m.model_copy(deep=True) for m in self._model_cache]
+        result = await self._fetch_models()
+        self._model_cache = result
+        self._model_cache_at = now
+        return result
+
+    async def _fetch_models(self):
         data = await self._json("GET", self.catalog_path)
         entries = data.get("data")
         if not isinstance(entries, list) or len(entries) > 4096:
@@ -365,7 +382,7 @@ class OllamaLocalAdapter(TextAdapter):
         self.base_url = settings.ollama_url.rstrip("/")
         super().__init__(spec, settings, **kwargs)
 
-    async def list_models(self):
+    async def _fetch_models(self):
         data = await self._json("GET", "/api/tags")
         entries = data.get("models")
         if not isinstance(entries, list) or len(entries) > 4096:

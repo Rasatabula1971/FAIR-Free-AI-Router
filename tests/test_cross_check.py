@@ -264,7 +264,7 @@ async def test_verifier_must_pass_all_routing_gates(make_router, blocked):
     elif blocked == "terms":
         verifier.status = "TERMS_REVIEW"
     elif blocked == "quota":
-        router.quota.exhaust("b")
+        await router.quota.exhaust("b")
     elif blocked == "privacy":
         verifier.max_data_class = "PUBLIC"
         changes["privacy_class"] = "CONFIDENTIAL"

@@ -68,7 +68,7 @@ async def test_reservation_survives_restart_and_config_reconcile(restartable):
     first = restartable(provider(request_limit=1))
     await first.solve(request())
     second = restartable(provider(request_limit=1))
-    assert second.quota.remaining(second.registry.providers["a"]) == 0
+    assert await second.quota.remaining(second.registry.providers["a"]) == 0
     assert not (await second.solve(request())).attempts
 
 
@@ -82,7 +82,7 @@ async def test_reservation_survives_restart_and_config_reconcile(restartable):
 async def test_failure_blocks_survive_restart(restartable, error, status):
     await restartable(adapter=MockAdapter("a", error=error)).solve(request())
     second = restartable()
-    assert second.quota.effective_status(second.registry.providers["a"]) == status
+    assert await second.quota.effective_status(second.registry.providers["a"]) == status
     assert not (await second.solve(request())).attempts
     with second.sessions() as session:
         assert session.scalar(select(ProviderHealthEvent.event_type)) in {
@@ -94,55 +94,55 @@ async def test_failure_blocks_survive_restart(restartable, error, status):
             assert "secret-sentinel" not in str(session.execute(table.select()).all())
 
 
-def test_throttle_uses_durable_wall_clock(restartable):
+async def test_throttle_uses_durable_wall_clock(restartable):
     first = restartable()
     first.quota.clock = lambda: 100
-    first.quota.throttle("a")
+    await first.quota.throttle("a")
     second = restartable()
     second.quota.clock = lambda: 120
-    assert not second.quota.available(second.registry.providers["a"])
+    assert not await second.quota.available(second.registry.providers["a"])
     second.quota.clock = lambda: 161
-    assert second.quota.available(second.registry.providers["a"])
+    assert await second.quota.available(second.registry.providers["a"])
 
 
-def test_circuit_failure_window_survives_restart_and_single_probe(restartable):
+async def test_circuit_failure_window_survives_restart_and_single_probe(restartable):
     first = restartable()
     first.quota.clock = lambda: 100
-    first.quota.failure("a")
-    first.quota.failure("a")
+    await first.quota.failure("a")
+    await first.quota.failure("a")
     second = restartable()
     second.quota.clock = lambda: 101
-    second.quota.failure("a")
+    await second.quota.failure("a")
     spec = second.registry.providers["a"]
-    assert second.quota.state("a").circuit_state == "OPEN"
-    assert not second.quota.reserve(spec)
+    assert (await second.quota.state("a")).circuit_state == "OPEN"
+    assert not await second.quota.reserve(spec)
     second.quota.clock = lambda: 162
-    assert second.quota.reserve(spec)
-    assert second.quota.state("a").circuit_state == "HALF_OPEN"
+    assert await second.quota.reserve(spec)
+    assert (await second.quota.state("a")).circuit_state == "HALF_OPEN"
     competitor = QuotaGovernor(second.settings, second.sessions, clock=lambda: 162)
-    assert not competitor.reserve(spec)
-    second.quota.success("a")
-    assert competitor.state("a").circuit_state == "CLOSED"
+    assert not await competitor.reserve(spec)
+    await second.quota.success("a")
+    assert (await competitor.state("a")).circuit_state == "CLOSED"
     with second.sessions() as session:
         assert "PROBE_STARTED" in list(session.scalars(select(ProviderHealthEvent.event_type)))
 
 
-def test_failed_or_abandoned_probe_reopens(restartable):
+async def test_failed_or_abandoned_probe_reopens(restartable):
     router = restartable()
     router.quota.clock = lambda: 100
     for _ in range(3):
-        router.quota.failure("a")
+        await router.quota.failure("a")
     router.quota.clock = lambda: 161
-    assert router.quota.reserve(router.registry.providers["a"])
-    router.quota.failure("a")
-    assert router.quota.state("a").circuit_state == "OPEN"
+    assert await router.quota.reserve(router.registry.providers["a"])
+    await router.quota.failure("a")
+    assert (await router.quota.state("a")).circuit_state == "OPEN"
     router.quota.clock = lambda: 222
-    assert router.quota.reserve(router.registry.providers["a"])
+    assert await router.quota.reserve(router.registry.providers["a"])
     restarted = restartable()
     restarted.quota.clock = lambda: 250
-    assert not restarted.quota.available(restarted.registry.providers["a"])
-    assert restarted.quota.state("a").circuit_state == "OPEN"
-    assert restarted.quota.state("a").blocked_until == 310
+    assert not await restarted.quota.available(restarted.registry.providers["a"])
+    assert (await restarted.quota.state("a")).circuit_state == "OPEN"
+    assert (await restarted.quota.state("a")).blocked_until == 310
 
 
 async def test_observed_quota_reset_survives_restart(restartable):
@@ -151,22 +151,22 @@ async def test_observed_quota_reset_survives_restart(restartable):
     await first.solve(request())
     second = restartable()
     second.quota.clock = lambda: 199
-    assert not second.quota.available(second.registry.providers["a"])
+    assert not await second.quota.available(second.registry.providers["a"])
     second.quota.clock = lambda: 200
-    assert second.quota.available(second.registry.providers["a"])
-    assert second.quota.state("a").used == 0
+    assert await second.quota.available(second.registry.providers["a"])
+    assert (await second.quota.state("a")).used == 0
     with second.sessions() as session:
         assert "QUOTA_RESET" in list(session.scalars(select(ProviderHealthEvent.event_type)))
 
 
 @pytest.mark.parametrize("reset", [None, 50, float("nan"), float("inf")])
-def test_unknown_or_invalid_reset_stays_exhausted(restartable, reset):
+async def test_unknown_or_invalid_reset_stays_exhausted(restartable, reset):
     first = restartable()
     first.quota.clock = lambda: 100
-    first.quota.exhaust("a", reset_at=reset)
+    await first.quota.exhaust("a", reset_at=reset)
     second = restartable()
     second.quota.clock = lambda: 1_000_000
-    assert not second.quota.available(second.registry.providers["a"])
+    assert not await second.quota.available(second.registry.providers["a"])
 
 
 async def test_relational_registry_and_profile_written(restartable):
@@ -188,9 +188,9 @@ def test_removed_provider_disabled_without_deleting_history(restartable):
         assert session.get(ProviderQuotaState, "a") is not None
 
 
-def test_health_endpoint_reports_durable_observations(make_router):
+async def test_health_endpoint_reports_durable_observations(make_router):
     router = make_router()
-    router.quota.exhaust("a")
+    await router.quota.exhaust("a")
     with TestClient(create_app(router, {"alice": "key"}, "admin")) as client:
         assert client.get("/v1/providers/a/health").status_code == 401
         response = client.get("/v1/providers/a/health", headers={"X-API-Key": "key"})

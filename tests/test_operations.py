@@ -104,8 +104,8 @@ async def test_snapshot_counts_owned_work_without_reading_payloads(make_router):
     )
     await router.solve(req)
     await router.solve(req)
-    router.quota.block_security("a")
-    router.quota.exhaust("a")
+    await router.quota.block_security("a")
+    await router.quota.exhaust("a")
     result = snapshot(router, credentials())
     assert result["requests_last_24h"]["ACCEPTED"] == 2
     assert result["cache_hits_last_24h"] == result["active_cache_entries"] == 1
@@ -178,7 +178,7 @@ def test_preflight_database_check_does_not_migrate(preflight_config, monkeypatch
     assert check(preflight_config, check_database=True)["status"] == "FAIL"
     with engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
-        connection.execute(text("UPDATE alembic_version SET version_num='0008'"))
+        connection.execute(text("UPDATE alembic_version SET version_num='0009'"))
     assert check(preflight_config, check_database=True)["status"] == "PASS"
     engine.dispose()
 

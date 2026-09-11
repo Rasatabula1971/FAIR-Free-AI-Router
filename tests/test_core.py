@@ -51,7 +51,11 @@ async def test_execution_boundary_rechecks_faulty_selector(make_router):
     router = make_router()
     spec = router.registry.providers["a"]
     spec.current_access_cost_usd = 1
-    router.selector.candidates = lambda *args: [(1, spec, spec.models[0])]
+
+    async def fake_candidates(*args, **kwargs):
+        return [(1, spec, spec.models[0])]
+
+    router.selector.candidates = fake_candidates
     with pytest.raises(AdmissionDenied):
         await router.solve(req())
     assert router.registry.adapters["a"].calls == 0
@@ -86,7 +90,7 @@ async def test_capability_context_privacy_filter(make_router, task_request):
     assert not (await router.solve(task_request)).attempts
 
 
-def test_task_specific_quality_wins(make_router):
+async def test_task_specific_quality_wins(make_router):
     router = make_router([(provider(n), MockAdapter(n)) for n in ("a", "b")])
     with router.sessions.begin() as session:
         session.add(
@@ -99,10 +103,10 @@ def test_task_specific_quality_wins(make_router):
             )
         )
     profile = profile_task(req(), router.thresholds)
-    assert router.selector.candidates(req(), profile, set())[0][1].provider_id == "b"
+    assert (await router.selector.candidates(req(), profile, set()))[0][1].provider_id == "b"
 
 
-def test_quota_scarcity_preserves_near_equal_model(make_router):
+async def test_quota_scarcity_preserves_near_equal_model(make_router):
     router = make_router([(provider(n, request_limit=100), MockAdapter(n)) for n in ("a", "b")])
     with router.sessions.begin() as session:
         for name, total in (("a", 850), ("b", 830)):
@@ -116,9 +120,9 @@ def test_quota_scarcity_preserves_near_equal_model(make_router):
                 )
             )
     for _ in range(95):
-        router.quota.reserve(router.registry.providers["a"])
+        await router.quota.reserve(router.registry.providers["a"])
     assert (
-        router.selector.candidates(req(), profile_task(req(), router.thresholds), set())[0][
+        (await router.selector.candidates(req(), profile_task(req(), router.thresholds), set()))[0][
             1
         ].provider_id
         == "b"
@@ -142,9 +146,9 @@ async def test_failover_and_no_error_or_raw_text_leak(make_router, error, dispos
     assert result.attempts[0].disposition == disposition
     assert first.calls == second.calls == 1
     assert "secret-key-canary" not in result.model_dump_json()
-    assert router.performance.scores("a", "model", "general")[0] == 0.5
+    assert (await router.performance.scores("a", "model", "general"))[0] == 0.5
     if isinstance(error, QuotaExceeded):
-        assert router.quota.effective_status(router.registry.providers["a"]) == "QUOTA_EXHAUSTED"
+        assert await router.quota.effective_status(router.registry.providers["a"]) == "QUOTA_EXHAUSTED"
     with router.sessions() as session:
         assert len(list(session.scalars(select(RoutingAttempt)))) == 2
 
@@ -171,17 +175,17 @@ async def test_all_unavailable_escalates(make_router):
     assert (await router.solve(req())).reason_code == "NO_ELIGIBLE_FREE_MODELS"
 
 
-def test_circuit_breaker_cooldown(make_router):
+async def test_circuit_breaker_cooldown(make_router):
     router = make_router()
     clock = [100.0]
     router.quota.clock = lambda: clock[0]
     for _ in range(3):
-        router.quota.failure("a")
-    assert not router.quota.available(router.registry.providers["a"])
+        await router.quota.failure("a")
+    assert not await router.quota.available(router.registry.providers["a"])
     clock[0] += 61
-    assert router.quota.available(router.registry.providers["a"])
-    router.quota.success("a")
-    assert not router.quota.state("a").failures
+    assert await router.quota.available(router.registry.providers["a"])
+    await router.quota.success("a")
+    assert not (await router.quota.state("a")).failures
 
 
 async def test_quota_reservations_are_conservative(make_router):
