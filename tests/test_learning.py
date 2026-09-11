@@ -53,7 +53,7 @@ async def test_feedback_is_idempotent_private_and_only_changes_own_preferences(m
     router = make_router([(provider(), MockAdapter("a", text="4"))])
     result = await router.solve(request())
     registry = FeedbackRegistry(router.sessions)
-    before = router.performance.scores("a", "model", "arithmetic", client_id="alice")
+    before = await router.performance.scores("a", "model", "arithmetic", client_id="alice")
     feedback = FeedbackRequest(
         request_id=result.request_id,
         accepted=False,
@@ -62,9 +62,9 @@ async def test_feedback_is_idempotent_private_and_only_changes_own_preferences(m
     )
     report = registry.submit("alice", feedback)
     assert registry.submit("alice", feedback) == report
-    assert router.performance.scores("a", "model", "arithmetic", client_id="alice")[0] < before[0]
-    assert router.performance.scores("a", "model", "arithmetic", client_id="bob") == before
-    assert router.performance.scores("a", "model", "arithmetic", client_id="alice")[1] == before[1]
+    assert (await router.performance.scores("a", "model", "arithmetic", client_id="alice"))[0] < before[0]
+    assert await router.performance.scores("a", "model", "arithmetic", client_id="bob") == before
+    assert (await router.performance.scores("a", "model", "arithmetic", client_id="alice"))[1] == before[1]
     with pytest.raises(FeedbackDenied, match="ALREADY_RECORDED"):
         registry.submit("alice", FeedbackRequest(request_id=result.request_id, accepted=True))
     with pytest.raises(FeedbackDenied, match="NOT_FOUND"):
@@ -85,17 +85,17 @@ async def test_positive_feedback_is_bounded_by_benchmark_and_expires(make_router
     router = make_router([(provider(), MockAdapter("a", text="4"))])
     result = await router.solve(request())
     registry = FeedbackRegistry(router.sessions)
-    before = router.performance.scores("a", "model", "arithmetic")[0]
+    before = (await router.performance.scores("a", "model", "arithmetic"))[0]
     registry.submit("alice", FeedbackRequest(request_id=result.request_id, rating=5))
-    assert router.performance.scores("a", "model", "arithmetic", client_id="alice")[0] > before
+    assert (await router.performance.scores("a", "model", "arithmetic", client_id="alice"))[0] > before
     assert (
-        router.performance.scores("a", "model", "arithmetic", client_id="alice", quality_prior=0.8)[
+        (await router.performance.scores("a", "model", "arithmetic", client_id="alice", quality_prior=0.8))[
             0
         ]
         <= 0.8
     )
     router.performance.clock = lambda: datetime.now(UTC) + timedelta(days=31)
-    assert router.performance.scores("a", "model", "arithmetic", client_id="alice")[0] == before
+    assert (await router.performance.scores("a", "model", "arithmetic", client_id="alice"))[0] == before
 
 
 async def test_feedback_failure_rolls_back_and_cannot_label_unverified(make_router):
@@ -158,23 +158,23 @@ def test_invalid_feedback(values):
         FeedbackRequest(request_id="id", **values)
 
 
-def test_rolling_drift_changes_rank_with_separate_baseline(make_router):
+async def test_rolling_drift_changes_rank_with_separate_baseline(make_router):
     router = make_router()
     record(router, [100] * 40)
-    before = router.performance.scores("a", "model", "arithmetic")[0]
+    before = (await router.performance.scores("a", "model", "arithmetic"))[0]
     assert describe(router)["drift_state"] == "STABLE"
     record(router, [20] * 20, "QUALITY_FAILURE")
     report = describe(router)
     assert report["baseline_quality_samples"] == 40
     assert report["baseline_average_quality"] == 100 and report["recent_average_quality"] == 20
     assert report["benchmark_review_required"] and report["drift_state"] == "DEGRADED"
-    quality = router.performance.scores("a", "model", "arithmetic")[0]
+    quality = (await router.performance.scores("a", "model", "arithmetic"))[0]
     assert quality < before and quality < (44 + 2.5) / 65
     record(router, [100] * 20)
     assert describe(router)["drift_state"] == "STABLE"
 
 
-def test_confidence_grows_decays_and_infra_does_not_refresh_quality(make_router):
+async def test_confidence_grows_decays_and_infra_does_not_refresh_quality(make_router):
     router = make_router()
     now = datetime(2026, 1, 1, tzinfo=UTC)
     router.performance.clock = lambda: now
@@ -184,17 +184,17 @@ def test_confidence_grows_decays_and_infra_does_not_refresh_quality(make_router)
     record(router, [100] * 9)
     strong = describe(router)["observation_confidence"]
     assert strong > sparse["observation_confidence"]
-    before = router.performance.scores("a", "model", "arithmetic")[0]
+    before = (await router.performance.scores("a", "model", "arithmetic"))[0]
     now += timedelta(days=30)
     record(router, [None] * 21, "INFRA_FAILURE")
     report = describe(router)
     assert report["observation_confidence"] == pytest.approx(strong / 2)
     assert report["recent_attempts"] == report["recent_infra_failures"] == 20
     assert report["recent_quality_samples"] == 10
-    assert router.performance.scores("a", "model", "arithmetic")[0] == before
+    assert (await router.performance.scores("a", "model", "arithmetic"))[0] == before
     record(router, [None] * 21, "QUOTA_FAILURE")
     assert describe(router)["recent_quota_failures"] == 20
-    assert router.performance.scores("a", "model", "arithmetic")[0] == before
+    assert (await router.performance.scores("a", "model", "arithmetic"))[0] == before
 
 
 def test_unknown_legacy_freshness_has_no_invented_confidence(make_router):
@@ -285,7 +285,7 @@ async def test_shadow_is_opt_in_and_preserves_governance(make_router, mode):
         candidate.request_limit = None
     if mode == "low_quota":
         candidate.request_limit = 1
-        router.quota.reserve(candidate)
+        await router.quota.reserve(candidate)
     if mode == "same_model":
         candidate.models[0].independence_group = "model"
     if mode == "paid":
@@ -313,7 +313,7 @@ async def test_feedback_changes_selector_only_for_owner(make_router):
     )
     for client, expected in [("alice", "b"), ("bob", "a")]:
         value = request(client)
-        candidates = router.selector.candidates(
+        candidates = await router.selector.candidates(
             value, profile_task(value, router.thresholds), set()
         )
         assert candidates[0][1].provider_id == expected
@@ -365,7 +365,7 @@ async def test_shadow_rechecks_quota_after_waiting_behind_user_work(make_router)
     assert router.registry.adapters["b"].calls == 0
     candidate = router.registry.providers["b"]
     candidate.request_limit = 1
-    router.quota.reserve(candidate)
+    await router.quota.reserve(candidate)
     release.set()
     await user
     await drain(router)

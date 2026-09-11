@@ -208,16 +208,16 @@ def create_app(router=None, client_keys=None, admin_key=None):
                     continue
 
     @app.get("/v1/providers")
-    def providers(identity=Depends(client)):
-        return [
-            {
+    async def providers(identity=Depends(client)):
+        results = []
+        for p in app.state.router.registry.providers.values():
+            results.append({
                 "provider_id": p.provider_id,
-                "status": app.state.router.quota.effective_status(p),
+                "status": await app.state.router.quota.effective_status(p),
                 "access_class": p.access_class,
                 "models": [m.model_id for m in p.models],
-            }
-            for p in app.state.router.registry.providers.values()
-        ]
+            })
+        return results
 
     def owned(session, request_id, identity):
         row = session.get(TaskRow, request_id)
@@ -271,7 +271,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
 
     @app.delete("/v1/cache")
     async def clear_cache(identity=Depends(client)):
-        return app.state.router.cache.clear(identity)
+        return await app.state.router.cache.clear(identity)
 
     @app.get("/v1/requests/{request_id}/feedback")
     def request_feedback(request_id: str, identity=Depends(client)):
@@ -313,15 +313,15 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return Recovery(app.state.router).requests(request)
 
     @app.get("/v1/providers/{provider_id}/health")
-    def provider_health(provider_id: str, identity=Depends(client)):
+    async def provider_health(provider_id: str, identity=Depends(client)):
         active = app.state.router
         spec = active.registry.providers.get(provider_id)
         if spec is None:
             raise HTTPException(404, "Provider not found")
-        state = active.quota.state(provider_id)
+        state = await active.quota.state(provider_id)
         return {
             "provider_id": provider_id,
-            "status": active.quota.effective_status(spec),
+            "status": await active.quota.effective_status(spec),
             "circuit_state": state.circuit_state,
             "requests_used": state.used,
             "request_limit": spec.request_limit,

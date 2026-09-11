@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 from datetime import datetime
@@ -47,7 +48,6 @@ class ExactCache:
             or router.settings.benchmark_policy is not None
         ):
             return None
-        # Preserve task whitespace and JSON array order: approximate equivalence is unsafe.
         payload = {
             "cache_version": 1,
             "engine": ENGINE_VERSION,
@@ -65,111 +65,117 @@ class ExactCache:
         )
         return hashlib.sha256(encoded.encode()).hexdigest()
 
-    def get(self, request, profile, request_id):
+    async def get(self, request, profile, request_id):
         key = self.key(request, profile)
         router, now = self.router, self.clock()
         if key is None or router.stopped:
             return None
-        with router.sessions.begin() as session:
-            entry = session.get(CacheEntry, (request.client_id, key))
-            if entry is None:
-                return None
-            ttl = min(
-                request.cache_ttl_seconds or router.settings.cache_ttl_seconds,
-                router.settings.cache_ttl_seconds,
-            )
-            if request.cache_mode == "refresh" or not entry.created_at <= now < min(
-                entry.expires_at, entry.created_at + ttl
-            ):
-                session.delete(entry)
-                return None
-            source = session.get(TaskRequest, entry.source_request_id)
-            feedback = session.scalar(
-                select(FeedbackEvent).where(FeedbackEvent.request_id == entry.source_request_id)
-            )
-            if (
-                source is None
-                or source.client_id != request.client_id
-                or source.status != "ACCEPTED"
-                or source.execution_kind != "PRIMARY"
-                or not source.result_json
-                or feedback is not None
-                and (feedback.score < 50 or feedback.correction_hash is not None)
-            ):
-                session.delete(entry)
-                return None
-            try:
-                original = SolveResponse.model_validate(source.result_json)
-                spec = router.registry.providers[original.provider_id]
-                admit_provider(spec)
-                adapter = router.registry.adapters.get(spec.provider_id)
-                if adapter is None:
+
+        def _do():
+            with router.sessions.begin() as session:
+                entry = session.get(CacheEntry, (request.client_id, key))
+                if entry is None:
                     return None
-                if hasattr(adapter, "check_admission"):
-                    adapter.check_admission()
-                if (
-                    original.status != "ACCEPTED"
-                    or original.cache_hit
-                    or original.output is None
-                    or original.quality is None
-                ):
-                    raise ValueError()
-                if session.get(ProviderQuotaState, spec.provider_id).security_blocked:
-                    return None
-                if not any(
-                    model.model_id == original.model_id and model.active for model in spec.models
-                ):
-                    return None
-                normalized = NormalizedModelResponse(
-                    provider_id=original.provider_id,
-                    model_id=original.model_id,
-                    text=original.output,
+                ttl = min(
+                    request.cache_ttl_seconds or router.settings.cache_ttl_seconds,
+                    router.settings.cache_ttl_seconds,
                 )
-                quality = evaluate(request, profile, normalized)
-                if not acceptable(quality, profile):
+                if request.cache_mode == "refresh" or not entry.created_at <= now < min(
+                    entry.expires_at, entry.created_at + ttl
+                ):
                     session.delete(entry)
                     return None
-            except (ValueError, KeyError, AdmissionDenied, AuthenticationFailed):
-                session.delete(entry)
-                return None
-            result = SolveResponse(
-                request_id=request_id,
-                status="ACCEPTED",
-                reason_code="EXACT_CACHE_HIT",
-                attempts=[],
-                minimum_required=profile.minimum_quality_score,
-                best_quality_score=quality.overall_score,
-                verification_state=quality.verification_state,
-                quality=quality,
-                output=original.output,
-                provider_id=original.provider_id,
-                model_id=original.model_id,
-                cache_hit=True,
-                cached_from_request_id=source.id,
-            )
-            row = session.get(TaskRequest, request_id)
-            row.status, row.result_json = result.status, result.model_dump(mode="json")
-            router.audit(
-                session,
-                request_id,
-                request.client_id,
-                "CACHE_HIT",
-                {"source_request_id": source.id, "revalidated": True},
-            )
-            router.audit(
-                session,
-                request_id,
-                request.client_id,
-                "ACCEPTED",
-                {
-                    "reason_code": result.reason_code,
-                    "attempts_count": 0,
-                    "paid_inference_executed": False,
-                },
-            )
-            return result
+                source = session.get(TaskRequest, entry.source_request_id)
+                feedback = session.scalar(
+                    select(FeedbackEvent).where(
+                        FeedbackEvent.request_id == entry.source_request_id
+                    )
+                )
+                if (
+                    source is None
+                    or source.client_id != request.client_id
+                    or source.status != "ACCEPTED"
+                    or source.execution_kind != "PRIMARY"
+                    or not source.result_json
+                    or feedback is not None
+                    and (feedback.score < 50 or feedback.correction_hash is not None)
+                ):
+                    session.delete(entry)
+                    return None
+                try:
+                    original = SolveResponse.model_validate(source.result_json)
+                    spec = router.registry.providers[original.provider_id]
+                    admit_provider(spec)
+                    adapter = router.registry.adapters.get(spec.provider_id)
+                    if adapter is None:
+                        return None
+                    if hasattr(adapter, "check_admission"):
+                        adapter.check_admission()
+                    if (
+                        original.status != "ACCEPTED"
+                        or original.cache_hit
+                        or original.output is None
+                        or original.quality is None
+                    ):
+                        raise ValueError()
+                    if session.get(ProviderQuotaState, spec.provider_id).security_blocked:
+                        return None
+                    if not any(
+                        model.model_id == original.model_id and model.active
+                        for model in spec.models
+                    ):
+                        return None
+                    normalized = NormalizedModelResponse(
+                        provider_id=original.provider_id,
+                        model_id=original.model_id,
+                        text=original.output,
+                    )
+                    quality = evaluate(request, profile, normalized)
+                    if not acceptable(quality, profile):
+                        session.delete(entry)
+                        return None
+                except (ValueError, KeyError, AdmissionDenied, AuthenticationFailed):
+                    session.delete(entry)
+                    return None
+                result = SolveResponse(
+                    request_id=request_id,
+                    status="ACCEPTED",
+                    reason_code="EXACT_CACHE_HIT",
+                    attempts=[],
+                    minimum_required=profile.minimum_quality_score,
+                    best_quality_score=quality.overall_score,
+                    verification_state=quality.verification_state,
+                    quality=quality,
+                    output=original.output,
+                    provider_id=original.provider_id,
+                    model_id=original.model_id,
+                    cache_hit=True,
+                    cached_from_request_id=source.id,
+                )
+                row = session.get(TaskRequest, request_id)
+                row.status, row.result_json = result.status, result.model_dump(mode="json")
+                router.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "CACHE_HIT",
+                    {"source_request_id": source.id, "revalidated": True},
+                )
+                router.audit(
+                    session,
+                    request_id,
+                    request.client_id,
+                    "ACCEPTED",
+                    {
+                        "reason_code": result.reason_code,
+                        "attempts_count": 0,
+                        "paid_inference_executed": False,
+                    },
+                )
+                return result
+        return await asyncio.to_thread(_do)
 
-    def put(self, request, profile, result):
+    async def put(self, request, profile, result):
         key = self.key(request, profile)
         router, now = self.router, self.clock()
         if (
@@ -180,39 +186,52 @@ class ExactCache:
             or result.execution_kind != "PRIMARY"
         ):
             return
-        with router.sessions.begin() as session:
-            session.execute(delete(CacheEntry).where(CacheEntry.expires_at <= now))
-            existing = session.get(CacheEntry, (request.client_id, key))
-            if existing is None:
-                count = session.scalar(select(func.count()).select_from(CacheEntry))
-                if count >= router.settings.cache_max_entries:
-                    oldest = session.scalars(
-                        select(CacheEntry)
-                        .order_by(CacheEntry.created_at, CacheEntry.client_id, CacheEntry.key)
-                        .limit(count - router.settings.cache_max_entries + 1)
-                    )
-                    for old in oldest:
-                        session.delete(old)
-                existing = CacheEntry(client_id=request.client_id, key=key)
-                session.add(existing)
-            existing.source_request_id = result.request_id
-            existing.created_at = now
-            existing.expires_at = now + min(
-                request.cache_ttl_seconds or router.settings.cache_ttl_seconds,
-                router.settings.cache_ttl_seconds,
-            )
-            router.audit(
-                session,
-                result.request_id,
-                request.client_id,
-                "CACHE_STORED",
-                {"expires_at": existing.expires_at},
-            )
 
-    def clear(self, client_id):
-        with self.router.sessions.begin() as session:
-            result = session.execute(delete(CacheEntry).where(CacheEntry.client_id == client_id))
-            self.router.audit(
-                session, None, client_id, "CACHE_CLEARED", {"entries_removed": result.rowcount}
-            )
-            return {"entries_removed": result.rowcount}
+        def _do():
+            with router.sessions.begin() as session:
+                session.execute(delete(CacheEntry).where(CacheEntry.expires_at <= now))
+                existing = session.get(CacheEntry, (request.client_id, key))
+                if existing is None:
+                    count = session.scalar(select(func.count()).select_from(CacheEntry))
+                    if count >= router.settings.cache_max_entries:
+                        oldest = session.scalars(
+                            select(CacheEntry)
+                            .order_by(
+                                CacheEntry.created_at, CacheEntry.client_id, CacheEntry.key
+                            )
+                            .limit(count - router.settings.cache_max_entries + 1)
+                        )
+                        for old in oldest:
+                            session.delete(old)
+                    existing = CacheEntry(client_id=request.client_id, key=key)
+                    session.add(existing)
+                existing.source_request_id = result.request_id
+                existing.created_at = now
+                existing.expires_at = now + min(
+                    request.cache_ttl_seconds or router.settings.cache_ttl_seconds,
+                    router.settings.cache_ttl_seconds,
+                )
+                router.audit(
+                    session,
+                    result.request_id,
+                    request.client_id,
+                    "CACHE_STORED",
+                    {"expires_at": existing.expires_at},
+                )
+        await asyncio.to_thread(_do)
+
+    async def clear(self, client_id):
+        def _do():
+            with self.router.sessions.begin() as session:
+                result = session.execute(
+                    delete(CacheEntry).where(CacheEntry.client_id == client_id)
+                )
+                self.router.audit(
+                    session,
+                    None,
+                    client_id,
+                    "CACHE_CLEARED",
+                    {"entries_removed": result.rowcount},
+                )
+                return {"entries_removed": result.rowcount}
+        return await asyncio.to_thread(_do)

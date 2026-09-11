@@ -104,8 +104,8 @@ async def test_snapshot_counts_owned_work_without_reading_payloads(make_router):
     )
     await router.solve(req)
     await router.solve(req)
-    router.quota.block_security("a")
-    router.quota.exhaust("a")
+    await router.quota.block_security("a")
+    await router.quota.exhaust("a")
     result = snapshot(router, credentials())
     assert result["requests_last_24h"]["ACCEPTED"] == 2
     assert result["cache_hits_last_24h"] == result["active_cache_entries"] == 1

@@ -312,7 +312,7 @@ async def test_missing_qualification_consumes_no_quota_or_model_learning(make_ro
     result = await router.solve(request())
     assert result.reason_code == "BENCHMARK_QUALIFICATION_UNSATISFIED" and not result.attempts
     assert result.output is None and router.registry.adapters["a"].calls == 0
-    assert router.quota.state("a").used == 0
+    assert (await router.quota.state("a")).used == 0
     with router.sessions() as session:
         assert not list(session.scalars(select(ModelTaskPerformance)))
 
@@ -416,7 +416,9 @@ async def test_expiry_of_checker_qualification_prevents_release(make_router):
 async def test_dispatch_rechecks_even_if_selection_is_bypassed(make_router):
     router = attach(make_router([(spec(), MockAdapter("a", text="2"))], benchmark_policy={}), [])
     selected = router.registry.providers["a"]
-    router.selector.candidates = lambda *args: [(1, selected, selected.models[0])]
+    async def mock_candidates(*args):
+        return [(1, selected, selected.models[0])]
+    router.selector.candidates = mock_candidates
     result = await router.solve(request())
     assert not result.attempts and router.registry.adapters["a"].calls == 0
 

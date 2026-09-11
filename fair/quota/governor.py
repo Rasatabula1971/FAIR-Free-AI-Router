@@ -1,3 +1,4 @@
+import asyncio
 from math import isfinite
 from time import time
 
@@ -48,14 +49,16 @@ class QuotaGovernor:
             row.probe_until = 0
             self._event(session, row, "PROBE_EXPIRED")
 
-    def state(self, provider_id):
-        with self.sessions.begin() as session:
-            row = self._row(session, provider_id)
-            self._recover(session, row)
-            return row
+    async def state(self, provider_id):
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, provider_id)
+                self._recover(session, row)
+                return row
+        return await asyncio.to_thread(_do)
 
-    def remaining(self, spec):
-        state = self.state(spec.provider_id)
+    async def remaining(self, spec):
+        state = await self.state(spec.provider_id)
         return None if spec.request_limit is None else max(0, spec.request_limit - state.used)
 
     def _available(self, row, spec):
@@ -67,47 +70,51 @@ class QuotaGovernor:
             and (spec.request_limit is None or row.used < spec.request_limit)
         )
 
-    def available(self, spec):
-        return self._available(self.state(spec.provider_id), spec)
+    async def available(self, spec):
+        return self._available(await self.state(spec.provider_id), spec)
 
-    def reserve(self, spec):
-        with self.sessions.begin() as session:
-            row = self._row(session, spec.provider_id)
-            self._recover(session, row)
-            if not self._available(row, spec):
-                return False
-            if row.circuit_state == "OPEN":
-                row.circuit_state = "HALF_OPEN"
-                row.probe_until = self.clock() + self.settings.timeout_seconds + 5
-                self._event(session, row, "PROBE_STARTED")
-            row.used += 1
-            row.last_reserved_at = self.clock()
-            row.updated_at = utcnow()
-            return True
+    async def reserve(self, spec):
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, spec.provider_id)
+                self._recover(session, row)
+                if not self._available(row, spec):
+                    return False
+                if row.circuit_state == "OPEN":
+                    row.circuit_state = "HALF_OPEN"
+                    row.probe_until = self.clock() + self.settings.timeout_seconds + 5
+                    self._event(session, row, "PROBE_STARTED")
+                row.used += 1
+                row.last_reserved_at = self.clock()
+                row.updated_at = utcnow()
+                return True
+        return await asyncio.to_thread(_do)
 
     def _open(self, row):
         row.circuit_state = "OPEN"
         row.blocked_until = self.clock() + self.settings.cooldown_seconds
         row.probe_until = 0
 
-    def throttle(self, provider_id, retry_after=None):
-        with self.sessions.begin() as session:
-            row = self._row(session, provider_id)
-            if row.circuit_state == "HALF_OPEN":
-                self._open(row)
-            delay = (
-                retry_after
-                if isinstance(retry_after, (int, float))
-                and isfinite(retry_after)
-                and 0 < retry_after <= 86400
-                else 0
-            )
-            row.blocked_until = max(
-                row.blocked_until, self.clock() + max(self.settings.cooldown_seconds, delay)
-            )
-            self._event(session, row, "RATE_LIMITED")
+    async def throttle(self, provider_id, retry_after=None):
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, provider_id)
+                if row.circuit_state == "HALF_OPEN":
+                    self._open(row)
+                delay = (
+                    retry_after
+                    if isinstance(retry_after, (int, float))
+                    and isfinite(retry_after)
+                    and 0 < retry_after <= 86400
+                    else 0
+                )
+                row.blocked_until = max(
+                    row.blocked_until, self.clock() + max(self.settings.cooldown_seconds, delay)
+                )
+                self._event(session, row, "RATE_LIMITED")
+        await asyncio.to_thread(_do)
 
-    def observe(self, spec, observation):
+    async def observe(self, spec, observation):
         if observation.provider_id != spec.provider_id:
             raise ValueError("Quota observation identity mismatch")
         remaining = observation.quota_remaining_estimate
@@ -117,64 +124,74 @@ class QuotaGovernor:
             or remaining > observation.quota_limit
         ):
             return
-        with self.sessions.begin() as session:
-            row = self._row(session, spec.provider_id)
-            if spec.request_limit is not None:
-                row.used = max(row.used, spec.request_limit - min(remaining, spec.request_limit))
-            if remaining == 0:
-                row.exhausted = True
-            if (
-                observation.reset_at is not None
-                and self.clock() < observation.reset_at <= self.clock() + 86400
-            ):
-                row.reset_at = observation.reset_at
-            self._event(session, row, "QUOTA_OBSERVED")
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, spec.provider_id)
+                if spec.request_limit is not None:
+                    row.used = max(row.used, spec.request_limit - min(remaining, spec.request_limit))
+                if remaining == 0:
+                    row.exhausted = True
+                if (
+                    observation.reset_at is not None
+                    and self.clock() < observation.reset_at <= self.clock() + 86400
+                ):
+                    row.reset_at = observation.reset_at
+                self._event(session, row, "QUOTA_OBSERVED")
+        await asyncio.to_thread(_do)
 
-    def exhaust(self, provider_id, reset_at=None):
+    async def exhaust(self, provider_id, reset_at=None):
         """reset_at comes only from a trusted adapter's observed quota reset, if supplied."""
         if reset_at is not None and (not isfinite(reset_at) or reset_at <= self.clock()):
-            reset_at = None  # A stale or invalid reset is not permission to clear exhaustion.
-        with self.sessions.begin() as session:
-            row = self._row(session, provider_id)
-            row.exhausted = True
-            row.reset_at = reset_at
-            if row.circuit_state == "HALF_OPEN":
-                self._open(row)
-            self._event(session, row, "QUOTA_EXHAUSTED")
+            reset_at = None
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, provider_id)
+                row.exhausted = True
+                row.reset_at = reset_at
+                if row.circuit_state == "HALF_OPEN":
+                    self._open(row)
+                self._event(session, row, "QUOTA_EXHAUSTED")
+        await asyncio.to_thread(_do)
 
-    def block_security(self, provider_id):
-        with self.sessions.begin() as session:
-            row = self._row(session, provider_id)
-            row.security_blocked = True
-            self._event(session, row, "AUTHENTICATION_FAILED")
+    async def block_security(self, provider_id):
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, provider_id)
+                row.security_blocked = True
+                self._event(session, row, "AUTHENTICATION_FAILED")
+        await asyncio.to_thread(_do)
 
-    def failure(self, provider_id):
-        with self.sessions.begin() as session:
-            row = self._row(session, provider_id)
-            now = self.clock()
-            row.failures = [
-                t for t in row.failures if t >= now - self.settings.circuit_window_seconds
-            ] + [now]
-            if (
-                row.circuit_state == "HALF_OPEN"
-                or len(row.failures) >= self.settings.circuit_failures
-            ):
-                self._open(row)
-            self._event(session, row, "INFRA_FAILURE")
+    async def failure(self, provider_id):
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, provider_id)
+                now = self.clock()
+                row.failures = [
+                    t for t in row.failures if t >= now - self.settings.circuit_window_seconds
+                ] + [now]
+                if (
+                    row.circuit_state == "HALF_OPEN"
+                    or len(row.failures) >= self.settings.circuit_failures
+                ):
+                    self._open(row)
+                self._event(session, row, "INFRA_FAILURE")
+        await asyncio.to_thread(_do)
 
-    def success(self, provider_id):
-        with self.sessions.begin() as session:
-            row = self._row(session, provider_id)
-            row.failures = []
-            row.circuit_state = "CLOSED"
-            row.probe_until = 0
-            row.blocked_until = 0
-            self._event(session, row, "HEALTHY_RESPONSE")
+    async def success(self, provider_id):
+        def _do():
+            with self.sessions.begin() as session:
+                row = self._row(session, provider_id)
+                row.failures = []
+                row.circuit_state = "CLOSED"
+                row.probe_until = 0
+                row.blocked_until = 0
+                self._event(session, row, "HEALTHY_RESPONSE")
+        await asyncio.to_thread(_do)
 
-    def effective_status(self, spec):
+    async def effective_status(self, spec):
         if spec.status not in {"ACTIVE", "QUOTA_PRESSURE"}:
             return spec.status
-        row = self.state(spec.provider_id)
+        row = await self.state(spec.provider_id)
         if row.security_blocked:
             return "SECURITY_BLOCKED"
         if row.exhausted or (spec.request_limit is not None and row.used >= spec.request_limit):

@@ -1,3 +1,5 @@
+import asyncio
+
 from fair.governor.policy import AdmissionDenied, admit_provider
 
 PRIVACY = {
@@ -13,14 +15,14 @@ class Selector:
         self.performance = performance
         self.benchmarks = benchmarks
 
-    def candidates(self, request, profile, tried, benchmark_checks=None, eligible=None):
+    async def candidates(self, request, profile, tried, benchmark_checks=None, eligible=None):
         candidates = []
         for spec in self.registry.providers.values():
             try:
                 admit_provider(spec)
             except AdmissionDenied:
                 continue
-            if spec.provider_id not in self.registry.adapters or not self.quota.available(spec):
+            if spec.provider_id not in self.registry.adapters or not await self.quota.available(spec):
                 continue
             if PRIVACY[request.privacy_class] > PRIVACY[spec.max_data_class]:
                 continue
@@ -31,8 +33,12 @@ class Selector:
                     continue
                 if profile.context_tokens_estimate > model.context_window:
                     continue
-                if eligible is not None and not eligible(spec, model):
-                    continue
+                if eligible is not None:
+                    result = eligible(spec, model)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    if not result:
+                        continue
                 quality_prior = None
                 if self.settings.benchmark_policy is not None:
                     check = self.benchmarks.assess(
@@ -43,14 +49,14 @@ class Selector:
                     if check.state != "PASSED":
                         continue
                     quality_prior = check.conservative_score / 100
-                quality, reliability = self.performance.scores(
+                quality, reliability = await self.performance.scores(
                     spec.provider_id,
                     model.model_id,
                     profile.task_class,
                     quality_prior=quality_prior,
                     client_id=request.client_id,
                 )
-                remaining = self.quota.remaining(spec)
+                remaining = await self.quota.remaining(spec)
                 headroom = remaining / spec.request_limit if spec.request_limit else 0.5
                 score = (
                     self.settings.quality_weight * quality

@@ -215,7 +215,20 @@ def database(url):
     if url.startswith("sqlite"):
         kwargs = {"connect_args": {"check_same_thread": False}}
         if ":memory:" in url:
-            kwargs["poolclass"] = StaticPool
+            import sqlite3
+
+            from sqlalchemy.pool import QueuePool
+
+            name = uuid4().hex
+            kwargs["creator"] = lambda: sqlite3.connect(
+                f"file:{name}?mode=memory&cache=shared",
+                uri=True,
+                check_same_thread=False,
+            )
+            kwargs["poolclass"] = QueuePool
+            kwargs["pool_size"] = 1
+            kwargs["max_overflow"] = 0
+            url = "sqlite://"
     engine = create_engine(url, **kwargs)
     if url.startswith("sqlite"):
 

@@ -177,7 +177,7 @@ async def test_guarded_adapter_never_serializes_credentials(make_router, monkeyp
                 assert json.dumps(SECRET)[1:-1] not in serialized
                 assert not {"api_key", "credential", "authorization"}.intersection(values)
     if mode in {"echo", "input", "authentication"}:
-        assert router.quota.state("a").security_blocked
+        assert (await router.quota.state("a")).security_blocked
 
 
 async def test_discovery_and_direct_errors_are_also_guarded(monkeypatch):

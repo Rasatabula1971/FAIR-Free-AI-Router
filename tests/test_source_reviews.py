@@ -92,7 +92,7 @@ async def test_ineligible_snapshot_blocks_before_inference_or_quota(make_router,
     assert result.reason_code == "SOURCE_POLICY_UNSATISFIED" and result.output is None
     assert result.source_policy.checks[0].status == status
     assert not result.attempts and router.registry.adapters["a"].calls == 0
-    assert router.quota.state("a").used == 0
+    assert (await router.quota.state("a")).used == 0
     with router.sessions() as session:
         assert not list(session.scalars(select(ModelTaskPerformance)))
 

@@ -32,19 +32,19 @@ def change(recovery, action="clear_authentication", **values):
     )
 
 
-def maintenance(make_router):
+async def maintenance(make_router):
     router = make_router([(provider(request_limit=2), MockAdapter("a"))])
     router.quota.clock = lambda: NOW - 10
-    router.quota.reserve(router.registry.providers["a"])
-    router.quota.block_security("a")
+    await router.quota.reserve(router.registry.providers["a"])
+    await router.quota.block_security("a")
     router.stopped = True
     return router, Recovery(router, clock=lambda: NOW)
 
 
-def test_authentication_recovery_preserves_quota_other_blocks_and_audits(make_router):
-    router, recovery = maintenance(make_router)
-    router.quota.exhaust("a")
-    router.quota.throttle("a")
+async def test_authentication_recovery_preserves_quota_other_blocks_and_audits(make_router):
+    router, recovery = await maintenance(make_router)
+    await router.quota.exhaust("a")
+    await router.quota.throttle("a")
     result = recovery.provider("a", change(recovery))
     assert not result["after"]["security_blocked"]
     assert result["after"]["used"] == 1 and result["after"]["exhausted"]
@@ -58,19 +58,19 @@ def test_authentication_recovery_preserves_quota_other_blocks_and_audits(make_ro
         assert "private-review-reference" not in json.dumps(audit.payload_json)
         assert not list(session.scalars(select(ModelTaskPerformance)))
     restarted = QuotaGovernor(router.settings, router.sessions, clock=lambda: NOW)
-    assert not restarted.state("a").security_blocked and restarted.state("a").exhausted
+    assert not (await restarted.state("a")).security_blocked and (await restarted.state("a")).exhausted
 
 
 @pytest.mark.parametrize("condition", ["running", "inflight", "stale", "unknown", "noop"])
-def test_recovery_preconditions_are_fail_closed(make_router, condition):
-    router, recovery = maintenance(make_router)
+async def test_recovery_preconditions_are_fail_closed(make_router, condition):
+    router, recovery = await maintenance(make_router)
     request = change(recovery)
     if condition == "running":
         router.stopped = False
     elif condition == "inflight":
         router.inflight.add("active-request")
     elif condition == "stale":
-        router.quota.throttle("a")
+        await router.quota.throttle("a")
     elif condition == "noop":
         recovery.provider("a", request)
         request = change(recovery)
@@ -80,8 +80,8 @@ def test_recovery_preconditions_are_fail_closed(make_router, condition):
     assert recovery.inspect_provider("a") == before
 
 
-def test_stale_replay_cannot_reapply_and_audit_failure_rolls_back(make_router):
-    router, recovery = maintenance(make_router)
+async def test_stale_replay_cannot_reapply_and_audit_failure_rolls_back(make_router):
+    router, recovery = await maintenance(make_router)
     request = change(recovery)
     before = recovery.inspect_provider("a")
 
@@ -101,41 +101,41 @@ def test_stale_replay_cannot_reapply_and_audit_failure_rolls_back(make_router):
         recovery.provider("a", request)
 
 
-def test_rearm_preserves_quota_and_allows_only_one_probe(make_router):
-    router, recovery = maintenance(make_router)
+async def test_rearm_preserves_quota_and_allows_only_one_probe(make_router):
+    router, recovery = await maintenance(make_router)
     recovery.provider("a", change(recovery))
     for _ in range(3):
-        router.quota.failure("a")
+        await router.quota.failure("a")
     request = change(recovery, "rearm_circuit")
     recovery.provider("a", request)
     router.quota.clock = lambda: NOW
     spec = router.registry.providers["a"]
-    assert router.quota.state("a").circuit_state == "OPEN"
-    assert router.quota.reserve(spec)
-    assert router.quota.state("a").circuit_state == "HALF_OPEN"
-    assert not QuotaGovernor(router.settings, router.sessions, clock=lambda: NOW).reserve(spec)
-    assert router.quota.state("a").used == 2
+    assert (await router.quota.state("a")).circuit_state == "OPEN"
+    assert await router.quota.reserve(spec)
+    assert (await router.quota.state("a")).circuit_state == "HALF_OPEN"
+    assert not await QuotaGovernor(router.settings, router.sessions, clock=lambda: NOW).reserve(spec)
+    assert (await router.quota.state("a")).used == 2
 
 
-def test_quota_reset_requires_new_boundary_and_cannot_be_replayed(make_router):
-    router, recovery = maintenance(make_router)
-    router.quota.exhaust("a")
+async def test_quota_reset_requires_new_boundary_and_cannot_be_replayed(make_router):
+    router, recovery = await maintenance(make_router)
+    await router.quota.exhaust("a")
     reset = datetime.fromtimestamp(NOW - 5, UTC)
     recovery.provider("a", change(recovery, "confirm_quota_reset", observed_reset_at=reset))
-    state = router.quota.state("a")
+    state = await router.quota.state("a")
     assert state.used == 0 and not state.exhausted and state.security_blocked
     assert state.last_quota_reset_at == reset.timestamp()
     recovery.provider("a", change(recovery))
     router.quota.clock = lambda: NOW - 2
-    router.quota.reserve(router.registry.providers["a"])
+    await router.quota.reserve(router.registry.providers["a"])
     with pytest.raises(RecoveryDenied, match="ALREADY_ACCOUNTED"):
         recovery.provider("a", change(recovery, "confirm_quota_reset", observed_reset_at=reset))
-    assert router.quota.state("a").used == 1
+    assert (await router.quota.state("a")).used == 1
 
 
 @pytest.mark.parametrize("offset", [1, -86401, -10, -11])
-def test_invalid_or_prior_reservation_reset_cannot_clear_usage(make_router, offset):
-    router, recovery = maintenance(make_router)
+async def test_invalid_or_prior_reservation_reset_cannot_clear_usage(make_router, offset):
+    router, recovery = await maintenance(make_router)
     with pytest.raises(RecoveryDenied):
         recovery.provider(
             "a",
@@ -145,7 +145,7 @@ def test_invalid_or_prior_reservation_reset_cannot_clear_usage(make_router, offs
                 observed_reset_at=datetime.fromtimestamp(NOW + offset, UTC),
             ),
         )
-    assert router.quota.state("a").used == 1
+    assert (await router.quota.state("a")).used == 1
 
 
 @pytest.mark.parametrize(
@@ -173,12 +173,12 @@ def test_invalid_recovery_contract(changes):
         )
 
 
-def test_recovery_does_not_enable_disabled_or_paid_provider(make_router):
-    router, recovery = maintenance(make_router)
+async def test_recovery_does_not_enable_disabled_or_paid_provider(make_router):
+    router, recovery = await maintenance(make_router)
     router.registry.providers["a"].status = "DISABLED"
     router.registry.providers["a"].current_access_cost_usd = 1
     recovery.provider("a", change(recovery))
-    assert router.quota.effective_status(router.registry.providers["a"]) == "DISABLED"
+    assert await router.quota.effective_status(router.registry.providers["a"]) == "DISABLED"
 
 
 def seed_requests(router):
@@ -198,15 +198,15 @@ def seed_requests(router):
             )
 
 
-def test_interrupted_request_recovery_is_bounded_idempotent_and_preserves_quota(make_router):
-    router, _ = maintenance(make_router)
+async def test_interrupted_request_recovery_is_bounded_idempotent_and_preserves_quota(make_router):
+    router, _ = await maintenance(make_router)
     recovery = Recovery(router)
     seed_requests(router)
     request = RequestRecovery(created_before=utcnow(), review_reference="incident", limit=2)
     assert recovery.requests(request)["recovered"] == 2
     assert recovery.requests(request)["recovered"] == 1
     assert recovery.requests(request)["recovered"] == 0
-    assert router.quota.state("a").used == 1
+    assert (await router.quota.state("a")).used == 1
     with router.sessions() as session:
         assert (
             session.get(TaskRequest, "request-0").result_json["reason_code"]
@@ -248,8 +248,8 @@ async def test_stop_does_not_allow_recovery_while_provider_cleanup_runs(make_rou
     assert not router.inflight
 
 
-def test_http_recovery_authentication_and_client_history_isolation(make_router):
-    router, _ = maintenance(make_router)
+async def test_http_recovery_authentication_and_client_history_isolation(make_router):
+    router, _ = await maintenance(make_router)
     seed_requests(router)
     with TestClient(create_app(router, {"alice": "a", "bob": "b"}, "admin")) as client:
         admin = {"X-API-Key": "admin"}

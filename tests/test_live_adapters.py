@@ -515,24 +515,24 @@ def test_retry_parsing_is_bounded():
     assert retry_seconds("Wed, 09 Sep 2026 00:02:00 GMT", NOW.timestamp()) == 120
 
 
-def test_observations_only_reduce_budget_and_persist_retry(make_router):
+async def test_observations_only_reduce_budget_and_persist_retry(make_router):
     spec = provider(request_limit=10)
     router = make_router([(spec, None)])
     router.quota.clock = lambda: 1000
-    assert router.quota.reserve(spec)
-    router.quota.observe(
+    assert await router.quota.reserve(spec)
+    await router.quota.observe(
         spec,
         QuotaSnapshot(provider_id="a", quota_limit=100, quota_remaining_estimate=2, reset_at=1060),
     )
-    assert router.quota.remaining(spec) == 2
-    router.quota.observe(
+    assert await router.quota.remaining(spec) == 2
+    await router.quota.observe(
         spec, QuotaSnapshot(provider_id="a", quota_limit=100, quota_remaining_estimate=99)
     )
-    assert router.quota.remaining(spec) == 2
-    router.quota.throttle("a", retry_after=120)
-    assert router.quota.state("a").blocked_until == 1120
+    assert await router.quota.remaining(spec) == 2
+    await router.quota.throttle("a", retry_after=120)
+    assert (await router.quota.state("a")).blocked_until == 1120
     with pytest.raises(ValueError):
-        router.quota.observe(spec, QuotaSnapshot(provider_id="wrong"))
+        await router.quota.observe(spec, QuotaSnapshot(provider_id="wrong"))
 
 
 def test_registry_requires_scoped_credentials(monkeypatch):
@@ -541,7 +541,7 @@ def test_registry_requires_scoped_credentials(monkeypatch):
         register_live(Registry(), [spec_for()], settings())
 
 
-def test_billing_violation_stops_router_without_false_zero_spend_claim(make_router):
+async def test_billing_violation_stops_router_without_false_zero_spend_claim(make_router):
     spec = spec_for("openrouter_free")
 
     def handler(req):
@@ -567,7 +567,7 @@ def test_billing_violation_stops_router_without_false_zero_spend_claim(make_rout
         )
         assert response.status_code == 503, response.text
         assert response.json()["paid_inference_executed"] is None
-        assert router.stopped and router.quota.state(spec.provider_id).security_blocked
+        assert router.stopped and (await router.quota.state(spec.provider_id)).security_blocked
         assert client.get("/healthz").json()["live_inference_enabled"] is False
     with router.sessions() as session:
         row = session.scalar(select(TaskRequest))

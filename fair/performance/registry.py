@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, timedelta
 
 from sqlalchemy import select
@@ -117,47 +118,46 @@ class PerformanceRegistry:
             else None,
         }
 
-    def scores(self, provider_id, model_id, task_class, quality_prior=None, client_id=None):
-        with self.sessions() as session:
-            row = session.get(ModelTaskPerformance, (provider_id, model_id, task_class))
-            if row is None:
-                return quality_prior if quality_prior is not None else 0.5, 0.5
-            # Five neutral prior observations dampen sparse samples. Infrastructure and
-            # quota outcomes never enter the quality numerator or denominator.
-            prior = quality_prior if quality_prior is not None else 0.5
-            quality = (row.quality_sum / 100 + 5 * prior) / (row.quality_samples + 5)
-            observation = self.describe(row)
-            if observation["drift_state"] == "DEGRADED":
-                quality = min(
-                    quality,
-                    (sum(row.recent_quality) / 100 + 5 * prior) / (len(row.recent_quality) + 5),
-                )
-            if client_id is not None and self.settings.feedback_weight:
-                feedback = list(
-                    session.scalars(
-                        select(FeedbackEvent.score)
-                        .where(
-                            FeedbackEvent.client_id == client_id,
-                            FeedbackEvent.provider_id == provider_id,
-                            FeedbackEvent.model_id == model_id,
-                            FeedbackEvent.task_class == task_class,
-                            FeedbackEvent.created_at
-                            >= self.clock() - timedelta(days=self.settings.feedback_max_age_days),
+    async def scores(self, provider_id, model_id, task_class, quality_prior=None, client_id=None):
+        def _do():
+            with self.sessions() as session:
+                row = session.get(ModelTaskPerformance, (provider_id, model_id, task_class))
+                if row is None:
+                    return quality_prior if quality_prior is not None else 0.5, 0.5
+                prior = quality_prior if quality_prior is not None else 0.5
+                quality = (row.quality_sum / 100 + 5 * prior) / (row.quality_samples + 5)
+                observation = self.describe(row)
+                if observation["drift_state"] == "DEGRADED":
+                    quality = min(
+                        quality,
+                        (sum(row.recent_quality) / 100 + 5 * prior) / (len(row.recent_quality) + 5),
+                    )
+                if client_id is not None and self.settings.feedback_weight:
+                    feedback = list(
+                        session.scalars(
+                            select(FeedbackEvent.score)
+                            .where(
+                                FeedbackEvent.client_id == client_id,
+                                FeedbackEvent.provider_id == provider_id,
+                                FeedbackEvent.model_id == model_id,
+                                FeedbackEvent.task_class == task_class,
+                                FeedbackEvent.created_at
+                                >= self.clock()
+                                - timedelta(days=self.settings.feedback_max_age_days),
+                            )
+                            .order_by(FeedbackEvent.created_at.desc(), FeedbackEvent.id.desc())
+                            .limit(20)
                         )
-                        .order_by(FeedbackEvent.created_at.desc(), FeedbackEvent.id.desc())
-                        .limit(20)
                     )
-                )
-                if feedback:
-                    weight = self.settings.feedback_weight
-                    observations = min(20, row.quality_samples) + 5
-                    quality = (quality * observations + sum(feedback) / 100 * weight) / (
-                        observations + len(feedback) * weight
-                    )
-            if quality_prior is not None:
-                # Production failures can reduce ranking, but accumulated history cannot
-                # promote a model above its independently measured qualification bound.
-                quality = min(quality_prior, quality)
-            observed = row.attempts - row.quota_failures
-            reliability = (observed - row.infra_failures + 2.5) / (observed + 5)
-            return quality, reliability
+                    if feedback:
+                        weight = self.settings.feedback_weight
+                        observations = min(20, row.quality_samples) + 5
+                        quality = (quality * observations + sum(feedback) / 100 * weight) / (
+                            observations + len(feedback) * weight
+                        )
+                if quality_prior is not None:
+                    quality = min(quality_prior, quality)
+                observed = row.attempts - row.quota_failures
+                reliability = (observed - row.infra_failures + 2.5) / (observed + 5)
+                return quality, reliability
+        return await asyncio.to_thread(_do)
