@@ -146,7 +146,10 @@ class Router:
                         "quota_remaining": remaining,
                     },
                 )
-        await asyncio.to_thread(_audit_executing)
+        try:
+            await asyncio.to_thread(_audit_executing)
+        except SQLAlchemyError:
+            pass
         try:
             response = await asyncio.wait_for(
                 self.registry.adapters[spec.provider_id].complete(
@@ -168,9 +171,12 @@ class Router:
             await self.quota.success(spec.provider_id)
         except BillingViolation:
             billing_violation = True
-            await self.quota.block_security(spec.provider_id)
             self.stopped = True
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
+            try:
+                await self.quota.block_security(spec.provider_id)
+            except SQLAlchemyError:
+                pass
 
             def _audit_billing():
                 with self.sessions.begin() as session:
@@ -181,23 +187,41 @@ class Router:
                         "BILLING_POLICY_VIOLATION",
                         {"provider_id": spec.provider_id, "system_stopped": True},
                     )
-            await asyncio.to_thread(_audit_billing)
+            try:
+                await asyncio.to_thread(_audit_billing)
+            except SQLAlchemyError:
+                pass
         except QuotaExceeded as error:
-            await self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
+            try:
+                await self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
+            except SQLAlchemyError:
+                pass
         except RateLimited as error:
-            await self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
+            try:
+                await self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
+            except SQLAlchemyError:
+                pass
         except AuthenticationFailed:
-            await self.quota.block_security(spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "AUTHENTICATION_FAILED"
+            try:
+                await self.quota.block_security(spec.provider_id)
+            except SQLAlchemyError:
+                pass
         except asyncio.CancelledError:
             cancelled = True
-            await self.quota.failure(spec.provider_id)
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
+            try:
+                await self.quota.failure(spec.provider_id)
+            except (SQLAlchemyError, asyncio.CancelledError):
+                pass
         except Exception:
-            await self.quota.failure(spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
+            try:
+                await self.quota.failure(spec.provider_id)
+            except SQLAlchemyError:
+                pass
         else:
             try:
                 source_report = self._source_report(request)
@@ -601,7 +625,10 @@ class Router:
         await asyncio.to_thread(_mark_profiled)
         reason = "NO_ELIGIBLE_FREE_MODELS"
         if shadow_of is None:
-            cached = await self.cache.get(request, profile, request_id)
+            try:
+                cached = await self.cache.get(request, profile, request_id)
+            except SQLAlchemyError:
+                cached = None
             if cached is not None:
                 return cached
         accepted_response = accepted_quality = None
