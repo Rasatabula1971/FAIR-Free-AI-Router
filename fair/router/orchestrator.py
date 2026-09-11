@@ -465,6 +465,7 @@ class Router:
         request = request.model_copy(deep=True)
         request_id = str(uuid4())
         profile = profile_task(request, self.thresholds)
+        profile_dict = profile.model_dump(mode="json")
 
         def _create_request():
             with self.sessions.begin() as session:
@@ -475,7 +476,7 @@ class Router:
                         status="RECEIVED",
                         execution_kind="SHADOW" if shadow_of is not None else "PRIMARY",
                         parent_request_id=shadow_of.request_id if shadow_of is not None else None,
-                        profile_json=profile.model_dump(mode="json"),
+                        profile_json=profile_dict,
                     )
                 )
         await asyncio.to_thread(_create_request)
@@ -516,8 +517,8 @@ class Router:
                     )
             await asyncio.to_thread(_audit_scheduled)
             if shadow_of is not None:
-                return await self._solve(request, request_id, profile, shadow_of=shadow_of)
-            result = await self._solve(request, request_id, profile)
+                return await self._solve(request, request_id, profile, profile_dict, shadow_of=shadow_of)
+            result = await self._solve(request, request_id, profile, profile_dict)
             self._queue_shadow(request, result)
             return result
         except SchedulingRejected as error:
@@ -572,7 +573,7 @@ class Router:
         except Exception as error:
             raise SourceReviewUnavailable("SOURCE_REVIEW_SERVICE_FAILED") from error
 
-    async def _solve(self, request, request_id, profile, shadow_of=None):
+    async def _solve(self, request, request_id, profile, profile_dict, shadow_of=None):
         attempts, tried = [], set()
         benchmark_checks = {}
         required = request.cross_check_required or request.quality_level == "high_impact_support"
@@ -584,14 +585,14 @@ class Router:
         def _mark_profiled():
             with self.sessions.begin() as session:
                 session.get(TaskRequest, request_id).status = "PROFILED"
-                session.add(ProfileRow(request_id=request_id, **profile.model_dump(mode="json")))
+                session.add(ProfileRow(request_id=request_id, **profile_dict))
                 self.audit(
                     session,
                     request_id,
                     request.client_id,
                     "PROFILED",
                     {
-                        **profile.model_dump(mode="json"),
+                        **profile_dict,
                         "cross_check_required": required,
                         "max_primary_attempts": self.settings.max_attempts,
                         "max_verification_attempts": self.settings.max_verification_attempts,
@@ -759,8 +760,9 @@ class Router:
 
         def _persist_result():
             with self.sessions.begin() as session:
+                result_dict = result.model_dump(mode="json")
                 row = session.get(TaskRequest, request_id)
-                row.status, row.result_json = result.status, result.model_dump(mode="json")
+                row.status, row.result_json = result.status, result_dict
                 if shadow_of is not None:
                     agreement, basis = (
                         compare(
@@ -827,7 +829,7 @@ class Router:
                         EscalationRecord(
                             request_id=request_id,
                             reason_code=reason,
-                            detail_json=result.model_dump(mode="json"),
+                            detail_json=result_dict,
                         )
                     )
                 self.audit(
