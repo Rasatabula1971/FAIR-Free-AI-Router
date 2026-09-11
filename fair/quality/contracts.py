@@ -4,6 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, JsonValue, StrictBool, StrictInt, field_validator
 
+from fair.constants import SECONDS_IN_DAY, SECONDS_IN_YEAR
 from fair.quality.arithmetic import calculate
 from fair.quality.code_validator import SAFE_BUILTINS, bounded
 from fair.schemas.domain import DTO
@@ -147,7 +148,7 @@ ValidationContract = Annotated[
 
 
 class SourcePolicy(DTO):
-    max_age_seconds: int = Field(default=86400, ge=1, le=31536000)
+    max_age_seconds: int = Field(default=SECONDS_IN_DAY, ge=1, le=SECONDS_IN_YEAR)
     allowed_source_classes: set[Literal["PRIMARY", "SECONDARY"]] = Field(
         default_factory=lambda: {"PRIMARY", "SECONDARY"}, min_length=1, max_length=2
     )

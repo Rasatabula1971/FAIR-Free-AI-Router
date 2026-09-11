@@ -4,6 +4,7 @@ from pathlib import Path
 import yaml
 from pydantic import Field
 
+from fair.constants import SECONDS_IN_DAY
 from fair.benchmarks.contracts import BenchmarkPolicy
 from fair.quality.contracts import SourcePolicy
 from fair.router.scheduler import SchedulerSettings
@@ -12,7 +13,7 @@ from fair.schemas.domain import DTO
 
 class RoutingSettings(DTO):
     cache_enabled: bool = False
-    cache_ttl_seconds: int = Field(default=3600, ge=1, le=86400)
+    cache_ttl_seconds: int = Field(default=3600, ge=1, le=SECONDS_IN_DAY)
     cache_max_entries: int = Field(default=1000, ge=1, le=100000)
     feedback_weight: float = Field(default=3, ge=0, le=5, allow_inf_nan=False)
     feedback_max_age_days: int = Field(default=30, ge=1, le=365)

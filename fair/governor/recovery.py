@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import AwareDatetime, Field, model_validator
 from sqlalchemy import String, cast, or_, select
 
+from fair.constants import SECONDS_IN_DAY
 from fair.schemas.db import (
     AuditEvent,
     ProviderHealthEvent,
@@ -135,7 +136,7 @@ class Recovery:
                 )
             else:
                 reset = request.observed_reset_at.timestamp()
-                if reset > now or reset < now - 86400:
+                if reset > now or reset < now - SECONDS_IN_DAY:
                     raise RecoveryDenied("INVALID_RESET_OBSERVATION")
                 if (row.last_quota_reset_at is not None and reset <= row.last_quota_reset_at) or (
                     row.last_reserved_at is not None and reset <= row.last_reserved_at

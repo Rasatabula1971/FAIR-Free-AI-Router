@@ -5,6 +5,7 @@ from time import time
 from sqlalchemy import select
 
 from fair.config import RoutingSettings
+from fair.constants import SECONDS_IN_DAY
 from fair.schemas.db import ProviderHealthEvent, ProviderQuotaState, utcnow
 
 
@@ -116,7 +117,7 @@ class QuotaGovernor:
                     retry_after
                     if isinstance(retry_after, (int, float))
                     and isfinite(retry_after)
-                    and 0 < retry_after <= 86400
+                    and 0 < retry_after <= SECONDS_IN_DAY
                     else 0
                 )
                 row.blocked_until = max(
@@ -144,7 +145,7 @@ class QuotaGovernor:
                     row.exhausted = True
                 if (
                     observation.reset_at is not None
-                    and self.clock() < observation.reset_at <= self.clock() + 86400
+                    and self.clock() < observation.reset_at <= self.clock() + SECONDS_IN_DAY
                 ):
                     row.reset_at = observation.reset_at
                 self._event(session, row, "QUOTA_OBSERVED")

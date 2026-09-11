@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 import httpx
 from pydantic import Field, model_validator
 
+from fair.constants import SECONDS_IN_DAY
 from fair.governor.policy import admit_provider
 from fair.providers.base import (
     AuthenticationFailed,
@@ -62,7 +63,7 @@ def retry_seconds(value, now):
             seconds = parsedate_to_datetime(value).timestamp() - now
         except (ValueError, TypeError, OverflowError):
             return None
-    return seconds if 0 < seconds <= 86400 else None
+    return seconds if 0 < seconds <= SECONDS_IN_DAY else None
 
 
 def duration(value):
@@ -72,7 +73,7 @@ def duration(value):
         float(number) * {"h": 3600, "m": 60, "s": 1, "ms": 0.001}[unit]
         for number, unit in re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", value)
     )
-    return seconds if 0 < seconds <= 86400 else None
+    return seconds if 0 < seconds <= SECONDS_IN_DAY else None
 
 
 def zero(value):
@@ -129,7 +130,7 @@ class TextAdapter:
             if reviewed is None or reviewed.tzinfo is None:
                 raise AuthenticationFailed("CURRENT_TERMS_REVIEW_REQUIRED")
             age = self.clock() - reviewed.timestamp()
-            if not 0 <= age <= self.settings.review_max_age_days * 86400:
+            if not 0 <= age <= self.settings.review_max_age_days * SECONDS_IN_DAY:
                 raise AuthenticationFailed("CURRENT_TERMS_REVIEW_REQUIRED")
             if self.spec.max_data_class != "PUBLIC":
                 raise AuthenticationFailed("REMOTE_ADAPTER_PUBLIC_ONLY")

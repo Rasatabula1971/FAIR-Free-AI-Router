@@ -4,6 +4,7 @@ from datetime import UTC, timedelta
 from sqlalchemy import select
 
 from fair.config import RoutingSettings
+from fair.constants import SECONDS_IN_DAY
 from fair.schemas.db import FeedbackEvent, ModelTaskPerformance, utcnow
 
 
@@ -82,7 +83,7 @@ class PerformanceRegistry:
                         else tested.replace(tzinfo=UTC)
                     )
                 ).total_seconds()
-                / 86400,
+                / SECONDS_IN_DAY,
             )
             if tested
             else None

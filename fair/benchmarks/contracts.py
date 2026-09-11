@@ -3,6 +3,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, StrictBool, model_validator
 
+from fair.constants import SECONDS_IN_YEAR
 from fair.schemas.domain import DTO
 
 Identity = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
@@ -32,7 +33,7 @@ def wilson(successes, samples):
 
 class BenchmarkPolicy(DTO):
     min_samples: int = Field(default=30, strict=True, ge=1, le=10000)
-    max_age_seconds: int = Field(default=2592000, strict=True, ge=1, le=31536000)
+    max_age_seconds: int = Field(default=2592000, strict=True, ge=1, le=SECONDS_IN_YEAR)
 
 
 class BenchmarkMetrics(DTO):
