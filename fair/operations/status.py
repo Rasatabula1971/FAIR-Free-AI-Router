@@ -4,7 +4,7 @@ from sqlalchemy import func, select, text
 
 from fair.schemas.db import AuditEvent, CacheEntry, ProviderQuotaState, SystemState, TaskRequest
 
-SCHEMA_REVISION = "0008"
+SCHEMA_REVISION = "0009"
 
 
 def schema_current(session):

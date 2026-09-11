@@ -97,10 +97,10 @@ class TaskRequest(Base):
     parent_request_id: Mapped[str | None] = mapped_column(
         ForeignKey("task_requests.id"), nullable=True, unique=True, index=True
     )
-    status: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(32), index=True)
     profile_json: Mapped[dict] = mapped_column(JSON)
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class RoutingAttempt(Base):
@@ -197,9 +197,9 @@ class EscalationRecord(Base):
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    request_id: Mapped[str | None] = mapped_column(ForeignKey("task_requests.id"), nullable=True)
+    request_id: Mapped[str | None] = mapped_column(ForeignKey("task_requests.id"), nullable=True, index=True)
     actor_id: Mapped[str] = mapped_column(String(128))
-    event_type: Mapped[str] = mapped_column(String(64))
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
     payload_json: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
