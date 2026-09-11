@@ -26,6 +26,7 @@ class SolveRequest(DTO):
     client_id: str = Field(min_length=1, max_length=128)
     priority: Priority = "P2"
     task: str = Field(min_length=1, max_length=100_000)
+    max_output_tokens: int = Field(default=1024, ge=1, le=65536, strict=True)
     task_type: str | None = Field(default=None, max_length=64)
     quality_level: Literal["commodity", "standard", "advanced", "high_impact_support"] = "standard"
     privacy_class: PrivacyClass = "PUBLIC"

@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import DateTime, bindparam, create_engine, inspect, text
+from sqlalchemy import DateTime, MetaData, Table, bindparam, create_engine, inspect, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
@@ -165,6 +165,65 @@ def test_cache_migration_preserves_source_request(tmp_path):
     try:
         with engine.begin() as connection:
             cache_migration_preserves_history(connection)
+    finally:
+        engine.dispose()
+
+
+def test_qualification_migration_does_not_approve_legacy_cloud_or_reset_state(tmp_path):
+    from conftest import provider
+
+    from fair.governor.policy import AdmissionDenied, admit_provider
+    from fair.schemas.db import database
+
+    engine, _ = database("sqlite:///" + (tmp_path / "qualification-migration.db").as_posix())
+    try:
+        with engine.begin() as connection:
+            cfg = config(connection)
+            command.upgrade(cfg, "0008")
+            legacy = provider(
+                "legacy-cloud", access_class="FREE_RECURRING", terms_last_verified=datetime.now(UTC)
+            )
+            values = legacy.model_dump(exclude={"models", "qualification"})
+            values["updated_at"] = datetime.now(UTC)
+            providers = Table("providers", MetaData(), autoload_with=connection)
+            connection.execute(providers.insert().values(**values))
+            connection.execute(
+                text(
+                    "INSERT INTO provider_quota_states "
+                    "(provider_id, used, exhausted, security_blocked, blocked_until, circuit_state, "
+                    "probe_until, failures, updated_at) "
+                    "VALUES ('legacy-cloud', 7, true, true, 0, 'CLOSED', 0, '[]', :now)"
+                ).bindparams(bindparam("now", type_=DateTime(timezone=True))),
+                {"now": datetime.now(UTC)},
+            )
+            connection.execute(text("UPDATE system_state SET stopped=true WHERE id='global'"))
+            connection.execute(
+                text(
+                    "INSERT INTO audit_events "
+                    "(id, request_id, actor_id, event_type, payload_json, created_at) "
+                    "VALUES (:id, NULL, 'admin', 'SYSTEM_STOP', '{}', :now)"
+                ).bindparams(bindparam("now", type_=DateTime(timezone=True))),
+                {"id": str(uuid4()), "now": datetime.now(UTC)},
+            )
+            command.upgrade(cfg, "head")
+            command.check(cfg)
+            assert (
+                connection.execute(
+                    text("SELECT qualification FROM providers WHERE provider_id='legacy-cloud'")
+                ).scalar()
+                is None
+            )
+            with pytest.raises(AdmissionDenied):
+                admit_provider(legacy)
+            command.downgrade(cfg, "0008")
+            command.upgrade(cfg, "head")
+            command.check(cfg)
+            state = connection.execute(
+                text("SELECT used, exhausted, security_blocked FROM provider_quota_states")
+            ).one()
+            assert tuple(state) == (7, True, True)
+            assert connection.execute(text("SELECT stopped FROM system_state")).scalar()
+            assert connection.execute(text("SELECT count(*) FROM audit_events")).scalar() == 1
     finally:
         engine.dispose()
 

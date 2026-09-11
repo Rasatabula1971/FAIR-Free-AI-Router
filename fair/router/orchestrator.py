@@ -155,6 +155,7 @@ class Router:
                         client_id=request.client_id,
                         task_class=profile.task_class,
                         expected_json_schema=request.expected_schema,
+                        max_output_tokens=request.max_output_tokens,
                     )
                 ),
                 timeout=self.settings.timeout_seconds,

@@ -41,6 +41,7 @@ class Provider(Base):
     terms_last_verified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     max_data_class: Mapped[str] = mapped_column(String(32))
     request_limit: Mapped[int | None] = mapped_column(Integer)
+    qualification: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

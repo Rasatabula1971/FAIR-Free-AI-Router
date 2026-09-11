@@ -1,15 +1,17 @@
 import asyncio
 import json
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 
 import httpx
 import pytest
-from conftest import provider
+from conftest import provider, qualification
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 
 from apps.api.main import create_app
+from fair.governor.policy import AdmissionDenied
 from fair.providers.base import (
     AuthenticationFailed,
     BillingViolation,
@@ -33,7 +35,7 @@ from fair.schemas.domain import NormalizedModelRequest, QuotaSnapshot
 from fair.security.adapter import CredentialedAdapter
 from fair.security.credentials import CredentialConfigurationError
 
-NOW = datetime(2026, 9, 9, tzinfo=UTC)
+NOW = datetime.now(UTC) - timedelta(seconds=1)
 CLASSES = {
     "groq": GroqAdapter,
     "openrouter_free": OpenRouterFreeAdapter,
@@ -42,7 +44,7 @@ CLASSES = {
 
 
 def spec_for(name="groq", **changes):
-    return provider(
+    spec = provider(
         name,
         **(
             {
@@ -62,6 +64,14 @@ def spec_for(name="groq", **changes):
             | changes
         ),
     )
+    if name != "ollama_local":
+        spec.qualification = qualification(
+            name,
+            [model.model_dump() for model in spec.models],
+            reviewed_at=NOW,
+            free_status="verified_free_plan" if name == "groq" else "verified_zero_price_model",
+        )
+    return spec
 
 
 def settings(**changes):
@@ -170,7 +180,12 @@ def test_live_opt_in_required(name):
     ],
 )
 def test_unreviewed_cloud_settings_fail_before_network(changes):
-    with pytest.raises(AuthenticationFailed):
+    expected = (
+        AdmissionDenied
+        if changes.get("models") == [] or changes.get("access_class") == "FREE_LOCAL"
+        else AuthenticationFailed
+    )
+    with pytest.raises(expected):
         adapter(spec=spec_for(**changes))
 
 
@@ -512,7 +527,14 @@ def test_retry_parsing_is_bounded():
     assert duration("unknown") is None
     for value in [None, "nan", "inf", "-1", "999999999"]:
         assert retry_seconds(value, NOW.timestamp()) is None
-    assert retry_seconds("Wed, 09 Sep 2026 00:02:00 GMT", NOW.timestamp()) == 120
+    whole_second = NOW.replace(microsecond=0)
+    assert (
+        retry_seconds(
+            format_datetime(whole_second + timedelta(seconds=120), usegmt=True),
+            whole_second.timestamp(),
+        )
+        == 120
+    )
 
 
 def test_observations_only_reduce_budget_and_persist_retry(make_router):
@@ -600,7 +622,7 @@ async def test_expired_review_rechecked_before_each_transport():
     calls = []
     live = adapter(handler=lambda req: calls.append(req))
     live.clock = lambda: NOW.timestamp() + 31 * 86400
-    with pytest.raises(AuthenticationFailed):
+    with pytest.raises(AdmissionDenied):
         await live.list_models()
     assert not calls
 

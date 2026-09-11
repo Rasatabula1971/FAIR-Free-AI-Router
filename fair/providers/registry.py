@@ -47,6 +47,10 @@ class Registry:
                     row.status = "DISABLED"
             for spec in self.providers.values():
                 values = spec.model_dump(exclude={"models"})
+                # Nested Decimal prices and review timestamps need JSON-safe serialization.
+                values["qualification"] = (
+                    spec.qualification.model_dump(mode="json") if spec.qualification else None
+                )
                 row = session.get(Provider, spec.provider_id)
                 if row is None:
                     row = Provider(**values)

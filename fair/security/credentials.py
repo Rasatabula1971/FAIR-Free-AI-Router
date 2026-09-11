@@ -104,10 +104,10 @@ class APIKeys:
 
 
 class ProviderCredentials:
-    """Resolve only operator-mapped environment variables for a trusted adapter factory.
+    """Resolve only operator-mapped credentials for a trusted adapter factory.
 
-    Factories receive one SecretStr, not the resolver or the entire environment. There are
-    reviewed live factories use this boundary without receiving other providers' keys.
+    Factories receive one SecretStr, not the resolver or the entire environment.
+    Explicit env files are isolated snapshots and never modify the process environment.
     """
 
     def __init__(self, bindings):
@@ -119,10 +119,56 @@ class ProviderCredentials:
             for provider, variable in bindings.items()
         ):
             raise CredentialConfigurationError("Invalid provider credential bindings")
+        if len(set(bindings.values())) != len(bindings):
+            raise CredentialConfigurationError("Ambiguous provider credential bindings")
         self._bindings = dict(bindings)
+        self._values = None
+
+    @classmethod
+    def from_env_file(cls, bindings, path):
+        try:
+            resolver = cls(bindings)
+            with Path(path).open("rb") as stream:
+                data = stream.read(65537)
+            if len(data) > 65536:
+                raise ValueError()
+            source = data.decode("utf-8-sig")
+            if any(ord(char) < 32 and char not in "\r\n\t" for char in source):
+                raise ValueError()
+            seen, values = set(), {}
+            for line in source.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                match = re.fullmatch(r"([A-Z][A-Z0-9_]{0,127})\s*=\s*(.*)", line)
+                if match is None or match[1] in seen:
+                    raise ValueError()
+                variable, value = match.groups()
+                seen.add(variable)
+                if value.startswith(("'", '"')):
+                    quoted = re.fullmatch(r"(['\"])(.*?)\1(?:[ \t]+#.*)?", value)
+                    if quoted is None:
+                        raise ValueError()
+                    value = quoted[2]
+                else:
+                    value = re.split(r"[ \t]+#", value, maxsplit=1)[0].strip()
+                # Ignore unrelated settings; never retain other providers' secrets.
+                if variable in bindings.values() and value:
+                    if not valid_secret(value):
+                        raise ValueError()
+                    values[variable] = SecretStr(value)
+            resolver._values = values
+            return resolver
+        except Exception:
+            raise CredentialConfigurationError("Invalid provider env file") from None
 
     def for_provider(self, provider_id):
         variable = self._bindings.get(provider_id)
+        if self._values is not None:
+            value = self._values.get(variable)
+            if value is None:
+                raise CredentialConfigurationError("Provider credential unavailable")
+            return value
         value = os.environ.get(variable) if variable else None
         if not valid_secret(value):
             raise CredentialConfigurationError("Provider credential unavailable")

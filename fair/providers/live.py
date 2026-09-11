@@ -3,6 +3,7 @@
 import ipaddress
 import json
 import re
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from time import time
@@ -28,6 +29,8 @@ from fair.security.credentials import ProviderCredentials
 class LiveSettings(DTO):
     enabled: bool = False
     groq_free_plan_confirmed: bool = False
+    gemini_free_tier_confirmed: bool = False
+    gemini_max_output_tokens: int = Field(default=65536, ge=1, le=65536, strict=True)
     openrouter_free_account_confirmed: bool = False
     ollama_local_only_confirmed: bool = False
     ollama_url: str = "http://127.0.0.1:11434"
@@ -92,6 +95,8 @@ class TextAdapter:
     expected_provider = ""
     expected_access = ""
     catalog_path = "/models"
+    credential_header = "Authorization"
+    credential_prefix = "Bearer "
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -100,7 +105,7 @@ class TextAdapter:
         self._admit()
 
     def _admit(self):
-        admit_provider(self.spec)
+        admit_provider(self.spec, now=datetime.fromtimestamp(self.clock(), UTC))
         if (
             self.provider_id != self.expected_provider
             or self.spec.access_class != self.expected_access
@@ -110,6 +115,7 @@ class TextAdapter:
             raise AuthenticationFailed("LIVE_ADAPTERS_DISABLED")
         confirmations = {
             "groq": self.settings.groq_free_plan_confirmed,
+            "google_gemini_api": self.settings.gemini_free_tier_confirmed,
             "openrouter_free": self.settings.openrouter_free_account_confirmed,
             "ollama_local": self.settings.ollama_local_only_confirmed,
         }
@@ -169,7 +175,9 @@ class TextAdapter:
         self._admit()
         headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
         if self._credential is not None:
-            headers["Authorization"] = "Bearer " + self._credential.get_secret_value()
+            headers[self.credential_header] = (
+                self.credential_prefix + self._credential.get_secret_value()
+            )
         try:
             async with httpx.AsyncClient(
                 timeout=30, trust_env=False, follow_redirects=False, transport=self._transport
@@ -357,6 +365,118 @@ class OpenRouterFreeAdapter(TextAdapter):
     expected_access = "FREE_DYNAMIC"
 
 
+class GeminiAdapter(TextAdapter):
+    base_url = "https://generativelanguage.googleapis.com/v1beta"
+    expected_provider = "google_gemini_api"
+    expected_access = "FREE_RECURRING"
+    credential_header = "x-goog-api-key"
+    credential_prefix = ""
+
+    def _admit(self):
+        super()._admit()
+        if any(
+            not re.fullmatch(r"gemini-[A-Za-z0-9][A-Za-z0-9._-]{0,120}", model.model_id)
+            for model in self.spec.models
+        ):
+            raise AuthenticationFailed("EXPLICIT_GEMINI_MODEL_REQUIRED")
+
+    async def _metadata(self, model):
+        # Fetch only exact reviewed names; listing pagination cannot approve new models.
+        data = await self._json("GET", "/models/" + model.model_id)
+        methods = data.get("supportedGenerationMethods")
+        if (
+            data.get("name") != "models/" + model.model_id
+            or not isinstance(methods, list)
+            or "generateContent" not in methods
+            or type(data.get("inputTokenLimit")) is not int
+            or data["inputTokenLimit"] < model.context_window
+            or type(data.get("outputTokenLimit")) is not int
+            or data["outputTokenLimit"] <= 0
+            or (model.model_revision is not None and data.get("version") != model.model_revision)
+        ):
+            return None
+        return data
+
+    async def list_models(self):
+        result = []
+        for model in self.spec.models:
+            if model.active and await self._metadata(model) is not None:
+                result.append(model.model_copy(deep=True))
+        return result
+
+    async def complete(self, request):
+        model = next(
+            (m for m in self.spec.models if m.active and m.model_id == request.model_id), None
+        )
+        if model is None:
+            raise AuthenticationFailed("REVIEWED_GEMINI_MODEL_REQUIRED")
+        if not 1 <= request.max_output_tokens <= self.settings.gemini_max_output_tokens:
+            raise MalformedResponse("OUTPUT_BUDGET_INVALID")
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": request.task}]}],
+            "generationConfig": {
+                "candidateCount": 1,
+                "maxOutputTokens": request.max_output_tokens,
+            },
+        }
+        if request.expected_json_schema is not None:
+            payload["generationConfig"].update(
+                responseMimeType="application/json", responseJsonSchema=request.expected_json_schema
+            )
+        # Gemini publishes separate input and output limits; the output allowance does not
+        # consume the configured input capacity. Byte counting remains conservative.
+        if len(json.dumps(payload).encode()) > model.context_window:
+            raise MalformedResponse("CONTEXT_BUDGET_EXCEEDED")
+        metadata = await self._metadata(model)
+        if metadata is None:
+            raise AuthenticationFailed("REVIEWED_GEMINI_MODEL_UNAVAILABLE_OR_CHANGED")
+        if request.max_output_tokens > metadata["outputTokenLimit"]:
+            raise MalformedResponse("OUTPUT_BUDGET_EXCEEDS_MODEL_LIMIT")
+        data = await self._json("POST", "/models/" + model.model_id + ":generateContent", payload)
+        try:
+            candidates = data["candidates"]
+            if (
+                data["modelVersion"] != model.model_id
+                or not isinstance(candidates, list)
+                or len(candidates) != 1
+                or (data.get("promptFeedback") or {}).get("blockReason")
+            ):
+                raise ValueError()
+            candidate = candidates[0]
+            content = candidate["content"]
+            if content.get("role") != "model" or candidate["finishReason"] not in {
+                "STOP",
+                "MAX_TOKENS",
+            }:
+                raise ValueError()
+            parts = content["parts"]
+            if not isinstance(parts, list) or not 1 <= len(parts) <= 4096:
+                raise ValueError()
+            texts = []
+            for part in parts:
+                if (
+                    not isinstance(part, dict)
+                    or part.keys() - {"text", "thought", "thoughtSignature"}
+                    or not isinstance(part.get("text"), str)
+                    or type(part.get("thought", False)) is not bool
+                ):
+                    raise ValueError()
+                if not part.get("thought", False):
+                    texts.append(part["text"])
+            text = "".join(texts)
+            if not text.strip():
+                raise ValueError()
+            return NormalizedModelResponse(
+                provider_id=self.provider_id,
+                model_id=data["modelVersion"],
+                text=text,
+                finish_reason="stop" if candidate["finishReason"] == "STOP" else "length",
+                quota=self._quota,
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise MalformedResponse("INVALID_GEMINI_COMPLETION") from None
+
+
 class OllamaLocalAdapter(TextAdapter):
     expected_provider = "ollama_local"
     expected_access = "FREE_LOCAL"
@@ -462,17 +582,28 @@ class OllamaLocalAdapter(TextAdapter):
             raise MalformedResponse("INVALID_LOCAL_COMPLETION") from None
 
 
-def register_live(registry, specs, settings, transport=None):
-    credentials = ProviderCredentials(
-        {"groq": "GROQ_API_KEY", "openrouter_free": "OPENROUTER_API_KEY"}
-    )
+LIVE_CREDENTIAL_BINDINGS = {
+    "groq": "GROQ_API_KEY",
+    "openrouter_free": "OPENROUTER_API_KEY",
+    "google_gemini_api": "GEMINI_API_KEY",
+}
+
+
+def register_live(registry, specs, settings, transport=None, *, credentials=None):
+    if credentials is None:
+        credentials = ProviderCredentials(LIVE_CREDENTIAL_BINDINGS)
+    cloud_adapters = {
+        "groq": GroqAdapter,
+        "openrouter_free": OpenRouterFreeAdapter,
+        "google_gemini_api": GeminiAdapter,
+    }
     for spec in specs:
         if not settings.enabled or spec.status not in {"ACTIVE", "QUOTA_PRESSURE"}:
             registry.register(spec)
         elif spec.provider_id == "ollama_local":
             registry.register(spec, OllamaLocalAdapter(spec, settings, transport=transport))
-        elif spec.provider_id in {"groq", "openrouter_free"}:
-            adapter = GroqAdapter if spec.provider_id == "groq" else OpenRouterFreeAdapter
+        elif spec.provider_id in cloud_adapters:
+            adapter = cloud_adapters[spec.provider_id]
             registry.register_credentialed(
                 spec,
                 lambda secret: adapter(spec, settings, credential=secret, transport=transport),

@@ -478,3 +478,70 @@ examples and acceptance scope.
   for code commit `9000a4e`: core, PostgreSQL, native sandbox and packaged Docker API, including
   the real backup/restore drill, readiness/preflight and build-context exclusion check. Evidence:
   [run 34473296926](https://github.com/Rasatabula1971/FAIR-Free-AI-Router/actions/runs/34473296926).
+
+## Provider qualification: evidence and admission
+
+- Corrected the default strict-free candidates and documented the initial provider checks
+  in [FREE_PROVIDER_QUALIFICATION.md](FREE_PROVIDER_QUALIFICATION.md).
+- Added typed account/model qualification evidence, exact-decimal zero pricing, review
+  expiry, billing-state requirements and referenced live/zero-charge observations. Cloud
+  admission now fails closed without this evidence, including for legacy active configs.
+- Migration `0009` adds nullable JSON evidence snapshots without inventing approvals or
+  resetting quota, security, stop or audit state. Readiness expects `0009`. No operational
+  database was migrated as part of implementation.
+- Local behavior and existing cloud transport/catalog safeguards remain in force. No real
+  qualification record was created, no paid request was made and no providers were activated.
+- Validation: 767 passed, 28 environment-dependent checks skipped, two upstream deprecation
+  warnings; lint and formatting pass. Disposable SQLite migration tests preserve state and
+  audit history. PostgreSQL/Docker execution remains environment-dependent.
+- Next: implement the Gemini adapter using these shared controls. Account free-plan evidence,
+  live qualification, provider-specific quotas and independent-route proof remain outstanding.
+
+## Gemini native adapter
+
+- Implemented `google_gemini_api` using native generateContent text/JSON requests, scoped
+  `GEMINI_API_KEY` header authentication and the shared bounded HTTP transport. The new
+  `gemini_free_tier_confirmed` switch defaults to false; qualification evidence is required.
+- Exact configured model metadata, optional revision, input/output capacities and returned
+  model identity are checked. Tools, remote files, grounding, batch and paid-tier selectors
+  are not sent. Thoughts and non-text outputs are withheld; normal quality validation applies.
+- Added 60 regressions covering request isolation, exact allowlists, metadata changes, output
+  bounds, malformed/blocked responses, errors, cancellation, full-router smoke and failover.
+- Live read-only metadata checks succeeded for Gemini 2.5 Flash and Flash-Lite using the
+  saved key. No live generation was run; account free-tier confirmation remains pending.
+  No quotas or global provider rankings were inferred from context capacity.
+- No additional migration is required beyond `0009`. Provider defaults remain inactive.
+  See [the Gemini setup and limitations](LIVE_ADAPTERS.md).
+- Final validation: 827 passed, 28 environment-dependent checks skipped, two upstream
+  deprecation warnings. Lint, formatting and whitespace checks pass.
+
+## Gemini output budget
+
+- Replaced the Gemini adapter's 4,096-token cap with a configurable ceiling of 65,536,
+  additionally bounded by the exact model's reported output capacity. Input and output
+  capacities are checked separately.
+- Added `max_output_tokens` to the solve API and JavaScript SDK type, and forwarded it
+  through the router. Requests default to 1,024 tokens. Other adapter limits still apply.
+- Exact cache keys include the requested budget and now serialize Decimal qualification
+  prices, allowing reviewed cloud configurations to use the cache.
+- Offline regressions cover larger budgets, configuration limits, invalid API values and
+  full-router cache isolation. Account quotas, provider activation and credentials are unchanged.
+- Validation: 838 passed, 28 environment-dependent checks skipped, two upstream deprecation
+  warnings. Lint, formatting and whitespace checks pass.
+
+## Local env-file support for provider qualification
+
+- Added explicit `--env-file` support to the isolated provider smoke command. Only the
+  selected provider's credential is retained and passed to its adapter; application settings
+  and other keys are not injected into the environment. Existing environment loading remains
+  available when the flag is omitted.
+- Added bounded UTF-8 parsing, duplicate-name and malformed-file rejection, literal values,
+  redacted errors and no ambient-key fallback for an explicitly selected file. Missing keys
+  and failed account/model admission still prevent requests.
+- The saved local `.env` parsed successfully with Groq, Gemini and OpenRouter keys present.
+  That credential availability check made no provider calls and displayed no key values.
+- Repeated the real local Ollama `llama3.2:3b` smoke through `--env-file`: `ACCEPTED`,
+  deterministic arithmetic verified, one attempt and no paid inference. Production routing
+  state and saved credentials were not changed.
+- Validation: 858 passed, 28 environment-dependent tests skipped, two upstream deprecation
+  warnings. Lint, formatting and whitespace checks pass.

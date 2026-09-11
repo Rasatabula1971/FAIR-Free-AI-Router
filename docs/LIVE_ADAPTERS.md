@@ -1,6 +1,6 @@
 # Live text adapters (Step 8)
 
-Groq, OpenRouter explicit free models, and local Ollama now implement the common adapter
+Groq, Gemini, OpenRouter explicit free models, and local Ollama now implement the common adapter
 contract. All shipped switches remain off and provider candidates remain inactive. Demo mode
 cannot be combined with live mode. No adapter downloads models, buys credits, upgrades an
 account, or retries a paid route. Normal quality validation still determines acceptance;
@@ -15,6 +15,7 @@ the eligibility of an individual account. These first cloud adapters accept PUBL
 | Adapter | Required access | Transport and checks |
 | --- | --- | --- |
 | `groq` | `FREE_RECURRING`, operator confirms free plan | Fixed `https://api.groq.com/openai/v1`; exact configured model must be active in current catalog; no Compound/server tools. |
+| `google_gemini_api` | `FREE_RECURRING`, operator confirms Gemini free tier and reviewed zero-priced model | Fixed `https://generativelanguage.googleapis.com/v1beta`; exact model metadata, input/output limits and optional catalog revision checked before generation. |
 | `openrouter_free` | `FREE_DYNAMIC`, operator confirms free account | Fixed `https://openrouter.ai/api/v1`; exact `owner/model:free`, zero catalog prices, `/key` must report `is_free_tier: true`. Automatic routers are rejected. |
 | `ollama_local` | `FREE_LOCAL`, operator confirms local weights | Literal loopback HTTP only; existing GGUF tags and show metadata must confirm completion capability and context capacity. Optional exact model digest binding. Cloud names and remote metadata are rejected. |
 
@@ -65,6 +66,11 @@ trusted; metadata checks are not OS network isolation.
 
 ## Activation and smoke testing
 
+Cloud activation now also requires [provider/model qualification evidence](PROVIDER_QUALIFICATION.md)
+and database migration `0009`. Complete reviewed direct diagnostics and zero-charge checks
+before the full-router smoke test. The previous account flags alone no longer suffice;
+missing, stale or incomplete qualification records deny cloud admission.
+
 1. Copy configuration into a private directory, for example ignored `secrets/live-config`.
    Retain the routing and quality files when using it as `FAIR_CONFIG_DIR` for the API.
 2. Review the account and exact model. In `providers.yaml`, set the correct access class,
@@ -74,9 +80,10 @@ trusted; metadata checks are not OS network isolation.
    through `model_revision` where possible. Set a request limit only from actual account evidence.
    Do not copy another operator's attestations or fabricate approvals.
 3. In `live_adapters.yaml`, set `enabled: true` and only the applicable account confirmation:
-   `groq_free_plan_confirmed`, `openrouter_free_account_confirmed`, or
+   `groq_free_plan_confirmed`, `gemini_free_tier_confirmed`, `openrouter_free_account_confirmed`, or
    `ollama_local_only_confirmed`. Other candidates remain inactive.
-4. Inject `GROQ_API_KEY` or `OPENROUTER_API_KEY` for cloud use. These are provider-scoped
+4. Inject `GROQ_API_KEY`, `GEMINI_API_KEY` or `OPENROUTER_API_KEY` for cloud use, or give the smoke
+   command an explicit local `--env-file`. These are provider-scoped
    environment credentials, distinct from FAIR client/admin keys; they are not read from YAML,
    returned, logged or persisted by the adapter. Restart after rotation. Never commit secrets.
 5. Run one isolated smoke request, substituting the exact reviewed model:
@@ -92,6 +99,75 @@ the account's free allowance. `/healthz` reports whether a live adapter is attac
 stop is clear; it does not assert remote availability, remaining quota or model quality.
 
 ## Evidence and limits
+
+### Gemini implementation
+
+Gemini uses the native [generateContent endpoint](https://ai.google.dev/api/generate-content)
+and [`x-goog-api-key` header](https://ai.google.dev/gemini-api/docs/api-key). Keys never enter
+URLs, model payloads or configuration snapshots. Only exact reviewed `gemini-*` names are
+accepted; tuned-model paths, unrelated model families and path/query injection are rejected.
+No model becomes free or approved merely because its ID matches that syntax.
+
+Discovery fetches only configured active models using [models.get](https://ai.google.dev/api/models),
+checking identity, `generateContent` support and input/output capacity. Optional
+`model_revision` binds catalog `version`. Responses must identify the exact configured
+`modelVersion`; aliases resolving to a different name are rejected rather than silently mapped.
+Returned thought parts are withheld. Non-text/tool parts, prompt blocks, unsupported finish
+reasons, missing answers and malformed envelopes fail. A truncated answer still goes through
+the normal quality validators and is not automatically accepted.
+
+Text and [structured JSON](https://ai.google.dev/gemini-api/docs/structured-output) are supported.
+Generation sends one candidate, a bounded output budget and no tools, grounding, caching,
+batch/priority selection or file uploads. The shared transport retains bounded response size,
+timeouts, no redirects/environment proxies, redacted diagnostics and cancellation cleanup.
+HTTP 429 uses the existing cooldown/failover path and bounded Retry-After handling; it does
+not invent remaining token quotas or daily resets. Gemini token usage metadata is not yet
+mapped into a token-quota governor.
+
+FAIR requests accept `max_output_tokens` (integer, 1–65,536; default 1,024). For example:
+
+```json
+{"client_id": "my-client", "task": "Explain this design in detail.", "max_output_tokens": 8192}
+```
+
+The Gemini server ceiling is configurable with `gemini_max_output_tokens` in
+`live_adapters.yaml`, defaulting to 65,536. The adapter also checks the exact model's reported
+`outputTokenLimit` before generation. Input capacity is checked separately from this output
+allowance. Other adapters retain their existing limits. This is a maximum output budget;
+it does not increase the account's free quota or guarantee that many tokens will be returned.
+Existing response-size and timeout limits still apply. The Python SDK accepts
+`client.solve(task, max_output_tokens=8192)`; JavaScript solve options accept the same field.
+
+Gemini [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) are per project/model,
+not per API key. Actual RPM, TPM and RPD must be reviewed in AI Studio. Large model context
+capacity does not establish the free allowance or a global provider ranking. Eligibility,
+task quality and verified remaining quotas continue to govern routing; no fixed Gemini
+priority or fabricated allowance was added.
+
+The saved key successfully fetched live metadata for `gemini-2.5-flash-lite` and
+`gemini-2.5-flash`: both reported version `001`, 1,048,576 input tokens and 65,536 output
+tokens of model capacity. This is metadata/authentication evidence, not live inference or
+account-tier verification. The native adapter was tested through the full router with an
+offline transport. Free-tier confirmation and real inference qualification remain pending.
+
+For a privately reviewed Gemini configuration, the smoke command now accepts
+`--provider google_gemini_api --model <exact-reviewed-model>`. The application and smoke CLI
+do not auto-load `.env`. The smoke CLI can read the saved keys explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -m fair.providers.smoke --config-directory secrets/live-config --provider google_gemini_api --model <exact-reviewed-model> --env-file "C:\FAIR Free AI Router\.env"
+```
+
+`--env-file` reads only the selected provider's credential into an isolated snapshot. It does
+not modify environment variables, read application settings from the file, or fall back to a
+different key from the shell. Omitting the flag retains environment-based credential loading.
+Use UTF-8 `NAME=value` lines, optionally single/double quoted, blank lines and `#` comments.
+Values are literal: no shell commands, variable expansion, escape decoding or multiline values.
+Duplicate names, malformed lines and files larger than 64 KiB fail with redacted diagnostics.
+Blank/missing selected keys fail as unavailable. Saved keys do not grant account/model approval;
+the same reviewed configuration and admission checks apply.
+
+### Earlier adapter evidence
 
 On 2026-09-09, local Ollama **0.33.3** and its existing **llama3.2:3b** GGUF model completed
 the smoke request through the registry, router, governor, quality engine and SQLite persistence:

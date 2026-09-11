@@ -1,6 +1,7 @@
 import hashlib
 import json
 from datetime import datetime
+from decimal import Decimal
 from time import time
 
 from sqlalchemy import delete, func, select
@@ -15,6 +16,8 @@ from fair.schemas.domain import NormalizedModelResponse
 
 
 def canonical(value):
+    if isinstance(value, Decimal):
+        return str(value)
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, dict):

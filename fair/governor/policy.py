@@ -1,3 +1,6 @@
+from datetime import UTC, datetime
+
+from fair.governor.qualification import qualified
 from fair.schemas.domain import AccessClass, ProviderSpec, ProviderState
 
 
@@ -5,7 +8,7 @@ class AdmissionDenied(Exception):
     pass
 
 
-def admit_provider(spec: ProviderSpec) -> None:
+def admit_provider(spec: ProviderSpec, *, now: datetime | None = None) -> None:
     """Explicit checks remain effective under python -O; unknown costs fail closed."""
     eligible = (
         spec.access_class in set(AccessClass)
@@ -18,5 +21,5 @@ def admit_provider(spec: ProviderSpec) -> None:
         and spec.status in {ProviderState.ACTIVE, ProviderState.QUOTA_PRESSURE}
         and (spec.access_class == AccessClass.FREE_LOCAL or spec.terms_last_verified is not None)
     )
-    if not eligible:
+    if not eligible or not qualified(spec, now if now is not None else datetime.now(UTC)):
         raise AdmissionDenied("Provider does not satisfy free-only admission policy")

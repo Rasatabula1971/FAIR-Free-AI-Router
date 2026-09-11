@@ -114,6 +114,7 @@ async def test_expiry_and_shorter_client_ttl_do_not_slide(make_router):
         {"quality_level": "advanced"},
         {"validation": {"kind": "arithmetic", "expression": "1 + 3"}},
         {"expected_schema": {"type": "number"}},
+        {"max_output_tokens": 8192},
     ],
 )
 async def test_request_contract_changes_miss(make_router, changes):

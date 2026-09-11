@@ -1,5 +1,6 @@
 export type JSONValue = null | boolean | number | string | JSONValue[] | { [key: string]: JSONValue };
 export interface SolveOptions {
+  max_output_tokens?: number;
   priority?: 'P0' | 'P1' | 'P2' | 'P3' | 'P4';
   task_type?: string;
   quality_level?: 'commodity' | 'standard' | 'advanced' | 'high_impact_support';

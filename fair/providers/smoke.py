@@ -8,15 +8,16 @@ from pathlib import Path
 import yaml
 
 from fair.config import RoutingSettings
-from fair.providers.live import LiveSettings, register_live
+from fair.providers.live import LIVE_CREDENTIAL_BINDINGS, LiveSettings, register_live
 from fair.providers.registry import Registry
 from fair.router.orchestrator import Router
 from fair.schemas.api import SolveRequest
 from fair.schemas.db import Base, database
 from fair.schemas.domain import ProviderSpec
+from fair.security.credentials import ProviderCredentials
 
 
-async def smoke(directory, provider_id, model_id):
+async def smoke(directory, provider_id, model_id, *, env_file=None):
     directory = Path(directory)
     settings = LiveSettings.model_validate(
         yaml.safe_load((directory / "live_adapters.yaml").read_text(encoding="utf-8"))
@@ -37,7 +38,16 @@ async def smoke(directory, provider_id, model_id):
         raise ValueError("An exact reviewed model is required")
     spec.models = models
     registry = Registry()
-    register_live(registry, [spec], settings)
+    if env_file is None:
+        register_live(registry, [spec], settings)
+    else:
+        bindings = (
+            {provider_id: LIVE_CREDENTIAL_BINDINGS[provider_id]}
+            if provider_id in LIVE_CREDENTIAL_BINDINGS
+            else {}
+        )
+        credentials = ProviderCredentials.from_env_file(bindings, env_file)
+        register_live(registry, [spec], settings, credentials=credentials)
     if provider_id not in registry.adapters:
         raise ValueError("Provider is not active")
     engine, sessions = database("sqlite:///:memory:")
@@ -76,12 +86,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-directory", type=Path, required=True)
     parser.add_argument(
-        "--provider", choices=["groq", "openrouter_free", "ollama_local"], required=True
+        "--provider",
+        choices=["groq", "openrouter_free", "google_gemini_api", "ollama_local"],
+        required=True,
     )
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--env-file", type=Path, help="Read provider credentials from this local file only"
+    )
     args = parser.parse_args()
     try:
-        result = asyncio.run(smoke(args.config_directory, args.provider, args.model))
+        result = asyncio.run(
+            smoke(args.config_directory, args.provider, args.model, env_file=args.env_file)
+        )
     except Exception:
         # Provider/configuration exceptions may include secrets; do not print their text.
         print(
