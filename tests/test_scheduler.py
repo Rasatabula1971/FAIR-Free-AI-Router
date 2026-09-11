@@ -256,10 +256,10 @@ async def test_unexpected_execution_failure_releases_turn(make_router, monkeypat
     await until(lambda: router.scheduler.queued == 1)
     original = router._solve
 
-    async def fail(request, request_id, profile):
+    async def fail(request, request_id, profile, profile_dict=None, **kwargs):
         if request.client_id == "bob":
             raise RuntimeError("private failure")
-        return await original(request, request_id, profile)
+        return await original(request, request_id, profile, profile_dict, **kwargs)
 
     monkeypatch.setattr(router, "_solve", fail)
     adapter.release.set()
