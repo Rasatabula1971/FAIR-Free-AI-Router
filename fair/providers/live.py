@@ -103,7 +103,8 @@ class TextAdapter:
         self._model_cache = None
         self._model_cache_at = 0.0
         self._client = httpx.AsyncClient(
-            timeout=30, trust_env=False, follow_redirects=False, transport=transport
+            timeout=httpx.Timeout(connect=5, read=25, write=5, pool=5),
+            trust_env=False, follow_redirects=False, transport=transport,
         )
         self._admit()
 

@@ -203,7 +203,7 @@ async def test_review_service_failure_is_normalized_and_never_dispatches(make_ro
 
 def test_direct_quality_call_without_trusted_registry_cannot_approve_policy():
     req = reviewed_request()
-    profile = profile_task(req, {"standard": 82})
+    profile = profile_task(req, {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92})
     report = evaluate(
         req,
         profile,

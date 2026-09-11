@@ -1,6 +1,9 @@
 import asyncio
+import logging
 
 from fair.governor.policy import AdmissionDenied, admit_provider
+
+logger = logging.getLogger(__name__)
 
 PRIVACY = {
     name: index for index, name in enumerate(["PUBLIC", "INTERNAL", "CONFIDENTIAL", "RESTRICTED"])
@@ -21,13 +24,16 @@ class Selector:
             try:
                 admit_provider(spec)
             except AdmissionDenied:
+                logger.debug("Provider %s rejected by admission policy", spec.provider_id)
                 continue
             if spec.provider_id not in self.registry.adapters:
                 continue
             avail, remaining = await self.quota.available_with_remaining(spec)
             if not avail:
+                logger.debug("Provider %s unavailable (quota/circuit)", spec.provider_id)
                 continue
             if PRIVACY[request.privacy_class] > PRIVACY[spec.max_data_class]:
+                logger.debug("Provider %s excluded by privacy class", spec.provider_id)
                 continue
             headroom = remaining / spec.request_limit if spec.request_limit else 0.5
             for model in spec.models:
@@ -65,7 +71,12 @@ class Selector:
                     + self.settings.quota_weight * headroom
                     + self.settings.reliability_weight * reliability
                 )
+                logger.debug(
+                    "Candidate %s/%s score=%.4f (quality=%.3f quota=%.3f reliability=%.3f)",
+                    spec.provider_id, model.model_id, score, quality, headroom, reliability,
+                )
                 candidates.append((score, spec, model))
+        logger.debug("Selection produced %d candidates", len(candidates))
         return sorted(
             candidates, key=lambda item: (-item[0], item[1].provider_id, item[2].model_id)
         )

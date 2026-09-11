@@ -518,6 +518,7 @@ async def test_live_failures_reduce_benchmark_ranking_without_changing_qualifica
         {"standard": True},
         {"standard": 90, "advanced": 80},
         {"unknown": 75},
+        {"commodity": 75, "standard": 82},
     ],
 )
 def test_invalid_threshold_configuration_rejected(thresholds):
@@ -526,8 +527,11 @@ def test_invalid_threshold_configuration_rejected(thresholds):
 
 
 def test_custom_threshold_sweep_uses_operator_values():
-    report = run_benchmark(dataset(), now=NOW, thresholds={"standard": 85})
-    assert report["diagnostics"][0]["threshold_sweep"][0]["threshold"] == 85
+    thresholds = {"commodity": 75, "standard": 85, "advanced": 88, "high_impact_support": 92}
+    report = run_benchmark(dataset(), now=NOW, thresholds=thresholds)
+    sweep = report["diagnostics"][0]["threshold_sweep"]
+    standard = next(s for s in sweep if s["quality_level"] == "standard")
+    assert standard["threshold"] == 85
 
 
 async def test_unqualified_alias_does_not_mask_missing_independent_checker(make_router):

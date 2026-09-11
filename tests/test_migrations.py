@@ -25,7 +25,7 @@ def recovery_roundtrip(connection):
     sessions = sessionmaker(bind=connection, expire_on_commit=False)
     registry = Registry()
     registry.register(provider())
-    router = Router(registry, RoutingSettings(), {"standard": 82}, sessions)
+    router = Router(registry, RoutingSettings(), {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}, sessions)
     router.stopped = True
     with sessions.begin() as session:
         row = session.scalar(

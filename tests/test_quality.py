@@ -164,7 +164,7 @@ def test_citation_hard_reject_overrides_correct_arithmetic(source, quote, reason
         text="0.3",
         citations=[{"source_id": source, "quote": quote}],
     )
-    report = evaluate(request, profile_task(request, {"standard": 82}), response)
+    report = evaluate(request, profile_task(request, {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}), response)
     assert report.hard_reject and report.overall_score == 0
     assert reason in report.reject_reasons
 
@@ -180,7 +180,7 @@ def test_structured_contradiction_hard_rejected():
             {"subject": "Sample", "predicate": "color", "value": "blue"},
         ],
     )
-    report = evaluate(request, profile_task(request, {"standard": 82}), response)
+    report = evaluate(request, profile_task(request, {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}), response)
     assert "MATERIAL_CONTRADICTION" in report.reject_reasons
 
 

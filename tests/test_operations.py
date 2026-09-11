@@ -125,7 +125,7 @@ def preflight_config(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     values = {
         "routing.yaml": {},
-        "quality_thresholds.yaml": {"standard": 82},
+        "quality_thresholds.yaml": {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
         "providers.yaml": {"providers": []},
         "live_adapters.yaml": {"enabled": False},
     }

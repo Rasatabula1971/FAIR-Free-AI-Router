@@ -72,6 +72,7 @@ class ExactCache:
         key = self.key(request, profile)
         router, now = self.router, self.clock()
         if key is None or router.stopped:
+            logger.debug("Cache lookup skipped for %s (key=%s stopped=%s)", request_id, key is not None, router.stopped)
             return None
 
         def _do():
@@ -175,8 +176,12 @@ class ExactCache:
                         "paid_inference_executed": False,
                     },
                 )
+                logger.debug("Cache hit for %s from source %s", request_id, source.id)
                 return result
-        return await asyncio.to_thread(_do)
+        result = await asyncio.to_thread(_do)
+        if result is None:
+            logger.debug("Cache miss for %s", request_id)
+        return result
 
     async def put(self, request, profile, result):
         key = self.key(request, profile)

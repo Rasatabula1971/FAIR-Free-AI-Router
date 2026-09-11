@@ -40,7 +40,7 @@ def restartable(tmp_path):
         Base.metadata.create_all(engine)
         registry = Registry()
         registry.register(spec or provider(), adapter or MockAdapter("a"))
-        router = Router(registry, RoutingSettings(), {"standard": 82}, sessions)
+        router = Router(registry, RoutingSettings(), {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}, sessions)
         return router
 
     yield start
