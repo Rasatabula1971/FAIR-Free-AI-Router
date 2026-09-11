@@ -354,11 +354,19 @@ async def test_shadow_rechecks_quota_after_waiting_behind_user_work(make_router)
             await release.wait()
         return await original(value)
 
+    shadow_gate = asyncio.Event()
+    real_shadow = router._shadow
+
+    async def gated_shadow(req, parent):
+        await shadow_gate.wait()
+        return await real_shadow(req, parent)
+
+    router._shadow = gated_shadow
+    await router.solve(request())
     router.registry.adapters["a"].complete = held
-    tenth = asyncio.create_task(router.solve(request()))
     user = asyncio.create_task(router.solve(request("bob")))
     await started.wait()
-    await tenth
+    shadow_gate.set()
     async with asyncio.timeout(15):
         while router.scheduler.queued == 0:
             await asyncio.sleep(0)
