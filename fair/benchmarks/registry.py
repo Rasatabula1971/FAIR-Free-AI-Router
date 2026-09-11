@@ -1,5 +1,6 @@
 """Server-managed workload qualification; clients cannot submit their own ratings."""
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from fair.benchmarks.contracts import BenchmarkFile
 from fair.benchmarks.runner import fingerprint
 from fair.quality.version import ENGINE_VERSION
 from fair.schemas.domain import BenchmarkCheck
+
+logger = logging.getLogger(__name__)
 
 
 class BenchmarkRegistry:
@@ -46,6 +49,9 @@ class BenchmarkRegistry:
         try:
             return self._assess(result, request, model, policy)
         except Exception:
+            logger.warning(
+                "Benchmark assessment failed for %s/%s", result.provider_id, result.model_id, exc_info=True
+            )
             result.state = "SERVICE_FAILED"
             return result
 

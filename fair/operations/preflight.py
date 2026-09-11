@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -18,12 +19,15 @@ from fair.schemas.db import database
 from fair.schemas.domain import ProviderSpec
 from fair.security.credentials import APIKeys
 
+logger = logging.getLogger(__name__)
+
 
 def check(directory, *, check_database=False, allow_demo=False):
     checks = {}
     try:
         checks["api_credentials"] = APIKeys.load().configured
     except Exception:
+        logger.warning("API credential check failed", exc_info=True)
         checks["api_credentials"] = False
     checks["execution_mode"] = os.environ.get("FAIR_DEMO_MODE") != "1" or allow_demo
     try:
@@ -53,6 +57,7 @@ def check(directory, *, check_database=False, allow_demo=False):
             raise ValueError()
         checks["routing_and_provider_configuration"] = True
     except Exception:
+        logger.warning("Routing/provider configuration check failed", exc_info=True)
         checks["routing_and_provider_configuration"] = False
     if check_database:
         engine = None
@@ -77,6 +82,7 @@ def check(directory, *, check_database=False, allow_demo=False):
             with sessions() as session:
                 checks["database_schema"] = schema_current(session)
         except Exception:
+            logger.warning("Database schema check failed", exc_info=True)
             checks["database_schema"] = False
         finally:
             if engine is not None:

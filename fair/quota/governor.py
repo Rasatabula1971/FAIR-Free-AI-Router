@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from math import isfinite
 from time import time
 
@@ -7,6 +8,8 @@ from sqlalchemy import select
 from fair.config import RoutingSettings
 from fair.constants import SECONDS_IN_DAY
 from fair.schemas.db import ProviderHealthEvent, ProviderQuotaState, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 class QuotaGovernor:
@@ -43,12 +46,13 @@ class QuotaGovernor:
             row.exhausted = False
             row.reset_at = None
             self._event(session, row, "QUOTA_RESET")
+            logger.info("Quota reset for provider %s", row.provider_id)
         if row.circuit_state == "HALF_OPEN" and now >= row.probe_until:
-            # An abandoned probe is not success, including after a process crash.
             row.circuit_state = "OPEN"
             row.blocked_until = now + self.settings.cooldown_seconds
             row.probe_until = 0
             self._event(session, row, "PROBE_EXPIRED")
+            logger.info("Probe expired for provider %s, circuit reopened", row.provider_id)
 
     async def state(self, provider_id):
         def _do():
@@ -106,6 +110,7 @@ class QuotaGovernor:
         row.circuit_state = "OPEN"
         row.blocked_until = self.clock() + self.settings.cooldown_seconds
         row.probe_until = 0
+        logger.warning("Circuit opened for provider %s", row.provider_id)
 
     async def throttle(self, provider_id, retry_after=None):
         def _do():
@@ -171,6 +176,7 @@ class QuotaGovernor:
                 row = self._row(session, provider_id)
                 row.security_blocked = True
                 self._event(session, row, "AUTHENTICATION_FAILED")
+                logger.error("Provider %s security-blocked", provider_id)
         await asyncio.to_thread(_do)
 
     async def failure(self, provider_id):

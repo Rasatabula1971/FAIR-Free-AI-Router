@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from datetime import datetime
 from time import time
 
@@ -13,6 +14,8 @@ from fair.quality.version import ENGINE_VERSION
 from fair.schemas.api import SolveResponse
 from fair.schemas.db import CacheEntry, FeedbackEvent, ProviderQuotaState, TaskRequest
 from fair.schemas.domain import NormalizedModelResponse
+
+logger = logging.getLogger(__name__)
 
 
 def canonical(value):

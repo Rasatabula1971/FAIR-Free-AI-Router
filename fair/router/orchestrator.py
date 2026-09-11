@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from time import monotonic
 from uuid import uuid4
 
@@ -33,6 +34,8 @@ from fair.schemas.domain import (
     NormalizedModelResponse,
     SourcePolicyReport,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Router:
@@ -71,6 +74,7 @@ class Router:
     def stopped(self, value):
         self.kill_switch.set(value)
         if value:
+            logger.critical("System stopped — rejecting all pending requests")
             self.scheduler.reject_pending("SYSTEM_STOPPED")
 
     def audit(self, session, request_id, client_id, event_type, payload):
@@ -149,7 +153,7 @@ class Router:
         try:
             await asyncio.to_thread(_audit_executing)
         except SQLAlchemyError:
-            pass
+            logger.warning("Failed to audit EXECUTING for request %s", request_id, exc_info=True)
         try:
             response = await asyncio.wait_for(
                 self.registry.adapters[spec.provider_id].complete(
@@ -172,11 +176,12 @@ class Router:
         except BillingViolation:
             billing_violation = True
             self.stopped = True
+            logger.critical("Billing violation from provider %s — system stopped", spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
             try:
                 await self.quota.block_security(spec.provider_id)
             except SQLAlchemyError:
-                pass
+                logger.warning("Failed to block provider %s after billing violation", spec.provider_id, exc_info=True)
 
             def _audit_billing():
                 with self.sessions.begin() as session:
@@ -190,38 +195,42 @@ class Router:
             try:
                 await asyncio.to_thread(_audit_billing)
             except SQLAlchemyError:
-                pass
+                logger.warning("Failed to audit billing violation for request %s", request_id, exc_info=True)
         except QuotaExceeded as error:
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
+            logger.info("Quota exhausted for provider %s", spec.provider_id)
             try:
                 await self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
             except SQLAlchemyError:
-                pass
+                logger.warning("Failed to persist quota exhaustion for provider %s", spec.provider_id, exc_info=True)
         except RateLimited as error:
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
+            logger.info("Rate limited by provider %s, retry_after=%s", spec.provider_id, error.retry_after)
             try:
                 await self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             except SQLAlchemyError:
-                pass
+                logger.warning("Failed to persist throttle for provider %s", spec.provider_id, exc_info=True)
         except AuthenticationFailed:
             disposition, error_type = "INFRA_FAILURE", "AUTHENTICATION_FAILED"
+            logger.error("Authentication failed for provider %s", spec.provider_id)
             try:
                 await self.quota.block_security(spec.provider_id)
             except SQLAlchemyError:
-                pass
+                logger.warning("Failed to block provider %s after auth failure", spec.provider_id, exc_info=True)
         except asyncio.CancelledError:
             cancelled = True
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
             try:
                 await self.quota.failure(spec.provider_id)
             except (SQLAlchemyError, asyncio.CancelledError):
-                pass
+                logger.debug("Could not record failure for provider %s after cancellation", spec.provider_id)
         except Exception:
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
+            logger.warning("Provider %s unavailable for request %s", spec.provider_id, request_id, exc_info=True)
             try:
                 await self.quota.failure(spec.provider_id)
             except SQLAlchemyError:
-                pass
+                logger.warning("Failed to record failure for provider %s", spec.provider_id, exc_info=True)
         else:
             try:
                 source_report = self._source_report(request)
@@ -630,6 +639,7 @@ class Router:
             try:
                 cached = await self.cache.get(request, profile, request_id)
             except SQLAlchemyError:
+                logger.warning("Cache lookup failed for request %s", request_id, exc_info=True)
                 cached = None
             if cached is not None:
                 return cached
@@ -877,6 +887,7 @@ class Router:
             try:
                 await self.cache.put(request, profile, result)
             except SQLAlchemyError:
+                logger.warning("Cache write failed for request %s", request_id, exc_info=True)
                 try:
                     def _audit_cache_fail():
                         with self.sessions.begin() as session:
@@ -885,5 +896,5 @@ class Router:
                             )
                     await asyncio.to_thread(_audit_cache_fail)
                 except SQLAlchemyError:
-                    pass
+                    logger.warning("Failed to audit cache write failure for request %s", request_id)
         return result
