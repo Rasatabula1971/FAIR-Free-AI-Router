@@ -1,6 +1,5 @@
 """Add indexes on frequently queried columns."""
 
-import sqlalchemy as sa
 from alembic import op
 
 revision = "0009"

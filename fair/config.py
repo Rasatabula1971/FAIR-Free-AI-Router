@@ -4,8 +4,8 @@ from pathlib import Path
 import yaml
 from pydantic import Field
 
-from fair.constants import SECONDS_IN_DAY
 from fair.benchmarks.contracts import BenchmarkPolicy
+from fair.constants import SECONDS_IN_DAY
 from fair.quality.contracts import SourcePolicy
 from fair.router.scheduler import SchedulerSettings
 from fair.schemas.domain import DTO

@@ -562,6 +562,8 @@ class Router:
                 ),
             )
 
+            reason_code = error.reason
+
             def _persist_rejected():
                 with self.sessions.begin() as session:
                     row = session.get(TaskRequest, request_id)
@@ -571,7 +573,7 @@ class Router:
                         request_id,
                         request.client_id,
                         "FAILED",
-                        {"reason_code": error.reason},
+                        {"reason_code": reason_code},
                     )
             await asyncio.to_thread(_persist_rejected)
             return result
