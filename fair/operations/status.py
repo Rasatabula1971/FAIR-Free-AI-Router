@@ -1,5 +1,6 @@
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from sqlalchemy import func, select, text
 
@@ -7,7 +8,20 @@ from fair.schemas.db import AuditEvent, CacheEntry, ProviderQuotaState, SystemSt
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_REVISION = "0010"
+
+def _discover_schema_revision():
+    versions_dir = Path(__file__).resolve().parents[2] / "migrations" / "versions"
+    if not versions_dir.is_dir():
+        return "0010"
+    revisions = sorted(
+        p.stem.split("_", 1)[0]
+        for p in versions_dir.iterdir()
+        if p.suffix == ".py" and not p.name.startswith("_")
+    )
+    return revisions[-1] if revisions else "0010"
+
+
+SCHEMA_REVISION = _discover_schema_revision()
 
 
 def schema_current(session):
