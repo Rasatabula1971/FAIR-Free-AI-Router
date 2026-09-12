@@ -285,7 +285,10 @@ class Router:
         if cancelled:
             def _mark_cancelled():
                 with self.sessions.begin() as session:
-                    session.get(TaskRequest, request_id).status = "CANCELLED"
+                    row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
+                    row.status = "CANCELLED"
                     self.audit(session, request_id, request.client_id, "CANCELLED", {})
             await asyncio.to_thread(_mark_cancelled)
             raise asyncio.CancelledError
@@ -530,7 +533,10 @@ class Router:
 
             def _mark_queued():
                 with self.sessions.begin() as session:
-                    session.get(TaskRequest, request_id).status = "QUEUED"
+                    row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
+                    row.status = "QUEUED"
                     self.audit(
                         session,
                         request_id,
@@ -581,6 +587,8 @@ class Router:
             def _persist_rejected():
                 with self.sessions.begin() as session:
                     row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
                     row.status, row.result_json = result.status, result.model_dump(mode="json")
                     self.audit(
                         session,
@@ -597,6 +605,8 @@ class Router:
             def _persist_error():
                 with self.sessions.begin() as session:
                     row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
                     if row.status != status:
                         row.status = status
                         self.audit(session, request_id, request.client_id, status, {})
@@ -624,7 +634,10 @@ class Router:
 
         def _mark_profiled():
             with self.sessions.begin() as session:
-                session.get(TaskRequest, request_id).status = "PROFILED"
+                row = session.get(TaskRequest, request_id)
+                if row is None:
+                    raise RuntimeError(f"TaskRequest {request_id} not found")
+                row.status = "PROFILED"
                 session.add(ProfileRow(request_id=request_id, **profile_dict))
                 self.audit(
                     session,
@@ -806,6 +819,8 @@ class Router:
             with self.sessions.begin() as session:
                 result_dict = result.model_dump(mode="json")
                 row = session.get(TaskRequest, request_id)
+                if row is None:
+                    raise RuntimeError(f"TaskRequest {request_id} not found")
                 row.status, row.result_json = result.status, result_dict
                 if shadow_of is not None:
                     agreement, basis = (

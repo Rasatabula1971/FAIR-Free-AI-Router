@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,6 +26,8 @@ from fair.schemas.db import AuditEvent, ModelTaskPerformance, database
 from fair.schemas.db import TaskRequest as TaskRow
 from fair.schemas.domain import ProviderSpec
 from fair.security.credentials import APIKeys
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(router=None, client_keys=None, admin_key=None):
@@ -175,6 +178,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
         try:
             return snapshot(app.state.router, credentials)
         except Exception:
+            logger.exception("Operational status snapshot failed")
             return JSONResponse(
                 status_code=503, content={"detail": "OPERATIONAL_STATUS_UNAVAILABLE"}
             )
