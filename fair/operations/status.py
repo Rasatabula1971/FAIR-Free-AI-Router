@@ -36,7 +36,7 @@ def readiness(router, credentials):
 
 def snapshot(router, credentials, now=None):
     now = now or datetime.now(UTC)
-    with router.sessions() as session:
+    with router.sessions.begin() as session:
         current = schema_current(session)
         state = session.get(SystemState, "global")
         rows = session.execute(

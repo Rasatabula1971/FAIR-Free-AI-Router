@@ -422,6 +422,7 @@ class Router:
 
     async def _shadow(self, request, parent):
         if self.scheduler.closed or await self.is_stopped():
+            logger.debug("Shadow skipped: system stopped or closed")
             return
 
         def _count():
@@ -447,6 +448,7 @@ class Router:
                 return foreground, spent
         foreground, spent = await asyncio.to_thread(_count)
         if spent + 1 > foreground * self.settings.shadow_max_rate:
+            logger.debug("Shadow skipped: rate limit (%d/%d)", spent, foreground)
             return
         profile = profile_task(request, self.thresholds)
         if not await self.selector.candidates(
@@ -455,7 +457,9 @@ class Router:
             set(),
             eligible=lambda spec, model: self._shadow_candidate(parent, spec, model),
         ):
+            logger.debug("Shadow skipped: no eligible candidates")
             return
+        logger.info("Shadow execution started for client %s", request.client_id)
         await self.solve(
             request.model_copy(update={"priority": "P4", "cross_check_required": False}),
             shadow_of=parent,
