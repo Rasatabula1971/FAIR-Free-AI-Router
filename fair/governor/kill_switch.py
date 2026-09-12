@@ -24,6 +24,8 @@ class KillSwitch:
             )
             if state is None:
                 raise RuntimeError("System state not initialized")
+            if state.stopped == stopped:
+                return
             state.stopped = stopped
             session.add(
                 AuditEvent(

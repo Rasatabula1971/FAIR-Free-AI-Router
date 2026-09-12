@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+import logging
 from datetime import UTC
 from math import isfinite
 from time import time
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 from pydantic import AwareDatetime, Field, model_validator
 from sqlalchemy import String, cast, or_, select
@@ -86,6 +89,7 @@ class Recovery:
     def _now(self):
         now = self.clock()
         if not isfinite(now):
+            logger.error("Recovery clock returned non-finite value")
             raise RecoveryDenied("RECOVERY_CLOCK_UNAVAILABLE", 503)
         return now
 
@@ -94,8 +98,10 @@ class Recovery:
             select(SystemState).where(SystemState.id == "global").with_for_update()
         )
         if state is None or not state.stopped:
+            logger.warning("Recovery denied: system not stopped")
             raise RecoveryDenied("SYSTEM_MUST_BE_STOPPED")
         if self.router.inflight or self.router.scheduler.active is not None:
+            logger.warning("Recovery denied: requests still in flight")
             raise RecoveryDenied("REQUESTS_STILL_IN_FLIGHT")
 
     def inspect_provider(self, provider_id):
@@ -108,8 +114,10 @@ class Recovery:
 
     def provider(self, provider_id, request):
         if provider_id not in self.router.registry.providers:
+            logger.warning("Recovery denied: provider %s not found", provider_id)
             raise RecoveryDenied("PROVIDER_NOT_FOUND", 404)
         now = self._now()
+        logger.info("Provider recovery started: %s action=%s", provider_id, request.action)
         with self.router.sessions.begin() as session:
             self._maintenance(session)
             row = session.scalar(
@@ -166,10 +174,12 @@ class Recovery:
                     circuit_state=row.circuit_state,
                 )
             )
+        logger.warning("Provider recovery completed: %s action=%s", provider_id, request.action)
         return report
 
     def requests(self, request):
         if request.created_before.timestamp() > self._now():
+            logger.warning("Recovery denied: cutoff %s is in the future", request.created_before)
             raise RecoveryDenied("INVALID_RECOVERY_CUTOFF")
         with self.router.sessions.begin() as session:
             self._maintenance(session)
@@ -220,4 +230,5 @@ class Recovery:
             session.add(
                 AuditEvent(actor_id="admin", event_type="REQUEST_RECOVERY", payload_json=result)
             )
+        logger.warning("Request recovery completed: %d requests recovered", len(rows))
         return result

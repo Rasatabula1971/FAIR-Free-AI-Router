@@ -64,6 +64,18 @@ async def test_stop_survives_restart_and_resume_is_audited(restartable):
         assert events.count("SYSTEM_STOP") == events.count("SYSTEM_RESUME") == 1
 
 
+async def test_stop_is_idempotent_and_resume_is_idempotent(restartable):
+    router = restartable()
+    router.stopped = True
+    router.stopped = True
+    router.stopped = False
+    router.stopped = False
+    with router.sessions() as session:
+        events = list(session.scalars(select(AuditEvent.event_type)))
+        assert events.count("SYSTEM_STOP") == 1
+        assert events.count("SYSTEM_RESUME") == 1
+
+
 async def test_reservation_survives_restart_and_config_reconcile(restartable):
     first = restartable(provider(request_limit=1))
     await first.solve(request())

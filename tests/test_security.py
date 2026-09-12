@@ -131,6 +131,8 @@ def test_provider_credentials_are_scoped_redacted_and_governed(monkeypatch):
     assert called == []
     registry.register_credentialed(provider(), lambda secret: MockAdapter("a"), credentials)
     assert SECRET not in registry.providers["a"].model_dump_json()
+    with pytest.raises(ValueError, match="Duplicate"):
+        registry.register_credentialed(provider(), lambda secret: MockAdapter("a"), credentials)
 
 
 @pytest.mark.parametrize(
