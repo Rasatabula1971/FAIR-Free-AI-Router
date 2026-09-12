@@ -30,6 +30,8 @@ class CredentialedAdapter:
             raise AuthenticationFailed("CREDENTIAL_CHECK_DEPTH_EXCEEDED")
         if isinstance(value, BaseModel):
             value = value.model_dump(mode="json")
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
         if isinstance(value, str):
             if self._credential.get_secret_value() in value:
                 logger.error("Credential exposure blocked for provider %s", self.provider_id)

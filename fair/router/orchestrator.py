@@ -237,11 +237,10 @@ class Router:
         else:
             try:
                 source_report = self._source_report(request)
-                quality = (
-                    evaluate(request, profile, response, source_review=source_report)
-                    if source_report.state != "NOT_REQUESTED"
-                    else evaluate(request, profile, response)
-                )
+                eval_kwargs = {}
+                if source_report.state != "NOT_REQUESTED":
+                    eval_kwargs["source_review"] = source_report
+                quality = evaluate(request, profile, response, **eval_kwargs)
                 if (
                     request.validation is not None
                     and request.validation.kind == "native_python_function"
@@ -249,7 +248,8 @@ class Router:
                     and not quality.hard_reject
                 ):
                     native_result = await self.sandbox.validate(response.text, request.validation)
-                    quality = evaluate(request, profile, response, native_result=native_result)
+                    eval_kwargs["native_result"] = native_result
+                    quality = evaluate(request, profile, response, **eval_kwargs)
                     quality.validator_results["sandbox_image_id"] = self.sandbox.image_id
             except asyncio.CancelledError:
                 cancelled = True
