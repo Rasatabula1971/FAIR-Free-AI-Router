@@ -1,4 +1,6 @@
 import logging
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -30,18 +32,27 @@ def schema_current(session):
     }
 
 
+_schema_cache = {}
+_schema_lock = threading.Lock()
+_SCHEMA_TTL = 30.0
+
+
 def readiness(router, credentials):
+    if router.scheduler.closed or not credentials.configured:
+        return {"status": "not_ready"}
+    now = time.monotonic()
+    key = id(router)
+    with _schema_lock:
+        cached = _schema_cache.get(key)
+        schema_ok = cached[0] if cached is not None and now < cached[1] else None
     try:
         with router.sessions() as session:
-            current = schema_current(session)
+            if schema_ok is None:
+                schema_ok = schema_current(session)
+                with _schema_lock:
+                    _schema_cache[key] = (schema_ok, now + _SCHEMA_TTL)
             state = session.get(SystemState, "global")
-            ready = (
-                current
-                and state is not None
-                and not state.stopped
-                and not router.scheduler.closed
-                and credentials.configured
-            )
+            ready = schema_ok and state is not None and not state.stopped
         return {"status": "ready" if ready else "not_ready"}
     except Exception:
         logger.warning("Readiness check failed", exc_info=True)

@@ -207,6 +207,9 @@ class Recovery:
                     "request_id": row.id,
                     "status": "FAILED",
                     "reason_code": "PROCESS_INTERRUPTED",
+                    "attempts": [],
+                    "minimum_required": 0,
+                    "verification_state": "UNVERIFIED",
                     "output": None,
                     "paid_inference_executed": False,
                 }
