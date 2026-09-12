@@ -25,7 +25,7 @@ def canonical(value):
         return {key: canonical(item) for key, item in value.items()}
     if isinstance(value, set):
         return sorted(canonical(item) for item in value)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [canonical(item) for item in value]
     return value
 

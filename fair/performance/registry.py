@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, timedelta
 
 from sqlalchemy import select
@@ -6,6 +7,8 @@ from sqlalchemy import select
 from fair.config import RoutingSettings
 from fair.constants import SECONDS_IN_DAY
 from fair.schemas.db import FeedbackEvent, ModelTaskPerformance, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 class PerformanceRegistry:
@@ -72,20 +75,13 @@ class PerformanceRegistry:
             else "STABLE"
         )
         tested = row.last_quality_at
+        if tested is not None and tested.tzinfo is None:
+            logger.warning("Naive datetime in last_quality_at for %s/%s — assuming UTC",
+                           row.provider_id, row.model_id)
+            tested = tested.replace(tzinfo=UTC)
         age_days = (
-            max(
-                0,
-                (
-                    self.clock()
-                    - (
-                        tested.astimezone(UTC)
-                        if tested and tested.tzinfo
-                        else tested.replace(tzinfo=UTC)
-                    )
-                ).total_seconds()
-                / SECONDS_IN_DAY,
-            )
-            if tested
+            max(0, (self.clock() - tested.astimezone(UTC)).total_seconds() / SECONDS_IN_DAY)
+            if tested is not None
             else None
         )
         confidence = (
