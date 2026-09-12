@@ -200,17 +200,30 @@ class ExactCache:
                 session.execute(delete(CacheEntry).where(CacheEntry.expires_at <= now))
                 existing = session.get(CacheEntry, (request.client_id, key))
                 if existing is None:
-                    count = session.scalar(select(func.count()).select_from(CacheEntry))
-                    if count >= router.settings.cache_max_entries:
-                        oldest = session.scalars(
-                            select(CacheEntry)
+                    at_capacity = (
+                        session.scalars(
+                            select(CacheEntry.client_id)
+                            .order_by(CacheEntry.created_at)
+                            .offset(router.settings.cache_max_entries - 1)
+                            .limit(1)
+                        ).first()
+                        is not None
+                    )
+                    if at_capacity:
+                        oldest = session.execute(
+                            select(CacheEntry.client_id, CacheEntry.key)
                             .order_by(
                                 CacheEntry.created_at, CacheEntry.client_id, CacheEntry.key
                             )
-                            .limit(count - router.settings.cache_max_entries + 1)
-                        )
-                        for old in oldest:
-                            session.delete(old)
+                            .limit(1)
+                        ).first()
+                        if oldest:
+                            session.execute(
+                                delete(CacheEntry).where(
+                                    CacheEntry.client_id == oldest[0],
+                                    CacheEntry.key == oldest[1],
+                                )
+                            )
                     existing = CacheEntry(client_id=request.client_id, key=key)
                     session.add(existing)
                 existing.source_request_id = result.request_id
