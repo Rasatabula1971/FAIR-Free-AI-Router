@@ -23,20 +23,26 @@ class CredentialedAdapter:
         self._adapter, self._credential = adapter, credential
         self.live_inference = getattr(adapter, "live_inference", False)
 
-    def _check(self, value):
+    _MAX_CHECK_DEPTH = 32
+
+    def _check(self, value, _depth=0):
+        if _depth > self._MAX_CHECK_DEPTH:
+            raise AuthenticationFailed("CREDENTIAL_CHECK_DEPTH_EXCEEDED")
         if isinstance(value, BaseModel):
             value = value.model_dump(mode="json")
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
         if isinstance(value, str):
             if self._credential.get_secret_value() in value:
                 logger.error("Credential exposure blocked for provider %s", self.provider_id)
                 raise AuthenticationFailed("CREDENTIAL_EXPOSURE_BLOCKED")
         elif isinstance(value, dict):
             for key, item in value.items():
-                self._check(key)
-                self._check(item)
+                self._check(key, _depth + 1)
+                self._check(item, _depth + 1)
         elif isinstance(value, (list, tuple)):
             for item in value:
-                self._check(item)
+                self._check(item, _depth + 1)
 
     async def _call(self, method, *args):
         self._check(args)

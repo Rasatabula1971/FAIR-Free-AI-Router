@@ -23,12 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 def check(directory, *, check_database=False, allow_demo=False):
-    checks = {}
+    checks, errors = {}, {}
     try:
         checks["api_credentials"] = APIKeys.load().configured
-    except Exception:
+    except Exception as error:
         logger.warning("API credential check failed", exc_info=True)
         checks["api_credentials"] = False
+        errors["api_credentials"] = type(error).__name__
     checks["execution_mode"] = os.environ.get("FAIR_DEMO_MODE") != "1" or allow_demo
     try:
         directory = Path(directory)
@@ -56,9 +57,10 @@ def check(directory, *, check_database=False, allow_demo=False):
         if live.enabled and os.environ.get("FAIR_DEMO_MODE") == "1":
             raise ValueError()
         checks["routing_and_provider_configuration"] = True
-    except Exception:
+    except Exception as error:
         logger.warning("Routing/provider configuration check failed", exc_info=True)
         checks["routing_and_provider_configuration"] = False
+        errors["routing_and_provider_configuration"] = type(error).__name__
     if check_database:
         engine = None
         try:
@@ -81,18 +83,22 @@ def check(directory, *, check_database=False, allow_demo=False):
             engine, sessions = database(url)
             with sessions() as session:
                 checks["database_schema"] = schema_current(session)
-        except Exception:
+        except Exception as error:
             logger.warning("Database schema check failed", exc_info=True)
             checks["database_schema"] = False
+            errors["database_schema"] = type(error).__name__
         finally:
             if engine is not None:
                 engine.dispose()
-    return {
+    result = {
         "status": "PASS" if all(checks.values()) else "FAIL",
         "database_checked": check_database,
         "checks": checks,
         "provider_calls": 0,
     }
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def main():

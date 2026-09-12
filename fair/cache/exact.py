@@ -25,7 +25,7 @@ def canonical(value):
         return {key: canonical(item) for key, item in value.items()}
     if isinstance(value, set):
         return sorted(canonical(item) for item in value)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [canonical(item) for item in value]
     return value
 
@@ -72,6 +72,7 @@ class ExactCache:
         key = self.key(request, profile)
         router, now = self.router, self.clock()
         if key is None or router.stopped:
+            logger.debug("Cache lookup skipped for %s (key=%s stopped=%s)", request_id, key is not None, router.stopped)
             return None
 
         def _do():
@@ -175,8 +176,12 @@ class ExactCache:
                         "paid_inference_executed": False,
                     },
                 )
+                logger.debug("Cache hit for %s from source %s", request_id, source.id)
                 return result
-        return await asyncio.to_thread(_do)
+        result = await asyncio.to_thread(_do)
+        if result is None:
+            logger.debug("Cache miss for %s", request_id)
+        return result
 
     async def put(self, request, profile, result):
         key = self.key(request, profile)
@@ -195,17 +200,30 @@ class ExactCache:
                 session.execute(delete(CacheEntry).where(CacheEntry.expires_at <= now))
                 existing = session.get(CacheEntry, (request.client_id, key))
                 if existing is None:
-                    count = session.scalar(select(func.count()).select_from(CacheEntry))
-                    if count >= router.settings.cache_max_entries:
-                        oldest = session.scalars(
-                            select(CacheEntry)
+                    at_capacity = (
+                        session.scalars(
+                            select(CacheEntry.client_id)
+                            .order_by(CacheEntry.created_at)
+                            .offset(router.settings.cache_max_entries - 1)
+                            .limit(1)
+                        ).first()
+                        is not None
+                    )
+                    if at_capacity:
+                        oldest = session.execute(
+                            select(CacheEntry.client_id, CacheEntry.key)
                             .order_by(
                                 CacheEntry.created_at, CacheEntry.client_id, CacheEntry.key
                             )
-                            .limit(count - router.settings.cache_max_entries + 1)
-                        )
-                        for old in oldest:
-                            session.delete(old)
+                            .limit(1)
+                        ).first()
+                        if oldest:
+                            session.execute(
+                                delete(CacheEntry).where(
+                                    CacheEntry.client_id == oldest[0],
+                                    CacheEntry.key == oldest[1],
+                                )
+                            )
                     existing = CacheEntry(client_id=request.client_id, key=key)
                     session.add(existing)
                 existing.source_request_id = result.request_id

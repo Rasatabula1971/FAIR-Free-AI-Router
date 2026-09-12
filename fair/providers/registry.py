@@ -26,9 +26,9 @@ class Registry:
 
     def register_credentialed(self, spec, factory, credentials):
         """Live factories receive only their scoped SecretStr after admission."""
-        admit_provider(spec)
         if spec.provider_id in self.providers:
             raise ValueError("Duplicate provider")
+        admit_provider(spec)
         credential = credentials.for_provider(spec.provider_id)
         try:
             adapter = factory(credential)

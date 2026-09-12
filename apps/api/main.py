@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as PathParam, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
@@ -25,6 +27,10 @@ from fair.schemas.db import AuditEvent, ModelTaskPerformance, database
 from fair.schemas.db import TaskRequest as TaskRow
 from fair.schemas.domain import ProviderSpec
 from fair.security.credentials import APIKeys
+
+logger = logging.getLogger(__name__)
+
+ValidRequestId = Annotated[str, PathParam(min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9_\-]+$")]
 
 
 def create_app(router=None, client_keys=None, admin_key=None):
@@ -175,6 +181,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
         try:
             return snapshot(app.state.router, credentials)
         except Exception:
+            logger.exception("Operational status snapshot failed")
             return JSONResponse(
                 status_code=503, content={"detail": "OPERATIONAL_STATUS_UNAVAILABLE"}
             )
@@ -226,7 +233,9 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return row
 
     @app.get("/v1/models/performance", dependencies=[Depends(administrator)])
-    def performance():
+    def performance(limit: int = 100, offset: int = 0):
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
         with app.state.router.sessions() as session:
             rows = session.scalars(
                 select(ModelTaskPerformance)
@@ -235,7 +244,8 @@ def create_app(router=None, client_keys=None, admin_key=None):
                     ModelTaskPerformance.model_id,
                     ModelTaskPerformance.task_class,
                 )
-                .limit(1000)
+                .limit(limit)
+                .offset(offset)
             )
             return [
                 {
@@ -260,7 +270,7 @@ def create_app(router=None, client_keys=None, admin_key=None):
             ]
 
     @app.get("/v1/requests/{request_id}")
-    def request_detail(request_id: str, identity=Depends(client)):
+    def request_detail(request_id: ValidRequestId, identity=Depends(client)):
         with app.state.router.sessions() as session:
             row = owned(session, request_id, identity)
             return row.result_json or {"request_id": row.id, "status": row.status}
@@ -274,17 +284,21 @@ def create_app(router=None, client_keys=None, admin_key=None):
         return await app.state.router.cache.clear(identity)
 
     @app.get("/v1/requests/{request_id}/feedback")
-    def request_feedback(request_id: str, identity=Depends(client)):
+    def request_feedback(request_id: ValidRequestId, identity=Depends(client)):
         return FeedbackRegistry(app.state.router.sessions).read(identity, request_id)
 
     @app.get("/v1/requests/{request_id}/audit")
-    def request_audit(request_id: str, identity=Depends(client)):
+    def request_audit(request_id: ValidRequestId, limit: int = 200, offset: int = 0, identity=Depends(client)):
+        limit = max(1, min(limit, 1000))
+        offset = max(0, offset)
         with app.state.router.sessions() as session:
             owned(session, request_id, identity)
             rows = session.scalars(
                 select(AuditEvent)
                 .where(AuditEvent.request_id == request_id)
                 .order_by(AuditEvent.created_at, AuditEvent.id)
+                .limit(limit)
+                .offset(offset)
             )
             return [
                 {"event_type": r.event_type, "payload": r.payload_json, "created_at": r.created_at}
@@ -356,4 +370,5 @@ def create_app(router=None, client_keys=None, admin_key=None):
     return app
 
 
-app = create_app()
+def get_app():
+    return create_app()

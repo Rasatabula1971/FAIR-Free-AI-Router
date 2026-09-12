@@ -125,7 +125,7 @@ def preflight_config(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     values = {
         "routing.yaml": {},
-        "quality_thresholds.yaml": {"standard": 82},
+        "quality_thresholds.yaml": {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
         "providers.yaml": {"providers": []},
         "live_adapters.yaml": {"enabled": False},
     }
@@ -178,7 +178,7 @@ def test_preflight_database_check_does_not_migrate(preflight_config, monkeypatch
     assert check(preflight_config, check_database=True)["status"] == "FAIL"
     with engine.begin() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
-        connection.execute(text("UPDATE alembic_version SET version_num='0009'"))
+        connection.execute(text("UPDATE alembic_version SET version_num='0010'"))
     assert check(preflight_config, check_database=True)["status"] == "PASS"
     engine.dispose()
 

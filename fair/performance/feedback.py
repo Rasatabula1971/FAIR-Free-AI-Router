@@ -69,13 +69,14 @@ class FeedbackRegistry:
                 raise FeedbackDenied("FEEDBACK_USE_ORIGINAL_REQUEST")
             if not result.get("provider_id") or not result.get("model_id"):
                 raise FeedbackDenied("FEEDBACK_TARGET_UNAVAILABLE")
-            score = (
-                0
-                if request.accepted is False
-                else (request.rating - 1) * 25
-                if request.rating is not None
-                else 100
-            )
+            if request.accepted is False:
+                score = 0
+            elif request.rating is not None:
+                score = (request.rating - 1) * 25
+                if request.accepted is True:
+                    score = max(score, 25)
+            else:
+                score = 100
             row = FeedbackEvent(
                 request_id=task.id,
                 client_id=client_id,

@@ -81,6 +81,19 @@ async def test_feedback_is_idempotent_private_and_only_changes_own_preferences(m
         assert "private correction" not in repr(vars(row))
 
 
+async def test_accepted_with_low_rating_scores_above_rejection(make_router):
+    router = make_router([(provider(), MockAdapter("a", text="4"))])
+    result = await router.solve(request())
+    registry = FeedbackRegistry(router.sessions)
+    registry.submit(
+        "alice",
+        FeedbackRequest(request_id=result.request_id, accepted=True, rating=1),
+    )
+    with router.sessions() as session:
+        row = session.scalar(select(FeedbackEvent))
+        assert row.score == 25
+
+
 async def test_positive_feedback_is_bounded_by_benchmark_and_expires(make_router):
     router = make_router([(provider(), MockAdapter("a", text="4"))])
     result = await router.solve(request())

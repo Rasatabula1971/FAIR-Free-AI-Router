@@ -8,6 +8,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     create_engine,
@@ -170,6 +171,10 @@ class FeedbackEvent(Base):
         ForeignKeyConstraint(
             ["provider_id", "model_id"], ["models.provider_id", "models.model_id"]
         ),
+        Index(
+            "ix_feedback_scoring",
+            "client_id", "provider_id", "model_id", "task_class", "created_at",
+        ),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     request_id: Mapped[str] = mapped_column(ForeignKey("task_requests.id"), unique=True)
@@ -195,6 +200,9 @@ class EscalationRecord(Base):
 
 class AuditEvent(Base):
     __tablename__ = "audit_events"
+    __table_args__ = (
+        Index("ix_audit_type_created", "event_type", "created_at"),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     request_id: Mapped[str | None] = mapped_column(ForeignKey("task_requests.id"), nullable=True, index=True)
     actor_id: Mapped[str] = mapped_column(String(128))

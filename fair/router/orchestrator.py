@@ -77,6 +77,9 @@ class Router:
             logger.critical("System stopped — rejecting all pending requests")
             self.scheduler.reject_pending("SYSTEM_STOPPED")
 
+    async def is_stopped(self):
+        return await self.kill_switch.is_stopped()
+
     def audit(self, session, request_id, client_id, event_type, payload):
         session.add(
             AuditEvent(
@@ -234,11 +237,10 @@ class Router:
         else:
             try:
                 source_report = self._source_report(request)
-                quality = (
-                    evaluate(request, profile, response, source_review=source_report)
-                    if source_report.state != "NOT_REQUESTED"
-                    else evaluate(request, profile, response)
-                )
+                eval_kwargs = {}
+                if source_report.state != "NOT_REQUESTED":
+                    eval_kwargs["source_review"] = source_report
+                quality = evaluate(request, profile, response, **eval_kwargs)
                 if (
                     request.validation is not None
                     and request.validation.kind == "native_python_function"
@@ -246,7 +248,8 @@ class Router:
                     and not quality.hard_reject
                 ):
                     native_result = await self.sandbox.validate(response.text, request.validation)
-                    quality = evaluate(request, profile, response, native_result=native_result)
+                    eval_kwargs["native_result"] = native_result
+                    quality = evaluate(request, profile, response, **eval_kwargs)
                     quality.validator_results["sandbox_image_id"] = self.sandbox.image_id
             except asyncio.CancelledError:
                 cancelled = True
@@ -282,7 +285,10 @@ class Router:
         if cancelled:
             def _mark_cancelled():
                 with self.sessions.begin() as session:
-                    session.get(TaskRequest, request_id).status = "CANCELLED"
+                    row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
+                    row.status = "CANCELLED"
                     self.audit(session, request_id, request.client_id, "CANCELLED", {})
             await asyncio.to_thread(_mark_cancelled)
             raise asyncio.CancelledError
@@ -307,7 +313,7 @@ class Router:
         )
         disagreement = "NOT_ASSESSED"
         for _ in range(self.settings.max_verification_attempts):
-            if self.stopped:
+            if await self.is_stopped():
                 report.state = "STOPPED"
                 break
             checker_qualifications = {}
@@ -352,7 +358,7 @@ class Router:
             attempts.append(attempt)
             report.attempts_count += 1
             report.verification_attempt_number = attempt.attempt_number
-            if self.stopped:
+            if await self.is_stopped():
                 report.state = "STOPPED"
                 break
             if failed:
@@ -415,7 +421,8 @@ class Router:
         return remaining / spec.request_limit > self.settings.shadow_min_headroom
 
     async def _shadow(self, request, parent):
-        if self.scheduler.closed or self.stopped:
+        if self.scheduler.closed or await self.is_stopped():
+            logger.debug("Shadow skipped: system stopped or closed")
             return
 
         def _count():
@@ -441,6 +448,7 @@ class Router:
                 return foreground, spent
         foreground, spent = await asyncio.to_thread(_count)
         if spent + 1 > foreground * self.settings.shadow_max_rate:
+            logger.debug("Shadow skipped: rate limit (%d/%d)", spent, foreground)
             return
         profile = profile_task(request, self.thresholds)
         if not await self.selector.candidates(
@@ -449,7 +457,9 @@ class Router:
             set(),
             eligible=lambda spec, model: self._shadow_candidate(parent, spec, model),
         ):
+            logger.debug("Shadow skipped: no eligible candidates")
             return
+        logger.info("Shadow execution started for client %s", request.client_id)
         await self.solve(
             request.model_copy(update={"priority": "P4", "cross_check_required": False}),
             shadow_of=parent,
@@ -472,7 +482,9 @@ class Router:
         def finished(done):
             self.shadow_tasks.discard(done)
             if not done.cancelled():
-                done.exception()
+                exc = done.exception()
+                if exc is not None:
+                    logger.warning("Shadow task failed: %s", type(exc).__name__)
 
         task.add_done_callback(finished)
 
@@ -516,7 +528,7 @@ class Router:
         ticket = None
         self.inflight.add(request_id)
         try:
-            if self.stopped:
+            if await self.is_stopped():
                 raise SchedulingRejected("SYSTEM_STOPPED")
             ticket = self.scheduler.submit(
                 request.client_id, request.priority, len(request.model_dump_json().encode("utf-8"))
@@ -525,7 +537,10 @@ class Router:
 
             def _mark_queued():
                 with self.sessions.begin() as session:
-                    session.get(TaskRequest, request_id).status = "QUEUED"
+                    row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
+                    row.status = "QUEUED"
                     self.audit(
                         session,
                         request_id,
@@ -576,6 +591,8 @@ class Router:
             def _persist_rejected():
                 with self.sessions.begin() as session:
                     row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
                     row.status, row.result_json = result.status, result.model_dump(mode="json")
                     self.audit(
                         session,
@@ -592,6 +609,8 @@ class Router:
             def _persist_error():
                 with self.sessions.begin() as session:
                     row = session.get(TaskRequest, request_id)
+                    if row is None:
+                        raise RuntimeError(f"TaskRequest {request_id} not found")
                     if row.status != status:
                         row.status = status
                         self.audit(session, request_id, request.client_id, status, {})
@@ -619,7 +638,10 @@ class Router:
 
         def _mark_profiled():
             with self.sessions.begin() as session:
-                session.get(TaskRequest, request_id).status = "PROFILED"
+                row = session.get(TaskRequest, request_id)
+                if row is None:
+                    raise RuntimeError(f"TaskRequest {request_id} not found")
+                row.status = "PROFILED"
                 session.add(ProfileRow(request_id=request_id, **profile_dict))
                 self.audit(
                     session,
@@ -646,7 +668,7 @@ class Router:
         accepted_response = accepted_quality = None
         validator_failed = False
         for _ in range(1 if shadow_of is not None else self.settings.max_attempts):
-            if self.stopped:
+            if await self.is_stopped():
                 reason = "SYSTEM_STOPPED"
                 break
             candidates = await self.selector.candidates(
@@ -690,7 +712,7 @@ class Router:
             attempts.append(attempt)
             if validator_failed:
                 break
-            if self.stopped and not required:
+            if await self.is_stopped() and not required:
                 reason = "SYSTEM_STOPPED"
                 break
             if attempt.disposition != "ACCEPTED":
@@ -801,6 +823,8 @@ class Router:
             with self.sessions.begin() as session:
                 result_dict = result.model_dump(mode="json")
                 row = session.get(TaskRequest, request_id)
+                if row is None:
+                    raise RuntimeError(f"TaskRequest {request_id} not found")
                 row.status, row.result_json = result.status, result_dict
                 if shadow_of is not None:
                     agreement, basis = (
