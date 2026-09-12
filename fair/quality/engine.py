@@ -185,5 +185,6 @@ def acceptable(report, profile):
             "STRUCTURED_CLAIMS_SUPPORTED",
             "BOUNDED_CODE_TESTS",
             "NATIVE_CODE_TESTS",
+            "STRUCTURE_VALIDATED",
         }
     )

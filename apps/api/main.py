@@ -370,4 +370,5 @@ def create_app(router=None, client_keys=None, admin_key=None):
     return app
 
 
-app = create_app()
+def get_app():
+    return create_app()
