@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from sqlalchemy import select
@@ -16,6 +17,9 @@ class KillSwitch:
         with self.sessions() as session:
             state = session.get(SystemState, "global")
             return state is None or state.stopped
+
+    async def is_stopped(self):
+        return await asyncio.to_thread(lambda: self.stopped)
 
     def set(self, stopped: bool, actor_id="admin"):
         with self.sessions.begin() as session:

@@ -77,6 +77,9 @@ class Router:
             logger.critical("System stopped — rejecting all pending requests")
             self.scheduler.reject_pending("SYSTEM_STOPPED")
 
+    async def is_stopped(self):
+        return await self.kill_switch.is_stopped()
+
     def audit(self, session, request_id, client_id, event_type, payload):
         session.add(
             AuditEvent(
@@ -307,7 +310,7 @@ class Router:
         )
         disagreement = "NOT_ASSESSED"
         for _ in range(self.settings.max_verification_attempts):
-            if self.stopped:
+            if await self.is_stopped():
                 report.state = "STOPPED"
                 break
             checker_qualifications = {}
@@ -352,7 +355,7 @@ class Router:
             attempts.append(attempt)
             report.attempts_count += 1
             report.verification_attempt_number = attempt.attempt_number
-            if self.stopped:
+            if await self.is_stopped():
                 report.state = "STOPPED"
                 break
             if failed:
@@ -415,7 +418,7 @@ class Router:
         return remaining / spec.request_limit > self.settings.shadow_min_headroom
 
     async def _shadow(self, request, parent):
-        if self.scheduler.closed or self.stopped:
+        if self.scheduler.closed or await self.is_stopped():
             return
 
         def _count():
@@ -472,7 +475,9 @@ class Router:
         def finished(done):
             self.shadow_tasks.discard(done)
             if not done.cancelled():
-                done.exception()
+                exc = done.exception()
+                if exc is not None:
+                    logger.warning("Shadow task failed: %s", type(exc).__name__)
 
         task.add_done_callback(finished)
 
@@ -516,7 +521,7 @@ class Router:
         ticket = None
         self.inflight.add(request_id)
         try:
-            if self.stopped:
+            if await self.is_stopped():
                 raise SchedulingRejected("SYSTEM_STOPPED")
             ticket = self.scheduler.submit(
                 request.client_id, request.priority, len(request.model_dump_json().encode("utf-8"))
@@ -646,7 +651,7 @@ class Router:
         accepted_response = accepted_quality = None
         validator_failed = False
         for _ in range(1 if shadow_of is not None else self.settings.max_attempts):
-            if self.stopped:
+            if await self.is_stopped():
                 reason = "SYSTEM_STOPPED"
                 break
             candidates = await self.selector.candidates(
@@ -690,7 +695,7 @@ class Router:
             attempts.append(attempt)
             if validator_failed:
                 break
-            if self.stopped and not required:
+            if await self.is_stopped() and not required:
                 reason = "SYSTEM_STOPPED"
                 break
             if attempt.disposition != "ACCEPTED":
