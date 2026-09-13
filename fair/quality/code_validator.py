@@ -124,7 +124,7 @@ def parse_function(source, name):
         or function.name in SAFE_BUILTINS
         or function.decorator_list
         or function.returns
-        or function.type_params
+        or getattr(function, "type_params", None)
         or args.posonlyargs
         or args.kwonlyargs
         or args.vararg

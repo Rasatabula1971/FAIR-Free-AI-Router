@@ -1,12 +1,13 @@
 from pydantic import Field
 
+from fair.constants import SECONDS_IN_DAY
 from fair.quality.contracts import SourcePolicy
 from fair.schemas.domain import DTO
 
 
 class RoutingSettings(DTO):
     cache_enabled: bool = False
-    cache_ttl_seconds: int = Field(default=3600, ge=1, le=86400)
+    cache_ttl_seconds: int = Field(default=3600, ge=1, le=SECONDS_IN_DAY)
     cache_max_entries: int = Field(default=1000, ge=1, le=100000)
     confidence_half_life_days: int = Field(default=30, ge=1, le=365)
     drift_drop_points: float = Field(default=15, gt=0, le=100, allow_inf_nan=False)

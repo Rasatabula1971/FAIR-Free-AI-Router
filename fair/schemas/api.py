@@ -4,6 +4,7 @@ from typing import Literal
 from jsonschema import Draft202012Validator, SchemaError
 from pydantic import Field, model_validator
 
+from fair.constants import SECONDS_IN_DAY
 from fair.quality.claims import fact_index
 from fair.quality.contracts import Evidence, SourcePolicy, ValidationContract
 from fair.quality.grounding import grounded_result
@@ -22,7 +23,7 @@ from fair.schemas.domain import (
 
 class SolveRequest(DTO):
     cache_mode: Literal["default", "bypass", "refresh"] = "default"
-    cache_ttl_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
+    cache_ttl_seconds: int | None = Field(default=None, ge=1, le=SECONDS_IN_DAY, strict=True)
     client_id: str = Field(min_length=1, max_length=128)
     priority: Priority = "P2"
     task: str = Field(min_length=1, max_length=100_000)
