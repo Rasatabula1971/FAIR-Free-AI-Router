@@ -84,6 +84,7 @@ class SolveResponse(DTO):
     best_quality_score: float | None = None
     verification_state: Literal[
         "UNVERIFIED",
+        "STRUCTURE_VALIDATED",
         "DETERMINISTIC_ARITHMETIC",
         "HOST_REFERENCE_MATCH",
         "SOURCE_DATA_MATCH",
