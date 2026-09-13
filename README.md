@@ -8,7 +8,7 @@ profiles tasks; filters models by capability, context and privacy; reserves requ
 and retries a bounded number of distinct free routes. It persists request, attempt and audit
 lineage and returns structured escalation when no eligible, verifiable answer exists.
 
-**Groq, OpenRouter free models and local Ollama adapters are included, disabled by default.**
+**Groq, Gemini, OpenRouter free models and local Ollama adapters are included, disabled by default.**
 See [live adapter setup and verification](docs/LIVE_ADAPTERS.md). Demo mode uses offline fixtures. A non-empty
 or schema-valid response is not evidence of factual correctness. Arithmetic, host-reference JSON,
 source-bound JSON extraction, and bounded Python-function test contracts can produce `ACCEPTED`.
@@ -17,6 +17,11 @@ rejecting unsupported/contradicted claims and incomplete attribution. Missing or
 evidence supports explicit abstention, which remains unverified with no invented quality score.
 Unsupported tasks still escalate. Failed answers are withheld. Paid routes are prohibited;
 unexpected OpenRouter cost reports stop dispatch and withhold the result.
+
+The [free provider qualification checklist](docs/FREE_PROVIDER_QUALIFICATION.md) tracks the
+corrected candidate pool, current credential evidence and remaining live-routing work.
+Cloud routes additionally require [current provider/model evidence](docs/PROVIDER_QUALIFICATION.md).
+This version requires migration `0009`; legacy cloud configs without evidence fail admission.
 
 Optional source policies require operator-reviewed evidence snapshots, enforce client access,
 content hashes, review expiry and observation age, and can require multiple configured origins
