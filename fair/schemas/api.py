@@ -7,13 +7,13 @@ from pydantic import Field, model_validator
 from fair.quality.claims import fact_index
 from fair.quality.contracts import Evidence, SourcePolicy, ValidationContract
 from fair.quality.grounding import grounded_result
-from fair.router.scheduler import Priority
 from fair.schemas.domain import (
     DTO,
     Attempt,
     BenchmarkCheck,
     Capability,
     CrossCheckReport,
+    Priority,
     PrivacyClass,
     QualityReport,
     SourcePolicyReport,

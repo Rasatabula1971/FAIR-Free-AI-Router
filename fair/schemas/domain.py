@@ -7,6 +7,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from fair.quality.version import ENGINE_VERSION
 from fair.schemas.qualification import ProviderQualification
 
+Priority = Literal["P0", "P1", "P2", "P3", "P4"]
+
 
 class AccessClass(StrEnum):
     FREE_RECURRING = "FREE_RECURRING"
