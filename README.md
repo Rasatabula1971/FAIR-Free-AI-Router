@@ -1,205 +1,146 @@
-# FAIR Free AI Router
+# FAIR — Free AI Router
 
-FAIR is a governed routing service for zero-cost AI inference. This repository contains the
-Sprint A routing core and the developing Sprint B quality engine. It is not yet a production AI service.
+Embeddable Python module for quality-verified AI inference through free providers.
+Every answer is judged before it's accepted — arithmetic checks, code validation,
+JSON schema matching, citation verification, and cross-checking between independent models.
 
-The core enforces free-only provider admission at registration, selection and execution;
-profiles tasks; filters models by capability, context and privacy; reserves request quotas;
-and retries a bounded number of distinct free routes. It persists request, attempt and audit
-lineage and returns structured escalation when no eligible, verifiable answer exists.
+## Install
 
-**Groq, Gemini, OpenRouter free models and local Ollama adapters are included, disabled by default.**
-See [live adapter setup and verification](docs/LIVE_ADAPTERS.md). Demo mode uses offline fixtures. A non-empty
-or schema-valid response is not evidence of factual correctness. Arithmetic, host-reference JSON,
-source-bound JSON extraction, and bounded Python-function test contracts can produce `ACCEPTED`.
-The `grounded_claims` contract additionally checks structured facts across all supplied sources,
-rejecting unsupported/contradicted claims and incomplete attribution. Missing or conflicting
-evidence supports explicit abstention, which remains unverified with no invented quality score.
-Unsupported tasks still escalate. Failed answers are withheld. Paid routes are prohibited;
-unexpected OpenRouter cost reports stop dispatch and withhold the result.
+```
+pip install -e .
+```
 
-The [free provider qualification checklist](docs/FREE_PROVIDER_QUALIFICATION.md) tracks the
-corrected candidate pool, current credential evidence and remaining live-routing work.
-Cloud routes additionally require [current provider/model evidence](docs/PROVIDER_QUALIFICATION.md).
-This version requires migration `0009`; legacy cloud configs without evidence fail admission.
+Requires Python 3.12+. Dependencies: `pydantic`, `httpx`, `jsonschema`.
 
-Optional source policies require operator-reviewed evidence snapshots, enforce client access,
-content hashes, review expiry and observation age, and can require multiple configured origins
-per structured claim. Server policies cannot be weakened by a request. See the
-[source review guide](docs/SOURCE_REVIEWS.md) for configuration, examples and renewal. These
-checks establish review-policy compliance, not source truth or live freshness.
+## Quick start
 
-Step 3 adds [offline benchmarks and workload qualification](docs/BENCHMARKS.md): independently
-labelled saved responses, separate calibration/holdout results, uncertainty bounds, and an
-optional server gate tied to exact model revisions. Fixtures cannot qualify routes. The shipped
-diagnostic suite makes no provider calls; live model ratings require measured workload data.
+```python
+from fair import FAIR
 
-Set `cross_check_required: true` to require a second provider/model to solve and validate the
-same task independently. This is mandatory for `high_impact_support`. Both answers must pass
-the selected contract and agree within its scope; otherwise FAIR withholds the provisional
-answer and returns escalation or a service failure. Agreement does not establish general truth.
+fair = FAIR(gemini_api_key="...")
+result = await fair.solve(
+    "What is 15 * 23?",
+    validation={"kind": "arithmetic", "expression": "15*23"},
+)
+print(result.status)  # "ACCEPTED"
+print(result.output)  # "345"
+```
 
-See [quality contracts](docs/QUALITY_CONTRACTS.md) for the supported checks, verification
-labels, examples and limitations. These deterministic checks do not establish general
-factual correctness or validate arbitrary generated code. The default code validator interprets
-bounded numeric/list functions with loops and selected built-ins. An opt-in `native_python_function` contract executes that same subset
-inside a constrained Docker container and reports `NATIVE_CODE_TESTS`. It is disabled unless
-a trusted local sandbox image is explicitly configured; see the quality contracts for setup
-and exact isolation limits.
+## Supported providers
 
-Step 4 expands both validators and adds [owner-scoped sandbox recovery](docs/SANDBOX_RECOVERY.md)
-after interruption or restart, with an audited admin endpoint. Imports, arbitrary calls and
-filesystem/network access remain outside the generated-code contract.
+| Provider | Env var | Access class |
+|----------|---------|-------------|
+| Google Gemini | `GEMINI_API_KEY` | Free recurring |
+| Groq | `GROQ_API_KEY` | Free recurring |
+| OpenRouter | `OPENROUTER_API_KEY` | Free dynamic |
+| Ollama | `OLLAMA_URL` + `OLLAMA_ENABLED=1` | Free local |
+
+Pass API keys directly to the constructor or set env vars. At least one provider is required.
+
+## Validation contracts
+
+FAIR verifies AI responses before accepting them:
+
+- **`arithmetic`** — exact rational arithmetic via bounded AST evaluation
+- **`python_function`** — safe AST interpreter runs test cases against generated code (no eval/exec)
+- **`reference_json`** — exact JSON match against a known reference
+- **`grounded_json`** — extracts values from supplied source data via JSON pointers
+- **`grounded_claims`** — structured fact-checking across supplied evidence sources
+
+```python
+# Code validation
+result = await fair.solve(
+    "Write a function that adds two numbers",
+    validation={
+        "kind": "python_function",
+        "function_name": "add",
+        "cases": [
+            {"arguments": [1, 2], "expected": 3},
+            {"arguments": [0, 0], "expected": 0},
+        ],
+    },
+)
+
+# JSON reference
+result = await fair.solve(
+    "Return the config as JSON",
+    validation={"kind": "reference_json", "expected": {"debug": False, "port": 8080}},
+)
+```
+
+## Cross-checking
+
+Request a second independent model to verify the answer:
+
+```python
+result = await fair.solve(
+    "What is the capital of France?",
+    cross_check_required=True,
+)
+# result.cross_check.state: "PASSED", "DISAGREEMENT", etc.
+```
+
+## Response statuses
+
+- **`ACCEPTED`** — answer passed all validation checks
+- **`ESCALATION_REQUIRED`** — no model produced a verified answer
+- **`FAILED`** — infrastructure failure (validator error, all providers down)
+
+## Constructor options
+
+```python
+FAIR(
+    gemini_api_key="...",         # or env: GEMINI_API_KEY
+    groq_api_key="...",           # or env: GROQ_API_KEY
+    openrouter_api_key="...",     # or env: OPENROUTER_API_KEY
+    ollama_url="...",             # or env: OLLAMA_URL (+ OLLAMA_ENABLED=1)
+    providers=[(spec, adapter)],  # custom providers (e.g. MockAdapter for testing)
+    quality_level="standard",     # commodity|standard|advanced|high_impact_support
+    max_attempts=3,               # retry budget across providers
+    timeout_seconds=15,           # per-attempt timeout
+    cache_enabled=True,           # in-memory LRU cache for deterministic tasks
+    cross_check_required=False,   # require independent verification
+    on_event=callback,            # optional (event_type, payload) callback
+)
+```
+
+## Event callback
+
+Monitor routing decisions without a database:
+
+```python
+def on_event(event_type, payload):
+    print(f"{event_type}: {payload}")
+
+fair = FAIR(gemini_api_key="...", on_event=on_event)
+```
+
+Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `ACCEPTED`, `ESCALATION_REQUIRED`, `FAILED`.
+
+## Architecture
+
+All quality validation logic runs as pure functions — no database, no server, no YAML config.
+
+```
+FAIR(api_keys)
+ └─ EmbeddedRouter
+     ├─ MemorySelector      (weighted scoring: quality × 0.65 + quota × 0.20 + reliability × 0.15)
+     ├─ MemoryQuotaGovernor  (circuit breaker: CLOSED → OPEN → HALF_OPEN)
+     ├─ MemoryPerformance    (quality/reliability tracking from observed attempts)
+     ├─ MemoryCache          (LRU with TTL for arithmetic/reference tasks)
+     └─ Quality Engine       (arithmetic, code validator, JSON, consensus, grounding)
+```
 
 ## Development
 
-Step 9 adds [Python/JavaScript SDKs and client-isolated exact caching](docs/SDK_AND_CACHE.md).
-The optional cache revalidates supported results, records new request lineage and saves provider
-quota without adding model-quality samples. Apply migration `0008` before starting this version.
-
-Python 3.12+ is required. From PowerShell:
-
-```powershell
-Set-Location 'C:\FAIR Free AI Router'
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\ruff.exe check .
+```
+pip install -e ".[dev]"
+pytest -q
 ```
 
-The test suite uses in-memory SQLite and offline mocks. It exercises paid-route rejection,
-execution-boundary checks, kill switches, capability/privacy/context filters, task-specific
-selection, quota scarcity, 429/quota/outage/timeout failover, cooldown recovery, bounded
-attempts, conservative concurrent reservations, schema validation, authenticated client
-isolation and persisted audit lineage.
+## Safety
 
-Quality tests exercise exact rational arithmetic, strict JSON reference matching, hard-reject
-precedence, citation-reference checks, structured assertion conflicts, model switching after
-rejection, private accepted output and persistent task-performance learning. A validator
-service error returns `FAILED` without penalizing the provider.
-Further tests cover source-path provenance, unsupported claims, hostile code constructs,
-resource limits and code test failures that trigger another model attempt.
-Cross-check tests cover route diversity, alias groups, bounded failover, disagreement,
-answer isolation, high-impact enforcement and durable cancellation lineage.
-Claim-grounding tests cover cross-source conflicts, exact context/type matching, complete
-provenance, partial answers, abstention, source budgets, client isolation and private audit reports.
-Source-review tests cover tampering, missing/rejected/expired reviews, client permissions,
-server policy floors, per-claim corroboration, and expiry during independent verification.
-
-Restart regressions also cover durable stop/resume, reservations, exhaustion, authentication
-blocks, throttle deadlines, circuit history, single recovery probes and abandoned probes.
-The migration test verifies that existing audit history and the last stop command survive
-an upgrade. A separate PostgreSQL migration/audit-trigger test runs when
-`FAIR_TEST_POSTGRES_URL` is set; GitHub Actions includes a PostgreSQL service for that check.
-
-GitHub Actions also builds and starts the actual Docker Compose package and runs
-`scripts/docker_smoke.py` against its HTTP API. This checks offline routing, authentication,
-request/audit persistence, and stop/resume across an API restart. The job uses disposable CI
-credentials and removes its database volume afterward; no live providers are enabled.
-
-A separate native-sandbox job builds the dedicated executor image and verifies native answers,
-OS restrictions, timeout/cancellation cleanup and output limits. Those real Docker tests are
-skipped locally unless `FAIR_TEST_SANDBOX_IMAGE` identifies an explicitly supplied test image.
-
-## Local service with PostgreSQL
-
-Step 10 adds [deployment checks, monitoring and backup/restore runbooks](docs/OPERATING_RUNBOOK.md).
-Use `python -m fair.operations.preflight --check-database` with the deployment environment
-before activation. The Compose API container uses bounded resources and a read-only root.
-
-The Compose file is a development configuration with local database credentials. Docker
-must be installed and running. Set distinct random keys before starting:
-
-```powershell
-$env:FAIR_CLIENT_KEYS = '{"my-app":"YOUR_RANDOM_CLIENT_KEY"}'
-$env:FAIR_ADMIN_KEY = 'YOUR_SEPARATE_RANDOM_ADMIN_KEY'
-$env:FAIR_DEMO_MODE = '1'
-docker compose -f infra/docker/docker-compose.yml up --build -d
-```
-
-Compose runs Alembic before starting a single API worker and binds the API to localhost.
-Open http://127.0.0.1:8000/docs for the API reference. The application does not load `.env`
-automatically; shell environment variables are used. Compose supports its normal `.env`
-substitution rules.
-
-```powershell
-Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/v1/solve' `
-  -Headers @{ 'X-API-Key' = 'YOUR_RANDOM_CLIENT_KEY' } `
-  -ContentType 'application/json' `
-  -Body '{"client_id":"my-app","task":"Write a short greeting"}'
-```
-
-Demo mode returns two mock attempts and `QUALITY_VERIFICATION_UNAVAILABLE`. With demo mode
-off, the inactive registry returns `NO_ELIGIBLE_FREE_MODELS` without making a model call.
-
-For an existing local PostgreSQL instance, set `FAIR_DATABASE_URL`, run
-`.\.venv\Scripts\alembic.exe upgrade head`, then
-`.\.venv\Scripts\python.exe -m uvicorn apps.api.main:app --host 127.0.0.1 --port 8000 --workers 1`.
-
-## Implemented endpoints
-
-| Endpoint | Access |
-| --- | --- |
-| `GET /healthz` | Public process health |
-| `GET /livez` | Public process-only liveness |
-| `GET /readyz` | Public generic readiness; 503 during maintenance or invalid state |
-| `GET /v1/system/status` | Admin-only operational counts and queue state |
-| `POST /v1/solve` | Client key; body identity must match key |
-| `POST /v1/feedback` | Owning client; one audited preference per accepted foreground result |
-| `GET /v1/requests/{id}/feedback` | Owning client only |
-| `GET /v1/providers` | Client key; safe registry summary |
-| `DELETE /v1/cache` | Client key; clear only owned cache entries |
-| `GET /v1/providers/{id}/health` | Client key; persisted quota and circuit observations |
-| `GET /v1/models/performance` | Admin key; up to 1,000 aggregate model/task records |
-| `GET /v1/system/scheduler` | Admin key; process-local queue and priority counts |
-| `GET /v1/system/providers/{id}/recovery` | Admin key; stored state and recovery fingerprint |
-| `POST /v1/system/providers/{id}/recover` | Admin key; stopped, idle, audited provider recovery |
-| `POST /v1/system/requests/recover` | Admin key; bounded reconciliation of interrupted requests |
-| `GET /v1/requests/{id}` | Owning client only |
-| `GET /v1/requests/{id}/audit` | Owning client only |
-| `POST /v1/system/stop` | Separate admin key |
-| `POST /v1/system/resume` | Separate admin key |
-
-Stop prevents subsequent model dispatches, including retries; it does not cancel an
-already-running attempt. The switch, request counters, failure windows, quota exhaustion,
-authentication blocks and recovery deadlines persist in the database. Use one worker;
-multi-worker scheduling and distributed dispatch coordination are not implemented.
-The bounded scheduler uses strict P0–P4 priority and round-robin client turns within each
-class. Urgent classes require operator configuration; requests default to P2. See
-[SCHEDULING.md](docs/SCHEDULING.md) for queue limits, cancellation, failure codes and the
-volatile single-process scope.
-Step 7 adds [feedback, recent metrics, drift tracking and opt-in shadow checks](docs/LEARNING.md).
-Feedback changes only the owner's routing preferences. Shadow checks are off by default and
-withhold output. Apply all migrations through `0008` before starting this version.
-API key digests are held in application authentication closures; tasks and keys are not stored
-in request/audit rows. Audit ORM updates/deletes are rejected, and the PostgreSQL migration
-adds a database trigger rejecting update/delete/truncate. Database-owner DDL is outside that
-boundary. SQLite is for tests only.
-
-Provider YAML remains the authority for configured eligibility and models. Startup records
-relational snapshots without clearing runtime blocks or quota consumption. A quota reset
-must be explicitly observed by the adapter; no daily/monthly reset is invented. Exhaustion
-without a known reset, and authentication blocks, remain blocked across restarts. An operator
-recovery workflow is available in [OPERATIONS_SECURITY.md](docs/OPERATIONS_SECURITY.md), including
-credential rotation, explicit quota-reset evidence and migration `0006`. Health reads report stored observations;
-they do not make live provider calls. Deadline fields use UTC Unix seconds.
-
-After pulling a schema change, run `alembic upgrade head` before starting the service.
-Existing profile JSON remains readable; new requests also receive relational profile rows.
-Migration `0003` adds quality reports, escalation records and model/task statistics. Only new
-attempts contribute to these statistics. Accepted response text is stored with the request
-result and is readable only by its owning client. Rejected response text, host reference
-answers and raw evidence are not stored in quality/audit rows; a contract fingerprint records
-which validation inputs were used. Integrators must retain their input for exact replay.
-Migration `0004` adds optional model `independence_group` metadata. Known aliases of the same
-underlying model/family should share a group; FAIR then excludes them from checking each other.
-Provider and model IDs must also differ. Unknown aliases cannot be automatically detected.
-
-## Build roadmap and limitations
-
-See [BUILD_STATUS.md](docs/BUILD_STATUS.md) for the exact implemented scope and remaining work.
-The supplied PDR, handoff, specification and seed are preserved under `docs/source` as
-requirements references. ASVS archives were not present, so no donor code was copied.
-
-Implementation references: [FastAPI lifespan](https://fastapi.tiangolo.com/advanced/events/)
-and [SQLAlchemy ORM](https://docs.sqlalchemy.org/en/20/orm/quickstart.html).
+- Paid routes are prohibited — the admission policy enforces $0 cost, no billing, no paid subscriptions
+- A `BillingViolation` from any provider stops the entire system immediately
+- Provider credentials are never leaked in responses (`CredentialedAdapter`)
+- The code validator uses a safe AST interpreter with bounded steps (4096) and iterations (1024) — no `eval`/`exec`
