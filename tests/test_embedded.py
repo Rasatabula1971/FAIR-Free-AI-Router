@@ -1,27 +1,19 @@
 """Tests for the embedded FAIR module — no database, no server."""
 
-import asyncio
-from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from fair.embedded import FAIR
-from fair.embedded.cache import MemoryCache
-from fair.embedded.performance import MemoryPerformanceRegistry
-from fair.embedded.quota import MemoryQuotaGovernor, QuotaState
-from fair.embedded.router import EmbeddedRouter
-from fair.embedded.selector import MemorySelector
 from fair.config import RoutingSettings
+from fair.embedded import FAIR
+from fair.embedded.performance import MemoryPerformanceRegistry
+from fair.embedded.quota import MemoryQuotaGovernor
+from fair.embedded.router import EmbeddedRouter
 from fair.providers.base import (
-    AuthenticationFailed,
     BillingViolation,
-    QuotaExceeded,
-    RateLimited,
 )
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.schemas.domain import ProviderSpec
-
 
 # ── helpers ──────────────────────────────────────────────────────────────
 

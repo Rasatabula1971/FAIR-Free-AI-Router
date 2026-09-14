@@ -18,7 +18,6 @@ from fair.schemas.domain import (
     Attempt,
     CrossCheckReport,
     NormalizedModelRequest,
-    SourcePolicyReport,
 )
 
 

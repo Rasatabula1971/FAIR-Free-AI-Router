@@ -1,5 +1,6 @@
 """Opt-in text adapters with fixed transports and conservative provider observations."""
 
+import copy
 import ipaddress
 import json
 import re
@@ -26,6 +27,8 @@ from fair.quality.json_data import strict_json
 from fair.schemas.domain import DTO, NormalizedModelResponse, ProviderHealth, QuotaSnapshot
 from fair.security.credentials import ProviderCredentials
 
+TEXT_CAPABILITIES = {"reasoning", "coding", "structured_output"}
+
 
 class LiveSettings(DTO):
     enabled: bool = False
@@ -35,6 +38,7 @@ class LiveSettings(DTO):
     openrouter_free_account_confirmed: bool = False
     ollama_local_only_confirmed: bool = False
     ollama_url: str = "http://127.0.0.1:11434"
+    confirmed_providers: set[str] = Field(default_factory=set)
     review_max_age_days: int = Field(default=30, ge=1, le=30)
 
     @model_validator(mode="after")
@@ -56,6 +60,15 @@ class LiveSettings(DTO):
         if not valid:
             raise ValueError("Ollama requires a literal loopback HTTP endpoint")
         return self
+
+    def confirmed(self, provider_id):
+        legacy = {
+            "groq": self.groq_free_plan_confirmed,
+            "google_gemini_api": self.gemini_free_tier_confirmed,
+            "openrouter_free": self.openrouter_free_account_confirmed,
+            "ollama_local": self.ollama_local_only_confirmed,
+        }
+        return provider_id in self.confirmed_providers or bool(legacy.get(provider_id))
 
 
 def retry_seconds(value, now):
@@ -90,12 +103,32 @@ def zero(value):
         return False
 
 
+def zero_priced(entry):
+    prices = entry.get("pricing")
+    return (
+        isinstance(prices, dict)
+        and {"prompt", "completion"} <= prices.keys()
+        and all(zero(value) for value in prices.values())
+    )
+
+
 class TextAdapter:
+    """OpenAI-style chat adapter; subclasses describe one provider's catalog and payload shape."""
+
     live_inference = True
     base_url = ""
     expected_provider = ""
     expected_access = ""
+    remote = True
     catalog_path = "/models"
+    catalog_key = "data"
+    catalog_id_key = "id"
+    context_field = "context_length"
+    zero_price_models = False
+    account_check_path = None
+    provider_preferences = None
+    output_tokens_key = "max_tokens"
+    extra_payload = {}
     credential_header = "Authorization"
     credential_prefix = "Bearer "
 
@@ -121,15 +154,9 @@ class TextAdapter:
             raise AuthenticationFailed("ADAPTER_IDENTITY_OR_ACCESS_CLASS_MISMATCH")
         if not self.settings.enabled:
             raise AuthenticationFailed("LIVE_ADAPTERS_DISABLED")
-        confirmations = {
-            "groq": self.settings.groq_free_plan_confirmed,
-            "google_gemini_api": self.settings.gemini_free_tier_confirmed,
-            "openrouter_free": self.settings.openrouter_free_account_confirmed,
-            "ollama_local": self.settings.ollama_local_only_confirmed,
-        }
-        if not confirmations.get(self.provider_id) or not self.spec.models:
+        if not self.settings.confirmed(self.provider_id) or not self.spec.models:
             raise AuthenticationFailed("LIVE_ACCOUNT_REVIEW_REQUIRED")
-        if self.provider_id != "ollama_local":
+        if self.remote:
             if self._credential is None or not self._credential.get_secret_value().strip():
                 raise AuthenticationFailed("PROVIDER_CREDENTIAL_REQUIRED")
             reviewed = self.spec.terms_last_verified
@@ -140,12 +167,9 @@ class TextAdapter:
                 raise AuthenticationFailed("CURRENT_TERMS_REVIEW_REQUIRED")
             if self.spec.max_data_class != "PUBLIC":
                 raise AuthenticationFailed("REMOTE_ADAPTER_PUBLIC_ONLY")
-        if any(
-            model.capabilities - {"reasoning", "coding", "structured_output"}
-            for model in self.spec.models
-        ):
+        if any(model.capabilities - TEXT_CAPABILITIES for model in self.spec.models):
             raise AuthenticationFailed("TEXT_ADAPTER_CAPABILITY_UNSUPPORTED")
-        if self.provider_id == "openrouter_free" and any(
+        if self.zero_price_models and any(
             not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+:free", model.model_id)
             or model.model_id.startswith("openrouter/")
             for model in self.spec.models
@@ -189,10 +213,9 @@ class TextAdapter:
             headers[self.credential_header] = (
                 self.credential_prefix + self._credential.get_secret_value()
             )
+        url = path if path.startswith("https://") else self.base_url + path
         try:
-            async with self._client.stream(
-                method, self.base_url + path, headers=headers, json=payload
-            ) as response:
+            async with self._client.stream(method, url, headers=headers, json=payload) as response:
                 self._error(response.status_code, response.headers)
                 if response.headers.get("content-encoding", "identity") != "identity":
                     raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
@@ -205,8 +228,8 @@ class TextAdapter:
                 value = strict_json(b"".join(chunks).decode("utf-8"))
                 if not isinstance(value, dict):
                     raise ValueError()
-                if "error" in value:
-                    error = value["error"]
+                if "error" in value or value.get("success") is False:
+                    error = value.get("error")
                     self._error(
                         error.get("code", 500)
                         if isinstance(error, dict) and type(error.get("code")) is int
@@ -233,6 +256,8 @@ class TextAdapter:
         return self._quota.model_copy(deep=True)
 
     async def list_models(self):
+        if self.catalog_path is None:
+            return [m.model_copy(deep=True) for m in self.spec.models if m.active]
         now = self.clock()
         if self._model_cache is not None and now - self._model_cache_at < self._catalog_ttl:
             return [m.model_copy(deep=True) for m in self._model_cache]
@@ -241,38 +266,54 @@ class TextAdapter:
         self._model_cache_at = now
         return result
 
-    async def _fetch_models(self):
-        data = await self._json("GET", self.catalog_path)
-        entries = data.get("data")
+    def _catalog_entries(self, data):
+        entries = data.get(self.catalog_key)
         if not isinstance(entries, list) or len(entries) > 4096:
             raise MalformedResponse("INVALID_MODEL_CATALOG")
+        return entries
+
+    def _catalog_context(self, entry):
+        return None if self.context_field is None else entry.get(self.context_field)
+
+    async def _fetch_models(self):
+        entries = self._catalog_entries(await self._json("GET", self.catalog_path))
         result = []
         for configured in self.spec.models:
             matches = [
                 entry
                 for entry in entries
-                if isinstance(entry, dict) and entry.get("id") == configured.model_id
+                if isinstance(entry, dict) and entry.get(self.catalog_id_key) == configured.model_id
             ]
             if len(matches) != 1 or not configured.active:
                 continue
             entry = matches[0]
             if entry.get("active", True) is not True:
                 continue
-            if self.provider_id == "openrouter_free":
-                prices = entry.get("pricing", {})
-                if (
-                    not isinstance(prices, dict)
-                    or not {"prompt", "completion", "request"} <= prices.keys()
-                    or not all(zero(value) for value in prices.values())
-                ):
-                    continue
-            context = entry.get(
-                "context_window" if self.provider_id == "groq" else "context_length"
-            )
-            if type(context) is not int or context < configured.context_window:
+            if self.zero_price_models and not zero_priced(entry):
                 continue
+            if self.context_field is not None:
+                context = self._catalog_context(entry)
+                if type(context) is not int or context < configured.context_window:
+                    continue
             result.append(configured.model_copy(deep=True))
         return result
+
+    async def _before_completion(self, payload):
+        if self.account_check_path is not None:
+            account = await self._json("GET", self.account_check_path)
+            if (
+                not isinstance(account.get("data"), dict)
+                or account["data"].get("is_free_tier") is not True
+            ):
+                raise AuthenticationFailed("FREE_ACCOUNT_NOT_CONFIRMED")
+        if self.provider_preferences is not None:
+            payload["provider"] = copy.deepcopy(self.provider_preferences)
+
+    def _after_completion(self, data):
+        if self.zero_price_models:
+            usage = data.get("usage")
+            if not isinstance(usage, dict) or not zero(usage.get("cost")):
+                raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
     async def complete(self, request):
         models = await self.list_models()
@@ -287,10 +328,9 @@ class TextAdapter:
             "model": model.model_id,
             "messages": [{"role": "user", "content": request.task}],
             "stream": False,
-            "max_completion_tokens"
-            if self.provider_id == "groq"
-            else "max_tokens": request.max_output_tokens,
+            self.output_tokens_key: request.max_output_tokens,
         }
+        payload.update(copy.deepcopy(self.extra_payload))
         if request.expected_json_schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
@@ -300,26 +340,11 @@ class TextAdapter:
                     "schema": request.expected_json_schema,
                 },
             }
-        if self.provider_id == "openrouter_free":
-            account = await self._json("GET", "/key")
-            if (
-                not isinstance(account.get("data"), dict)
-                or account["data"].get("is_free_tier") is not True
-            ):
-                raise AuthenticationFailed("FREE_ACCOUNT_NOT_CONFIRMED")
-            payload["provider"] = {
-                "allow_fallbacks": False,
-                "require_parameters": True,
-                "data_collection": "deny",
-                "max_price": {"prompt": 0, "completion": 0, "request": 0, "image": 0},
-            }
+        await self._before_completion(payload)
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
             raise MalformedResponse("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/chat/completions", payload)
-        if self.provider_id == "openrouter_free":
-            usage = data.get("usage")
-            if not isinstance(usage, dict) or not zero(usage.get("cost")):
-                raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
+        self._after_completion(data)
         try:
             choices = data["choices"]
             if (
@@ -358,6 +383,8 @@ class GroqAdapter(TextAdapter):
     base_url = "https://api.groq.com/openai/v1"
     expected_provider = "groq"
     expected_access = "FREE_RECURRING"
+    context_field = "context_window"
+    output_tokens_key = "max_completion_tokens"
 
     def _observe(self, headers):
         try:
@@ -380,6 +407,138 @@ class OpenRouterFreeAdapter(TextAdapter):
     base_url = "https://openrouter.ai/api/v1"
     expected_provider = "openrouter_free"
     expected_access = "FREE_DYNAMIC"
+    zero_price_models = True
+    account_check_path = "/key"
+    provider_preferences = {
+        "allow_fallbacks": False,
+        "require_parameters": True,
+        "data_collection": "deny",
+        "max_price": {"prompt": 0, "completion": 0, "request": 0, "image": 0},
+    }
+
+
+class KiloFreeAdapter(TextAdapter):
+    """Kilo gateway mirrors the OpenRouter catalog; only ':free' models with zero pricing pass."""
+
+    base_url = "https://api.kilo.ai/api/openrouter"
+    expected_provider = "kilo_free"
+    expected_access = "FREE_DYNAMIC"
+    zero_price_models = True
+
+
+class MistralAdapter(TextAdapter):
+    base_url = "https://api.mistral.ai/v1"
+    expected_provider = "mistral"
+    expected_access = "FREE_RECURRING"
+    context_field = "max_context_length"
+
+    def _observe(self, headers):
+        try:
+            limit = int(headers["x-ratelimit-limit-req-minute"])
+            remaining = int(headers["x-ratelimit-remaining-req-minute"])
+            if not 0 <= remaining <= limit or limit <= 0:
+                raise ValueError()
+            return QuotaSnapshot(
+                provider_id=self.provider_id,
+                quota_limit=limit,
+                quota_remaining_estimate=remaining,
+                reset_at=self.clock() + 60,
+            )
+        except (ValueError, KeyError):
+            return QuotaSnapshot(provider_id=self.provider_id)
+
+
+class ZaiFreeAdapter(TextAdapter):
+    """Z.ai flash models are zero-priced but absent from /models; the completion echo verifies them."""
+
+    base_url = "https://api.z.ai/api/paas/v4"
+    expected_provider = "zai_free"
+    expected_access = "FREE_DYNAMIC"
+    catalog_path = None
+    extra_payload = {"thinking": {"type": "disabled"}}
+
+    def _admit(self):
+        super()._admit()
+        if any(not model.model_id.endswith("-flash") for model in self.spec.models):
+            raise AuthenticationFailed("EXPLICIT_FREE_MODEL_REQUIRED")
+
+
+class NvidiaNimAdapter(TextAdapter):
+    base_url = "https://integrate.api.nvidia.com/v1"
+    expected_provider = "nvidia_nim"
+    expected_access = "FREE_RECURRING"
+    context_field = None
+
+
+class OllamaCloudAdapter(TextAdapter):
+    base_url = "https://ollama.com/v1"
+    expected_provider = "ollama_cloud"
+    expected_access = "FREE_RECURRING"
+    context_field = None
+
+
+class CloudflareWorkersAiAdapter(TextAdapter):
+    """Workers AI is free only inside the daily neuron allocation, which the adapter meters itself."""
+
+    expected_provider = "cloudflare_workers_ai"
+    expected_access = "FREE_RECURRING"
+    catalog_key = "result"
+    catalog_id_key = "name"
+    context_field = "context_window"
+    daily_neurons = 10_000
+
+    def __init__(self, spec, settings, account_id, **kwargs):
+        if not isinstance(account_id, str) or not re.fullmatch(r"[0-9a-f]{32}", account_id):
+            raise AuthenticationFailed("CLOUDFLARE_ACCOUNT_ID_REQUIRED")
+        self.base_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+        self.catalog_path = (
+            f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+            "/ai/models/search?task=Text%20Generation&per_page=100"
+        )
+        self._neurons_used = 0.0
+        self._neuron_day = None
+        super().__init__(spec, settings, **kwargs)
+
+    def _catalog_context(self, entry):
+        properties = entry.get("properties")
+        if not isinstance(properties, list):
+            return None
+        for item in properties:
+            if isinstance(item, dict) and item.get("property_id") == "context_window":
+                try:
+                    return int(item.get("value"))
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _day(self):
+        return int(self.clock() // SECONDS_IN_DAY)
+
+    def _reset_at(self):
+        return (self._day() + 1) * SECONDS_IN_DAY
+
+    def _observe(self, headers):
+        if self._neuron_day != self._day():
+            self._neuron_day, self._neurons_used = self._day(), 0.0
+        remaining = max(self.daily_neurons - self._neurons_used, 0)
+        return QuotaSnapshot(
+            provider_id=self.provider_id,
+            quota_limit=self.daily_neurons,
+            quota_remaining_estimate=int(remaining),
+            reset_at=self._reset_at(),
+        )
+
+    async def _before_completion(self, payload):
+        if self._observe({}).quota_remaining_estimate <= 0:
+            raise QuotaExceeded("DAILY_NEURON_ALLOCATION_SPENT", reset_at=self._reset_at())
+
+    def _after_completion(self, data):
+        usage = data.get("usage")
+        neurons = usage.get("neurons") if isinstance(usage, dict) else None
+        if isinstance(neurons, bool) or not isinstance(neurons, (int, float)) or neurons < 0:
+            raise BillingViolation("NEURON_USAGE_NOT_REPORTED")
+        self._neurons_used += neurons
+        self._quota = self._observe({})
 
 
 class GeminiAdapter(TextAdapter):
@@ -497,6 +656,7 @@ class GeminiAdapter(TextAdapter):
 class OllamaLocalAdapter(TextAdapter):
     expected_provider = "ollama_local"
     expected_access = "FREE_LOCAL"
+    remote = False
 
     def __init__(self, spec, settings, **kwargs):
         self.base_url = settings.ollama_url.rstrip("/")
@@ -603,6 +763,11 @@ LIVE_CREDENTIAL_BINDINGS = {
     "groq": "GROQ_API_KEY",
     "openrouter_free": "OPENROUTER_API_KEY",
     "google_gemini_api": "GEMINI_API_KEY",
+    "mistral": "MISTRAL_API_KEY",
+    "kilo_free": "KILO_API_KEY",
+    "zai_free": "ZAI_API_KEY",
+    "nvidia_nim": "NVIDIA_API_KEY",
+    "ollama_cloud": "OLLAMA_CLOUD_API_KEY",
 }
 
 
@@ -613,6 +778,11 @@ def register_live(registry, specs, settings, transport=None, *, credentials=None
         "groq": GroqAdapter,
         "openrouter_free": OpenRouterFreeAdapter,
         "google_gemini_api": GeminiAdapter,
+        "mistral": MistralAdapter,
+        "kilo_free": KiloFreeAdapter,
+        "zai_free": ZaiFreeAdapter,
+        "nvidia_nim": NvidiaNimAdapter,
+        "ollama_cloud": OllamaCloudAdapter,
     }
     for spec in specs:
         if not settings.enabled or spec.status not in {"ACTIVE", "QUOTA_PRESSURE"}:
