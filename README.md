@@ -28,14 +28,26 @@ print(result.output)  # "345"
 
 ## Supported providers
 
-| Provider | Env var | Access class |
-|----------|---------|-------------|
-| Google Gemini | `GEMINI_API_KEY` | Free recurring |
-| Groq | `GROQ_API_KEY` | Free recurring |
-| OpenRouter | `OPENROUTER_API_KEY` | Free dynamic |
-| Ollama | `OLLAMA_URL` + `OLLAMA_ENABLED=1` | Free local |
+| Provider | Env var | Access class | Models |
+|----------|---------|-------------|--------|
+| Google Gemini | `GEMINI_API_KEY` | Free recurring | `gemini-3.5-flash-lite`, `gemini-3.6-flash` |
+| Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
+| Mistral | `MISTRAL_API_KEY` | Free recurring | `mistral-small-latest`, `ministral-8b-latest` |
+| Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Free recurring (10k neurons/day, metered) | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
+| NVIDIA NIM | `NVIDIA_API_KEY` | Free recurring | `meta/llama-3.3-70b-instruct`, `meta/llama-3.1-8b-instruct` |
+| Ollama Cloud | `OLLAMA_CLOUD_API_KEY` | Free recurring | `gpt-oss:20b` |
+| OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, no data collection) | `gemma-4-26b`, `ling-3.0-flash-sante`, `north-mini-code`, `dots-3-note` |
+| Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-mini`, `laguna-s-2.1` |
+| Z.ai | `ZAI_API_KEY` | Free dynamic (flash models) | `glm-4.5-flash`, `glm-4.7-flash` |
+| Ollama (local) | `OLLAMA_HOST` or `OLLAMA_URL` | Free local | auto-discovered from the daemon |
 
-Pass API keys directly to the constructor or set env vars. At least one provider is required.
+Pass API keys directly to the constructor, set env vars, or point at a dotenv file with
+`FAIR(env_file=".env")` (the process environment wins over the file). At least one provider
+is required. Providers whose key is present but that cannot be registered (no Cloudflare
+account id, local Ollama not running) are listed in `fair.skipped` with the reason.
+
+Hugging Face is intentionally not supported: its router reports a nonzero `estimated_cost`
+on every call, which violates the free-only policy.
 
 ## Validation contracts
 
@@ -93,7 +105,16 @@ FAIR(
     gemini_api_key="...",         # or env: GEMINI_API_KEY
     groq_api_key="...",           # or env: GROQ_API_KEY
     openrouter_api_key="...",     # or env: OPENROUTER_API_KEY
-    ollama_url="...",             # or env: OLLAMA_URL (+ OLLAMA_ENABLED=1)
+    mistral_api_key="...",        # or env: MISTRAL_API_KEY
+    kilo_api_key="...",           # or env: KILO_API_KEY
+    zai_api_key="...",            # or env: ZAI_API_KEY
+    nvidia_api_key="...",         # or env: NVIDIA_API_KEY
+    ollama_cloud_api_key="...",   # or env: OLLAMA_CLOUD_API_KEY
+    cloudflare_api_token="...",   # or env: CLOUDFLARE_API_TOKEN
+    cloudflare_account_id="...",  # or env: CLOUDFLARE_ACCOUNT_ID
+    ollama_url="...",             # or env: OLLAMA_HOST / OLLAMA_URL (localhost is fine)
+    ollama_models=["llama3.2:3b"],# skip daemon discovery and use these local models
+    env_file=".env",              # optional dotenv file; process env takes precedence
     providers=[(spec, adapter)],  # custom providers (e.g. MockAdapter for testing)
     quality_level="standard",     # commodity|standard|advanced|high_impact_support
     max_attempts=3,               # retry budget across providers
