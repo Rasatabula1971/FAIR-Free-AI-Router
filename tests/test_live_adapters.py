@@ -333,6 +333,12 @@ class TestModuleWiring:
         assert [p["provider_id"] for p in fair.providers()] == ["groq"]
         assert "cloudflare_workers_ai" in fair.skipped
 
+    def test_cooldown_matches_longest_provider_window(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+        assert FAIR(groq_api_key="g")._router.settings.cooldown_seconds == 360
+        assert FAIR(groq_api_key="g", cooldown_seconds=30)._router.settings.cooldown_seconds == 30
+
     def test_localhost_normalizes_to_loopback(self):
         assert _loopback("http://localhost:11434/") == "http://127.0.0.1:11434"
         assert _loopback("http://127.0.0.1:11434") == "http://127.0.0.1:11434"

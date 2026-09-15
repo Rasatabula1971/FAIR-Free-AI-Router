@@ -32,7 +32,7 @@ print(result.output)  # "345"
 |----------|---------|-------------|--------|
 | Google Gemini | `GEMINI_API_KEY` | Free recurring | `gemini-3.5-flash-lite`, `gemini-3.6-flash` |
 | Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
-| Mistral | `MISTRAL_API_KEY` | Free recurring | `mistral-small-latest`, `ministral-8b-latest` |
+| Mistral | `MISTRAL_API_KEY` | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Free recurring (10k neurons/day, metered) | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
 | NVIDIA NIM | `NVIDIA_API_KEY` | Free recurring | `meta/llama-3.3-70b-instruct`, `meta/llama-3.1-8b-instruct` |
 | Ollama Cloud | `OLLAMA_CLOUD_API_KEY` | Free recurring | `gpt-oss:20b` |
@@ -124,6 +124,7 @@ FAIR(
     quality_level="standard",     # commodity|standard|advanced|high_impact_support
     max_attempts=3,               # retry budget across providers
     timeout_seconds=15,           # per-attempt timeout
+    cooldown_seconds=360,         # provider sit-out after circuit-break/throttle (Groq's window)
     cache_enabled=True,           # in-memory LRU cache for deterministic tasks
     cross_check_required=False,   # require independent verification
     on_event=callback,            # optional (event_type, payload) callback
