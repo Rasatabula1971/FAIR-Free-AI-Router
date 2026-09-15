@@ -16,7 +16,8 @@ class RoutingSettings(DTO):
     timeout_seconds: float = Field(default=15, gt=0, le=120)
     circuit_failures: int = Field(default=3, ge=1)
     circuit_window_seconds: float = Field(default=60, gt=0)
-    cooldown_seconds: float = Field(default=60, gt=0)
+    # Groq's request window refills at 86.4 s per request; a short burst reports ~5m45s.
+    cooldown_seconds: float = Field(default=360, gt=0)
     quality_weight: float = Field(default=0.65, ge=0)
     quota_weight: float = Field(default=0.20, ge=0)
     reliability_weight: float = Field(default=0.15, ge=0)
