@@ -205,6 +205,62 @@ class TestEmbeddedRouter:
         assert result.quality.verification_state == "HOST_REFERENCE_MATCH"
 
     @pytest.mark.asyncio
+    async def test_schema_only_accepted_at_standard(self):
+        router = _router(entries=[(_spec(), MockAdapter("a", text='{"items": [1, 2]}'))])
+        result = await router.solve(
+            _request(
+                task="list two items",
+                expected_schema={
+                    "type": "object",
+                    "required": ["items"],
+                    "properties": {"items": {"type": "array"}},
+                },
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.output == '{"items": [1, 2]}'
+        assert result.verification_state == "STRUCTURE_VALIDATED"
+        assert result.best_quality_score == 85.0
+
+    @pytest.mark.asyncio
+    async def test_schema_only_escalated_at_advanced(self):
+        router = _router(entries=[(_spec(), MockAdapter("a", text='{"items": []}'))])
+        result = await router.solve(
+            _request(
+                task="list items",
+                quality_level="advanced",
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.output is None
+        assert result.attempts[0].quality.verification_state == "STRUCTURE_VALIDATED"
+
+    @pytest.mark.asyncio
+    async def test_schema_mismatch_rejected(self):
+        router = _router(entries=[(_spec(), MockAdapter("a", text='{"wrong": 1}'))])
+        result = await router.solve(
+            _request(task="list items", expected_schema={"type": "object", "required": ["items"]})
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.attempts[0].quality.hard_reject
+        assert "SCHEMA_FAILURE" in result.attempts[0].quality.reject_reasons
+
+    @pytest.mark.asyncio
+    async def test_schema_only_not_accepted_when_task_needs_coding(self):
+        # The profiler infers a coding requirement; a schema check cannot vouch for code.
+        router = _router(entries=[(_spec(), MockAdapter("a", text='{"items": []}'))])
+        result = await router.solve(
+            _request(
+                task="list the python functions",
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        checks = result.attempts[0].quality.validator_results
+        assert checks["coverage"] == "TASK_VALIDATOR_UNAVAILABLE"
+
+    @pytest.mark.asyncio
     async def test_provider_failure_retries(self):
         spec_a = _spec("a")
         spec_b = _spec("b")

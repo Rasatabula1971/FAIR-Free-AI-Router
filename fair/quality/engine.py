@@ -8,6 +8,7 @@ from fair.quality.claims import validate_claims
 from fair.quality.code_validator import validate_function
 from fair.quality.grounding import grounded_result
 from fair.quality.json_data import strict_json
+from fair.quality.thresholds import STRUCTURE_VALIDATED_SCORE
 from fair.schemas.domain import QualityReport, SourcePolicyReport
 
 
@@ -116,6 +117,8 @@ def evaluate(
                 reasons.append(failure)
         # 100 means all deterministic contract checks passed, not a truth probability.
         score = None if matched is None else 100.0 if matched else 0.0
+    elif verification == "STRUCTURE_VALIDATED":
+        score = STRUCTURE_VALIDATED_SCORE
 
     unsupported = (
         (profile.requires_grounding and kind not in {"grounded_json", "grounded_claims"})
@@ -179,6 +182,7 @@ def acceptable(report, profile):
         and report.overall_score >= profile.minimum_quality_score
         and report.verification_state
         in {
+            "STRUCTURE_VALIDATED",
             "DETERMINISTIC_ARITHMETIC",
             "HOST_REFERENCE_MATCH",
             "SOURCE_DATA_MATCH",

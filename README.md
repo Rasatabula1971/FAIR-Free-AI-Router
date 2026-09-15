@@ -59,6 +59,11 @@ FAIR verifies AI responses before accepting them:
 - **`grounded_json`** — extracts values from supplied source data via JSON pointers
 - **`grounded_claims`** — structured fact-checking across supplied evidence sources
 
+Passing `expected_schema` with no contract checks JSON Schema conformance of the
+output. That proves shape, not truth, so it scores 85: accepted at `commodity` and
+`standard`, escalated at `advanced` and `high_impact_support`. Tasks the profiler
+flags as needing code or grounding still require a matching contract.
+
 ```python
 # Code validation
 result = await fair.solve(
