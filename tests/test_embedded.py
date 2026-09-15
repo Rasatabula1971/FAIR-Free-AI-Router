@@ -261,6 +261,37 @@ class TestEmbeddedRouter:
         assert checks["coverage"] == "TASK_VALIDATOR_UNAVAILABLE"
 
     @pytest.mark.asyncio
+    async def test_explicit_task_type_disables_keyword_inference(self):
+        # The task embeds third-party text mentioning python and sources; the
+        # caller declared an extraction task, so neither coding nor grounding
+        # is inferred and the schema-validated answer is accepted.
+        router = _router(entries=[(_spec(), MockAdapter("a", text='{"items": []}'))])
+        result = await router.solve(
+            _request(
+                task="Extract the problems from this comment: "
+                "'my python script breaks, see the sources in the README'",
+                task_type="extraction",
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.verification_state == "STRUCTURE_VALIDATED"
+
+    @pytest.mark.asyncio
+    async def test_explicit_coding_task_type_still_requires_coding(self):
+        router = _router(entries=[(_spec(), MockAdapter("a", text='{"items": []}'))])
+        result = await router.solve(
+            _request(
+                task="list them",
+                task_type="coding",
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        checks = result.attempts[0].quality.validator_results
+        assert checks["coverage"] == "TASK_VALIDATOR_UNAVAILABLE"
+
+    @pytest.mark.asyncio
     async def test_provider_failure_retries(self):
         spec_a = _spec("a")
         spec_b = _spec("b")
