@@ -9,8 +9,13 @@ def profile_task(request: SolveRequest, thresholds: dict[str, float]) -> TaskPro
     task = request.task.lower()
     required = set(request.required_capabilities)
     task_class = request.task_type or "general"
-    if request.task_type in {"coding", "debugging"} or re.search(
-        r"```|\b(code|debug|compiler|python|javascript)\b|\.py\b", task
+    # Keyword inference is a fallback for callers that say nothing about the
+    # task. A caller that names the task type has declared it; its task text
+    # routinely embeds third-party data (comments, descriptions) whose words
+    # ("code", "sources") say nothing about what the caller needs.
+    infer = request.task_type is None
+    if request.task_type in {"coding", "debugging"} or (
+        infer and re.search(r"```|\b(code|debug|compiler|python|javascript)\b|\.py\b", task)
     ):
         required.add("coding")
         task_class = "coding"
@@ -32,10 +37,13 @@ def profile_task(request: SolveRequest, thresholds: dict[str, float]) -> TaskPro
         )
         or request.task_type in {"research", "grounded_research", "factual_research"}
         or request.freshness_required
-        or bool(
-            re.search(
-                r"\b(latest|current|sources?|citations?|research)\b",
-                re.sub(r"\bsource\s+code\b", "code", task),
+        or (
+            infer
+            and bool(
+                re.search(
+                    r"\b(latest|current|sources?|citations?|research)\b",
+                    re.sub(r"\bsource\s+code\b", "code", task),
+                )
             )
         )
     )
