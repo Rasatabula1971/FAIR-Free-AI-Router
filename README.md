@@ -12,6 +12,26 @@ pip install -e .
 
 Requires Python 3.12+. Dependencies: `pydantic`, `httpx`, `jsonschema`, `PyYAML`.
 
+## Windows test console
+
+On Windows, double-click `START_FAIR.bat` from the repository root. The launcher
+uses `.venv` when present, creates it when missing, installs FAIR plus the development
+test tools if needed, and then opens an interactive menu:
+
+1. Quick offline validation test
+2. Test a live provider
+3. Test routing/failover with deterministic offline providers
+4. Test a live independent cross-check
+5. Run the full pytest suite
+6. Show eligible and skipped providers
+7. Exit
+
+Live tests read the existing `.env` file. API keys are never printed by the console.
+OpenRouter Free and Kilo Free retain FAIR's runtime zero-cost checks. Providers whose
+API keys may belong to paid/billable accounts still require an explicit free-only
+account confirmation; the console asks for that confirmation for the current session
+and does not persist it.
+
 ## Quick start
 
 ```python
