@@ -104,10 +104,13 @@ Request a second independent model to verify the answer:
 
 ```python
 result = await fair.solve(
-    "What is the capital of France?",
+    "What is 15 * 23?",
+    validation={"kind": "arithmetic", "expression": "15*23"},
     cross_check_required=True,
 )
-# result.cross_check.state: "PASSED", "DISAGREEMENT", etc.
+# Cross-check agreement is assessed only for supported deterministic or
+# structured validation contracts; free-form text is not treated as verified
+# merely because two models produce similar answers.
 ```
 
 ## Response statuses
