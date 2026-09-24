@@ -444,13 +444,35 @@ class KiloFreeAdapter(TextAdapter):
         if not isinstance(usage, dict):
             self._cost_observation = "USAGE_MISSING"
             raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
-        if "cost_microdollars" not in usage:
-            self._cost_observation = "COST_FIELD_MISSING"
+        if "cost_microdollars" in usage:
+            if zero(usage["cost_microdollars"]):
+                self._cost_observation = "ZERO"
+                return
+            self._cost_observation = "NONZERO_OR_INVALID"
             raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
-        if zero(usage["cost_microdollars"]):
-            self._cost_observation = "ZERO"
+
+        # Kilo documents ':free' models as zero-cost, but some live non-streaming
+        # responses omit cost_microdollars even though usage is present. Fall back
+        # only to the fresh catalog proof already obtained immediately before the
+        # request: exact response model, explicit ':free' suffix, and zero pricing.
+        response_model = data.get("model")
+        fresh_catalog = (
+            self._model_cache is not None
+            and 0 <= self.clock() - self._model_cache_at < self._catalog_ttl
+        )
+        catalog_ids = {
+            model.model_id for model in (self._model_cache or [])
+        }
+        if (
+            fresh_catalog
+            and isinstance(response_model, str)
+            and response_model.endswith(":free")
+            and response_model in catalog_ids
+        ):
+            self._cost_observation = "CATALOG_ZERO_PRICE_FALLBACK"
             return
-        self._cost_observation = "NONZERO_OR_INVALID"
+
+        self._cost_observation = "COST_FIELD_MISSING"
         raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
 
