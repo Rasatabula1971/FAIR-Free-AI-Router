@@ -431,10 +431,27 @@ class KiloFreeAdapter(TextAdapter):
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
 
+    def __init__(self, *args, **kwargs):
+        self._cost_observation = "NOT_OBSERVED"
+        super().__init__(*args, **kwargs)
+
+    def safe_diagnostics(self):
+        """Expose only a fixed billing-verification state, never raw provider data."""
+        return {"cost_microdollars": self._cost_observation}
+
     def _after_completion(self, data):
         usage = data.get("usage")
-        if not isinstance(usage, dict) or not zero(usage.get("cost_microdollars")):
+        if not isinstance(usage, dict):
+            self._cost_observation = "USAGE_MISSING"
             raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
+        if "cost_microdollars" not in usage:
+            self._cost_observation = "COST_FIELD_MISSING"
+            raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
+        if zero(usage["cost_microdollars"]):
+            self._cost_observation = "ZERO"
+            return
+        self._cost_observation = "NONZERO_OR_INVALID"
+        raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
 
 class MistralAdapter(TextAdapter):
