@@ -434,18 +434,24 @@ class FAIR:
         - output: the verified answer text (only when ACCEPTED)
         - quality: full QualityReport with scores and verification state
         """
-        request = SolveRequest(
-            client_id=client_id,
-            task=task,
-            task_type=task_type,
-            quality_level=quality_level or self._quality_level,
-            expected_schema=expected_schema,
-            validation=validation,
-            evidence=evidence or [],
-            cross_check_required=cross_check_required if cross_check_required is not None else self._cross_check,
-            max_output_tokens=max_output_tokens,
-            priority=priority,
-            cache_mode=cache_mode,
+        request = SolveRequest.model_validate(
+            {
+                "client_id": client_id,
+                "task": task,
+                "task_type": task_type,
+                "quality_level": quality_level or self._quality_level,
+                "expected_schema": expected_schema,
+                "validation": validation,
+                "evidence": evidence or [],
+                "cross_check_required": (
+                    cross_check_required
+                    if cross_check_required is not None
+                    else self._cross_check
+                ),
+                "max_output_tokens": max_output_tokens,
+                "priority": priority,
+                "cache_mode": cache_mode,
+            }
         )
         return await self._router.solve(request)
 
