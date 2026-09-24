@@ -120,15 +120,15 @@ class TextAdapter:
     expected_provider = ""
     expected_access = ""
     remote = True
-    catalog_path = "/models"
+    catalog_path: str | None = "/models"
     catalog_key = "data"
     catalog_id_key = "id"
-    context_field = "context_length"
+    context_field: str | None = "context_length"
     zero_price_models = False
-    account_check_path = None
-    provider_preferences = None
+    account_check_path: str | None = None
+    provider_preferences: dict[str, object] | None = None
     output_tokens_key = "max_tokens"
-    extra_payload = {}
+    extra_payload: dict[str, object] = {}
     credential_header = "Authorization"
     credential_prefix = "Bearer "
 
