@@ -114,7 +114,7 @@ def _transport(routes):
 
 
 class TestKilo:
-    MODEL = "nex-agi/nex-n2.5-mini:free"
+    MODEL = "nex-agi/nex-n2.5-pro:free"
 
     def _adapter(self, routes):
         transport, seen = _transport(routes)
@@ -152,7 +152,7 @@ class TestKilo:
     def test_non_free_model_id_is_refused(self):
         with pytest.raises(AuthenticationFailed):
             KiloFreeAdapter(
-                _spec("kilo_free", "FREE_DYNAMIC", "nex-agi/nex-n2.5-mini"), _settings(),
+                _spec("kilo_free", "FREE_DYNAMIC", "nex-agi/nex-n2.5-pro"), _settings(),
                 credential=SecretStr("k"), transport=httpx.MockTransport(lambda r: httpx.Response(500)),
             )
 
@@ -164,7 +164,7 @@ class TestOpenRouter:
         transport, seen = _transport({
             ("GET", "/models"): (200, {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0"}}]}),
             ("GET", "/key"): (200, {"data": {"is_free_tier": True}}),
-            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost_microdollars": 0})),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
         })
         adapter = OpenRouterFreeAdapter(
             _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL), _settings(),
