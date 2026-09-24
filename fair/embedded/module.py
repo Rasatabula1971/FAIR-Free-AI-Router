@@ -23,7 +23,6 @@ from fair.providers.live import (
     LiveSettings,
     MistralAdapter,
     NvidiaNimAdapter,
-    OllamaCloudAdapter,
     OllamaLocalAdapter,
     OpenRouterFreeAdapter,
     ZaiFreeAdapter,
@@ -154,13 +153,6 @@ _CLOUD_PROVIDERS = {
         "access_class": "FREE_RECURRING",
         "models": _text_models(("meta/llama-3.3-70b-instruct", 131072), ("meta/llama-3.1-8b-instruct", 131072)),
     },
-    "ollama_cloud": {
-        "kwarg": "ollama_cloud_api_key",
-        "env": "OLLAMA_CLOUD_API_KEY",
-        "adapter": OllamaCloudAdapter,
-        "access_class": "FREE_RECURRING",
-        "models": _text_models(("gpt-oss:20b", 131072)),
-    },
     "cloudflare_workers_ai": {
         "kwarg": "cloudflare_api_token",
         "env": "CLOUDFLARE_API_TOKEN",
@@ -287,6 +279,11 @@ class FAIR:
             "cloudflare_api_token": cloudflare_api_token,
         }
         cloudflare_account_id = cloudflare_account_id or env.get("CLOUDFLARE_ACCOUNT_ID")
+        ollama_cloud_key = ollama_cloud_api_key or env.get("OLLAMA_CLOUD_API_KEY")
+        if ollama_cloud_key and ollama_cloud_key.strip():
+            self.skipped["ollama_cloud"] = (
+                "credit-priced cloud service is not eligible for FAIR free-only routing"
+            )
 
         confirmed = set(confirmed_free_providers or ())
         unknown_confirmations = confirmed - set(_CLOUD_PROVIDERS)
