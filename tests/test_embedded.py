@@ -573,7 +573,7 @@ class TestMemoryCache:
 
 class TestFAIRModule:
     def test_no_providers_raises(self):
-        with pytest.raises(ValueError, match="at least one provider"):
+        with pytest.raises(ValueError, match="at least one safely eligible provider"):
             FAIR()
 
     def test_mock_provider(self):
