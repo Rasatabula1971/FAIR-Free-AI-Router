@@ -6,11 +6,11 @@ JSON schema matching, citation verification, and cross-checking between independ
 
 ## Install
 
-```
+```bash
 pip install -e .
 ```
 
-Requires Python 3.12+. Dependencies: `pydantic`, `httpx`, `jsonschema`.
+Requires Python 3.12+. Dependencies: `pydantic`, `httpx`, `jsonschema`, `PyYAML`.
 
 ## Quick start
 
@@ -32,7 +32,7 @@ print(result.output)  # "345"
 ## Supported providers
 
 | Provider | Env var | Access class | Models |
-|----------|---------|-------------|--------|
+| ---------- | --------- | ------------- | -------- |
 | Google Gemini | `GEMINI_API_KEY` | Free recurring | `gemini-3.5-flash-lite`, `gemini-3.6-flash` |
 | Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
 | Mistral | `MISTRAL_API_KEY` | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
@@ -47,12 +47,12 @@ Pass API keys directly to the constructor, set env vars, or point at a dotenv fi
 is required.
 
 FAIR does not treat possession of an API key as proof that a recurring provider account is
-still on a free tier. For providers such as Gemini, Groq, Mistral, NVIDIA NIM, Ollama Cloud,
-Z.ai and Cloudflare Workers AI, explicitly attest the account is currently free-only with
+still on a free tier. For providers such as Gemini, Groq, Mistral, Z.ai, and Cloudflare
+Workers AI, explicitly attest the account is currently free-only with
 `confirmed_free_providers={...}`. This is an operator assertion that the account/provider
 configuration cannot auto-bill or otherwise incur paid API usage; do not set it merely
-because the provider offers a free tier. OpenRouter Free and Kilo Free are auto-confirmed because
-their adapters enforce zero-priced `:free` models and reject non-zero observed cost at
+because the provider offers a free tier. OpenRouter Free and Kilo Free are auto-confirmed
+because their adapters enforce zero-priced `:free` models and reject non-zero observed cost at
 runtime. Providers whose key is present but cannot be safely registered are listed in
 `fair.skipped` with the reason.
 
@@ -173,7 +173,7 @@ Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `
 
 All quality validation logic runs as pure functions — no database, no server, no YAML config.
 
-```
+```text
 FAIR(api_keys)
  └─ EmbeddedRouter
      ├─ MemorySelector      (weighted scoring: quality × 0.65 + quota × 0.20 + reliability × 0.15)
@@ -185,7 +185,7 @@ FAIR(api_keys)
 
 ## Development
 
-```
+```bash
 pip install -e ".[dev]"
 pytest -q
 ```
