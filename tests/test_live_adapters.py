@@ -140,6 +140,7 @@ class TestKilo:
         })
         response = await adapter.complete(_request(self.MODEL))
         assert response.text == "pong"
+        assert adapter.safe_diagnostics() == {"cost_microdollars": "ZERO"}
         assert str(seen[-1].url) == "https://api.kilo.ai/api/gateway/chat/completions"
         assert "provider" not in json.loads(seen[-1].content)
 
@@ -156,6 +157,52 @@ class TestKilo:
         })
         with pytest.raises(BillingViolation):
             await adapter.complete(_request(self.MODEL))
+        assert adapter.safe_diagnostics() == {
+            "cost_microdollars": "NONZERO_OR_INVALID"
+        }
+
+    async def test_missing_cost_field_fails_closed_with_safe_diagnostic(self):
+        catalog = {
+            "data": [
+                {
+                    "id": self.MODEL,
+                    "context_length": 262144,
+                    "pricing": {"prompt": "0", "completion": "0"},
+                }
+            ]
+        }
+        adapter, _ = self._adapter({
+            ("GET", "/models"): (200, catalog),
+            ("POST", "/chat/completions"): (
+                200,
+                _completion(self.MODEL, usage={"prompt_tokens": 1, "completion_tokens": 1}),
+            ),
+        })
+        with pytest.raises(BillingViolation):
+            await adapter.complete(_request(self.MODEL))
+        assert adapter.safe_diagnostics() == {
+            "cost_microdollars": "COST_FIELD_MISSING"
+        }
+
+    async def test_missing_usage_fails_closed_with_safe_diagnostic(self):
+        catalog = {
+            "data": [
+                {
+                    "id": self.MODEL,
+                    "context_length": 262144,
+                    "pricing": {"prompt": "0", "completion": "0"},
+                }
+            ]
+        }
+        adapter, _ = self._adapter({
+            ("GET", "/models"): (200, catalog),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL)),
+        })
+        with pytest.raises(BillingViolation):
+            await adapter.complete(_request(self.MODEL))
+        assert adapter.safe_diagnostics() == {
+            "cost_microdollars": "USAGE_MISSING"
+        }
 
     def test_non_free_model_id_is_refused(self):
         with pytest.raises(AuthenticationFailed):
