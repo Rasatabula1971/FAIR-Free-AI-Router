@@ -17,7 +17,10 @@ Requires Python 3.12+. Dependencies: `pydantic`, `httpx`, `jsonschema`.
 ```python
 from fair import FAIR
 
-fair = FAIR(gemini_api_key="...")
+fair = FAIR(
+    gemini_api_key="...",
+    confirmed_free_providers={"google_gemini_api"},
+)
 result = await fair.solve(
     "What is 15 * 23?",
     validation={"kind": "arithmetic", "expression": "15*23"},
@@ -43,8 +46,15 @@ print(result.output)  # "345"
 
 Pass API keys directly to the constructor, set env vars, or point at a dotenv file with
 `FAIR(env_file=".env")` (the process environment wins over the file). At least one provider
-is required. Providers whose key is present but that cannot be registered (no Cloudflare
-account id, local Ollama not running) are listed in `fair.skipped` with the reason.
+is required.
+
+FAIR does not treat possession of an API key as proof that a recurring provider account is
+still on a free tier. For providers such as Gemini, Groq, Mistral, NVIDIA NIM, Ollama Cloud,
+Z.ai, and Cloudflare Workers AI, explicitly attest the account is currently free-only with
+`confirmed_free_providers={...}`. OpenRouter Free and Kilo Free are auto-confirmed because
+their adapters enforce zero-priced `:free` models and reject non-zero observed cost at
+runtime. Providers whose key is present but cannot be safely registered are listed in
+`fair.skipped` with the reason.
 
 Hugging Face is intentionally not supported: its router reports a nonzero `estimated_cost`
 on every call, which violates the free-only policy.
@@ -118,6 +128,10 @@ FAIR(
     ollama_cloud_api_key="...",   # or env: OLLAMA_CLOUD_API_KEY
     cloudflare_api_token="...",   # or env: CLOUDFLARE_API_TOKEN
     cloudflare_account_id="...",  # or env: CLOUDFLARE_ACCOUNT_ID
+    confirmed_free_providers={     # explicit account-tier confirmation where required
+        "google_gemini_api",
+        "groq",
+    },
     ollama_url="...",             # or env: OLLAMA_HOST / OLLAMA_URL (localhost is fine)
     ollama_models=["llama3.2:3b"],# skip daemon discovery and use these local models
     env_file=".env",              # optional dotenv file; process env takes precedence
@@ -141,7 +155,11 @@ Monitor routing decisions without a database:
 def on_event(event_type, payload):
     print(f"{event_type}: {payload}")
 
-fair = FAIR(gemini_api_key="...", on_event=on_event)
+fair = FAIR(
+    gemini_api_key="...",
+    confirmed_free_providers={"google_gemini_api"},
+    on_event=on_event,
+)
 ```
 
 Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `ACCEPTED`, `ESCALATION_REQUIRED`, `FAILED`.
@@ -169,7 +187,7 @@ pytest -q
 
 ## Safety
 
-- Paid routes are prohibited — the admission policy enforces $0 cost, no billing, no paid subscriptions
+- Paid routes are prohibited — recurring/free-plan accounts require explicit free-tier confirmation, while dynamic free gateways must prove zero-priced models/cost at runtime
 - A `BillingViolation` from any provider stops the entire system immediately
 - Provider credentials are never leaked in responses (`CredentialedAdapter`)
 - The code validator uses a safe AST interpreter with bounded steps (4096) and iterations (1024) — no `eval`/`exec`
