@@ -238,6 +238,12 @@ class Attempt(DTO):
     disposition: AttemptDisposition
     latency_ms: float
     error_type: str | None = None
+    # Why the attempt failed, in FAIR's own words: a ProviderError's message
+    # (composed by the adapter, e.g. "HTTP_503") or an exception class name
+    # (e.g. "TimeoutError"). Never upstream response text, which may carry
+    # credentials. error_type alone ("PROVIDER_UNAVAILABLE") hid whether a
+    # provider was down, slow, or returning garbage.
+    error_detail: str | None = None
     quality: QualityReport | None = None
     role: Literal["PRIMARY", "CROSS_CHECK"] = "PRIMARY"
 

@@ -11,7 +11,16 @@ class RoutingSettings(DTO):
     cache_max_entries: int = Field(default=1000, ge=1, le=100000)
     confidence_half_life_days: int = Field(default=30, ge=1, le=365)
     drift_drop_points: float = Field(default=15, gt=0, le=100, allow_inf_nan=False)
+    # Answered attempts: models that returned something the quality gate judged
+    # (ACCEPTED / QUALITY_FAILURE / UNVERIFIED). This is the "how many opinions
+    # before escalating" budget.
     max_attempts: int = Field(default=3, ge=1, le=10)
+    # Unanswered attempts: models that never produced an answer (INFRA_FAILURE,
+    # QUOTA_FAILURE). These do not spend the answer budget -- a provider that
+    # timed out or is throttled said nothing about the task -- but they are
+    # bounded separately so a fleet-wide outage still ends in finite time.
+    # Every (provider, model) is tried at most once per solve either way.
+    max_unanswered_attempts: int = Field(default=6, ge=0, le=30)
     max_verification_attempts: int = Field(default=2, ge=1, le=3)
     timeout_seconds: float = Field(default=15, gt=0, le=120)
     circuit_failures: int = Field(default=3, ge=1)

@@ -9,7 +9,13 @@ from fair.embedded.cache import MemoryCache
 from fair.embedded.performance import MemoryPerformanceRegistry
 from fair.embedded.quota import MemoryQuotaGovernor
 from fair.embedded.selector import MemorySelector
-from fair.providers.base import AuthenticationFailed, BillingViolation, QuotaExceeded, RateLimited
+from fair.providers.base import (
+    AuthenticationFailed,
+    BillingViolation,
+    ProviderError,
+    QuotaExceeded,
+    RateLimited,
+)
 from fair.quality.consensus import compare, independent
 from fair.quality.engine import acceptable, evaluate
 from fair.quality.thresholds import validate_thresholds
@@ -19,6 +25,19 @@ from fair.schemas.domain import (
     CrossCheckReport,
     NormalizedModelRequest,
 )
+
+
+def _failure_detail(error):
+    """What an attempt may record about its failure.
+
+    A ProviderError's message is composed by FAIR's own adapters (an HTTP
+    status, a policy code), never upstream response text -- see
+    fair.providers.base. Anything else is reduced to its class name, since an
+    arbitrary exception's text can carry a request URL with a credential in it.
+    """
+    if isinstance(error, ProviderError):
+        return str(error)[:120] or type(error).__name__
+    return type(error).__name__
 
 
 class EmbeddedRouter:
@@ -46,7 +65,7 @@ class EmbeddedRouter:
         if not self.quota.reserve(spec):
             return None, None, False
         start = monotonic()
-        quality = response = error_type = None
+        quality = response = error_type = error_detail = None
         validator_failed = cancelled = False
         billing_violation = False
         self._emit(
@@ -78,27 +97,32 @@ class EmbeddedRouter:
             if response.quota is not None:
                 self.quota.observe(spec, response.quota)
             self.quota.success(spec.provider_id)
-        except BillingViolation:
+        except BillingViolation as error:
             billing_violation = True
             self.quota.block_security(spec.provider_id)
             self.stopped = True
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
+            error_detail = _failure_detail(error)
         except QuotaExceeded as error:
             self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
+            error_detail = _failure_detail(error)
         except RateLimited as error:
             self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
-        except AuthenticationFailed:
+            error_detail = _failure_detail(error)
+        except AuthenticationFailed as error:
             self.quota.block_security(spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "AUTHENTICATION_FAILED"
+            error_detail = _failure_detail(error)
         except asyncio.CancelledError:
             cancelled = True
             self.quota.failure(spec.provider_id)
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
-        except Exception:
+        except Exception as error:
             self.quota.failure(spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
+            error_detail = _failure_detail(error)
         else:
             try:
                 quality = evaluate(request, profile, response)
@@ -127,6 +151,7 @@ class EmbeddedRouter:
             disposition=disposition,
             latency_ms=(monotonic() - start) * 1000,
             error_type=error_type,
+            error_detail=error_detail,
             quality=quality,
             role=role,
         )
@@ -227,7 +252,17 @@ class EmbeddedRouter:
         reason = "NO_ELIGIBLE_FREE_MODELS"
         accepted_response = accepted_quality = None
         validator_failed = False
-        for _ in range(self.settings.max_attempts):
+        # Two budgets (see RoutingSettings): max_attempts counts answers the
+        # quality gate judged; max_unanswered_attempts bounds the models that
+        # never answered (down, slow, throttled). Counting the latter against
+        # the former made three outages end the search while a dozen healthy
+        # models sat untried -- "no model passed" reported as if every model
+        # had been asked.
+        answered = unanswered = 0
+        while (
+            answered < self.settings.max_attempts
+            and unanswered <= self.settings.max_unanswered_attempts
+        ):
             if self.stopped:
                 reason = "SYSTEM_STOPPED"
                 break
@@ -245,9 +280,17 @@ class EmbeddedRouter:
                 validator_failed = True
                 break
             if attempt is None:
+                # The reservation lost a race with the governor (the provider
+                # became unavailable between selection and reserve). It stays
+                # out of this solve rather than being re-selected forever.
+                tried.add((route[1].provider_id, route[2].model_id))
                 continue
             tried.add((attempt.provider_id, attempt.model_id))
             attempts.append(attempt)
+            if attempt.disposition in {"INFRA_FAILURE", "QUOTA_FAILURE"}:
+                unanswered += 1
+            else:
+                answered += 1
             if validator_failed:
                 break
             if self.stopped and not required:

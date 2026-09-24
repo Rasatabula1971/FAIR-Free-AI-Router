@@ -246,6 +246,7 @@ class FAIR:
         providers: list[tuple[ProviderSpec, ProviderAdapter]] | None = None,
         quality_level: Literal["commodity", "standard", "advanced", "high_impact_support"] = "standard",
         max_attempts: int = 3,
+        max_unanswered_attempts: int = 6,
         max_verification_attempts: int = 2,
         timeout_seconds: float = 15,
         cooldown_seconds: float = 360,
@@ -311,6 +312,7 @@ class FAIR:
 
         settings = RoutingSettings(
             max_attempts=max_attempts,
+            max_unanswered_attempts=max_unanswered_attempts,
             max_verification_attempts=max_verification_attempts,
             timeout_seconds=timeout_seconds,
             cooldown_seconds=cooldown_seconds,

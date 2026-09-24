@@ -204,7 +204,10 @@ class TextAdapter:
                 "RATE_LIMITED", retry_after=retry_seconds(headers.get("retry-after"), self.clock())
             )
         if status != 200:
-            raise ProviderUnavailable("PROVIDER_UNAVAILABLE")
+            # The status code is FAIR's own observation, not upstream text, so
+            # it is safe to surface; it is the difference between "overloaded
+            # (503)", "bad request (400)" and "gone (404)" in the attempt log.
+            raise ProviderUnavailable(f"HTTP_{status}")
 
     async def _json(self, method, path, payload=None):
         self._admit()
