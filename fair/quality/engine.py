@@ -9,7 +9,7 @@ from fair.quality.code_validator import validate_function
 from fair.quality.grounding import grounded_result
 from fair.quality.json_data import json_document
 from fair.quality.thresholds import STRUCTURE_VALIDATED_SCORE
-from fair.schemas.domain import QualityReport, SourcePolicyReport
+from fair.schemas.domain import QualityReport, SourcePolicyReport, VerificationState
 
 
 def evaluate(
@@ -18,8 +18,10 @@ def evaluate(
     reasons = []
     checks = {}
     claim_checks = []
-    verification = "UNVERIFIED"
-    score = None
+    verification: VerificationState = "UNVERIFIED"
+    score: float | None = None
+    matched: bool | None = None
+    failure: str | None = None
     if not response.text.strip():
         reasons.append("EMPTY_RESPONSE")
     if response.finish_reason != "stop":
@@ -44,7 +46,7 @@ def evaluate(
         checks["citations"] = (
             "FAIL" if any("CITATION" in r for r in reasons) else "QUOTE_MATCH_ONLY"
         )
-    assertions = {}
+    assertions: dict[tuple[str, str], str] = {}
     for claim in response.assertions:
         key = (claim.subject.strip().casefold(), claim.predicate.strip().casefold())
         if key in assertions and assertions[key] != claim.value.strip().casefold():
@@ -106,14 +108,14 @@ def evaluate(
             checks[kind] = "UNAVAILABLE" if matched is None else "PASS" if matched else "FAIL"
             checks["code_test_count"] = str(len(request.validation.cases))
             verification = "NATIVE_CODE_TESTS" if matched else "UNVERIFIED"
-            if matched is False:
+            if matched is False and failure is not None:
                 reasons.append(failure)
         else:
             matched, failure = validate_function(response.text, request.validation)
             checks["python_function"] = "PASS" if matched else "FAIL"
             checks["code_test_count"] = str(len(request.validation.cases))
             verification = "BOUNDED_CODE_TESTS" if matched else "UNVERIFIED"
-            if not matched:
+            if not matched and failure is not None:
                 reasons.append(failure)
         # 100 means all deterministic contract checks passed, not a truth probability.
         score = None if matched is None else 100.0 if matched else 0.0
