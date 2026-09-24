@@ -361,6 +361,19 @@ class TestModuleWiring:
                 confirmed_free_providers={"not-a-provider"},
             )
 
+    def test_nvidia_hosted_credit_api_is_never_eligible(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+        fair = FAIR(
+            nvidia_api_key="n",
+            kilo_api_key="k",
+        )
+
+        assert {p["provider_id"] for p in fair.providers()} == {"kilo_free"}
+        assert fair.skipped["nvidia_nim"].startswith("hosted preview API uses starter credits")
+
     def test_ollama_cloud_credit_pricing_is_never_eligible(self, monkeypatch):
         for entry in _CLOUD_PROVIDERS.values():
             monkeypatch.delenv(entry["env"], raising=False)
