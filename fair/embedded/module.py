@@ -22,7 +22,6 @@ from fair.providers.live import (
     KiloFreeAdapter,
     LiveSettings,
     MistralAdapter,
-    NvidiaNimAdapter,
     OllamaLocalAdapter,
     OpenRouterFreeAdapter,
     ZaiFreeAdapter,
@@ -145,13 +144,6 @@ _CLOUD_PROVIDERS = {
         "adapter": ZaiFreeAdapter,
         "access_class": "FREE_DYNAMIC",
         "models": _text_models(("glm-4.5-flash", 131072), ("glm-4.7-flash", 131072)),
-    },
-    "nvidia_nim": {
-        "kwarg": "nvidia_api_key",
-        "env": "NVIDIA_API_KEY",
-        "adapter": NvidiaNimAdapter,
-        "access_class": "FREE_RECURRING",
-        "models": _text_models(("meta/llama-3.3-70b-instruct", 131072), ("meta/llama-3.1-8b-instruct", 131072)),
     },
     "cloudflare_workers_ai": {
         "kwarg": "cloudflare_api_token",
@@ -283,6 +275,12 @@ class FAIR:
         if ollama_cloud_key and ollama_cloud_key.strip():
             self.skipped["ollama_cloud"] = (
                 "credit-priced cloud service is not eligible for FAIR free-only routing"
+            )
+        nvidia_key = nvidia_api_key or env.get("NVIDIA_API_KEY")
+        if nvidia_key and nvidia_key.strip():
+            self.skipped["nvidia_nim"] = (
+                "hosted preview API uses starter credits and is not eligible for FAIR "
+                "recurring-free routing"
             )
 
         confirmed = set(confirmed_free_providers or ())
