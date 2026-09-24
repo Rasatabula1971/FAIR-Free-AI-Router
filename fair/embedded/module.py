@@ -227,7 +227,10 @@ class FAIR:
 
     Usage::
 
-        fair = FAIR(gemini_api_key="...")
+        fair = FAIR(
+            gemini_api_key="...",
+            confirmed_free_providers={"google_gemini_api"},
+        )
         result = await fair.solve("What is 15 * 23?",
                                   validation={"kind": "arithmetic", "expression": "15*23"})
         print(result.output)  # "345"
@@ -326,10 +329,11 @@ class FAIR:
 
         if not self._registry.adapters:
             raise ValueError(
-                "FAIR requires at least one provider. Pass an API key "
-                "(gemini_api_key, groq_api_key, openrouter_api_key, mistral_api_key, "
-                "kilo_api_key, zai_api_key, nvidia_api_key, ollama_cloud_api_key, "
-                "cloudflare_api_token) or set the corresponding environment variable."
+                "FAIR requires at least one safely eligible provider. "
+                "Use a runtime-zero-cost provider (OpenRouter Free or Kilo Free), "
+                "explicitly confirm a recurring free-tier account with "
+                "confirmed_free_providers, configure local Ollama, or pass a "
+                "reviewed custom provider."
             )
 
         settings = RoutingSettings(
