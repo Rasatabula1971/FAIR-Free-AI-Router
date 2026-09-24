@@ -15,6 +15,7 @@ from fair.config import RoutingSettings
 from fair.embedded.router import EmbeddedRouter
 from fair.providers.base import ProviderAdapter
 from fair.providers.live import (
+    TEXT_CAPABILITIES,
     CloudflareWorkersAiAdapter,
     GeminiAdapter,
     GroqAdapter,
@@ -23,7 +24,6 @@ from fair.providers.live import (
     MistralAdapter,
     OllamaLocalAdapter,
     OpenRouterFreeAdapter,
-    TEXT_CAPABILITIES,
     ZaiFreeAdapter,
 )
 from fair.providers.registry import Registry
