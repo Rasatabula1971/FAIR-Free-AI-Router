@@ -22,8 +22,6 @@ from fair.providers.live import (
     KiloFreeAdapter,
     LiveSettings,
     MistralAdapter,
-    NvidiaNimAdapter,
-    OllamaCloudAdapter,
     OllamaLocalAdapter,
     OpenRouterFreeAdapter,
     ZaiFreeAdapter,
@@ -35,12 +33,18 @@ from fair.schemas.domain import ModelDescriptor, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
 
+# Built-in provider policy was manually re-verified against current provider
+# documentation on this date. This MUST NOT be derived from process startup:
+# qualified() intentionally expires provider evidence after 30 days so stale
+# pricing/terms cannot be renewed merely by restarting FAIR.
+_BUILTIN_PROVIDER_REVIEWED_AT = datetime(2026, 9, 24, tzinfo=UTC)
+
 
 def _reviewed_at():
-    return datetime.now(UTC) - timedelta(seconds=10)
+    return _BUILTIN_PROVIDER_REVIEWED_AT
 
 
-def _make_qualification(provider_id, free_status, models):
+def _make_qualification(provider_id, free_status, models, reference):
     reviewed = _reviewed_at()
     return ProviderQualification(
         provider_id=provider_id,
@@ -52,11 +56,11 @@ def _make_qualification(provider_id, free_status, models):
         can_auto_bill=False,
         reviewed_at=reviewed,
         expires_at=reviewed + timedelta(days=29),
-        reviewer_reference="embedded-module-auto",
-        billing_reference="embedded-module-auto",
-        terms_reference="embedded-module-auto",
-        privacy_reference="embedded-module-auto",
-        limits_reference="embedded-module-auto",
+        reviewer_reference=reference,
+        billing_reference=reference,
+        terms_reference=reference,
+        privacy_reference=reference,
+        limits_reference=reference,
         models=[
             ModelQualification(
                 model_id=m.model_id,
@@ -64,13 +68,13 @@ def _make_qualification(provider_id, free_status, models):
                 input_price_per_million=0,
                 output_price_per_million=0,
                 request_price=0,
-                pricing_reference="embedded-module-auto",
+                pricing_reference=reference,
                 paid_tools_enabled=False,
                 live_test_passed=True,
                 live_test_at=reviewed,
-                live_test_reference="embedded-module-auto",
+                live_test_reference=reference,
                 zero_charge_verified=True,
-                zero_charge_reference="embedded-module-auto",
+                zero_charge_reference=reference,
             )
             for m in models
         ],
@@ -85,6 +89,12 @@ def _text_models(*entries):
 
 
 _FREE_STATUS = {"FREE_RECURRING": "verified_free_plan", "FREE_DYNAMIC": "verified_zero_price_model"}
+
+# These gateways prove zero price at request time: catalog entries must be
+# explicitly free/zero-priced and the completion response must report zero
+# cost. Free-plan providers whose same API key can belong to a billable
+# account are NOT auto-confirmed.
+_RUNTIME_ZERO_COST_PROVIDERS = frozenset({"openrouter_free", "kilo_free"})
 
 # Cloud providers: constructor keyword, environment variable, adapter, access class, models.
 _CLOUD_PROVIDERS = {
@@ -130,7 +140,7 @@ _CLOUD_PROVIDERS = {
         "access_class": "FREE_DYNAMIC",
         "models": _text_models(
             ("nvidia/nemotron-3-super-120b-a12b:free", 262144),
-            ("nex-agi/nex-n2.5-mini:free", 262144),
+            ("nex-agi/nex-n2.5-pro:free", 262144),
             ("poolside/laguna-s-2.1:free", 262144),
         ),
     },
@@ -140,20 +150,6 @@ _CLOUD_PROVIDERS = {
         "adapter": ZaiFreeAdapter,
         "access_class": "FREE_DYNAMIC",
         "models": _text_models(("glm-4.5-flash", 131072), ("glm-4.7-flash", 131072)),
-    },
-    "nvidia_nim": {
-        "kwarg": "nvidia_api_key",
-        "env": "NVIDIA_API_KEY",
-        "adapter": NvidiaNimAdapter,
-        "access_class": "FREE_RECURRING",
-        "models": _text_models(("meta/llama-3.3-70b-instruct", 131072), ("meta/llama-3.1-8b-instruct", 131072)),
-    },
-    "ollama_cloud": {
-        "kwarg": "ollama_cloud_api_key",
-        "env": "OLLAMA_CLOUD_API_KEY",
-        "adapter": OllamaCloudAdapter,
-        "access_class": "FREE_RECURRING",
-        "models": _text_models(("gpt-oss:20b", 131072)),
     },
     "cloudflare_workers_ai": {
         "kwarg": "cloudflare_api_token",
@@ -221,7 +217,10 @@ class FAIR:
 
     Usage::
 
-        fair = FAIR(gemini_api_key="...")
+        fair = FAIR(
+            gemini_api_key="...",
+            confirmed_free_providers={"google_gemini_api"},
+        )
         result = await fair.solve("What is 15 * 23?",
                                   validation={"kind": "arithmetic", "expression": "15*23"})
         print(result.output)  # "345"
@@ -240,6 +239,7 @@ class FAIR:
         ollama_cloud_api_key: str | None = None,
         cloudflare_api_token: str | None = None,
         cloudflare_account_id: str | None = None,
+        confirmed_free_providers: set[str] | None = None,
         ollama_url: str | None = None,
         ollama_models: list[str] | None = None,
         env_file: str | None = None,
@@ -277,12 +277,38 @@ class FAIR:
             "cloudflare_api_token": cloudflare_api_token,
         }
         cloudflare_account_id = cloudflare_account_id or env.get("CLOUDFLARE_ACCOUNT_ID")
+        ollama_cloud_key = ollama_cloud_api_key or env.get("OLLAMA_CLOUD_API_KEY")
+        if ollama_cloud_key and ollama_cloud_key.strip():
+            self.skipped["ollama_cloud"] = (
+                "credit-priced cloud service is not eligible for FAIR free-only routing"
+            )
+        nvidia_key = nvidia_api_key or env.get("NVIDIA_API_KEY")
+        if nvidia_key and nvidia_key.strip():
+            self.skipped["nvidia_nim"] = (
+                "hosted preview API uses starter credits and is not eligible for FAIR "
+                "recurring-free routing"
+            )
 
-        live_settings = LiveSettings(enabled=True, confirmed_providers=set(_CLOUD_PROVIDERS) | {"ollama_local"})
+        confirmed = set(confirmed_free_providers or ())
+        unknown_confirmations = confirmed - set(_CLOUD_PROVIDERS)
+        if unknown_confirmations:
+            names = ", ".join(sorted(unknown_confirmations))
+            raise ValueError(f"Unknown confirmed free provider(s): {names}")
+        confirmed |= set(_RUNTIME_ZERO_COST_PROVIDERS)
+        live_settings = LiveSettings(
+            enabled=True,
+            confirmed_providers=confirmed | {"ollama_local"},
+        )
 
         for provider_id, entry in _CLOUD_PROVIDERS.items():
             key = given[entry["kwarg"]] or env.get(entry["env"])
             if not key or not key.strip():
+                continue
+            if provider_id not in confirmed:
+                self.skipped[provider_id] = (
+                    "explicit free-tier account confirmation required; "
+                    "pass confirmed_free_providers with this provider_id"
+                )
                 continue
             extra = {}
             if provider_id == "cloudflare_workers_ai":
@@ -304,10 +330,11 @@ class FAIR:
 
         if not self._registry.adapters:
             raise ValueError(
-                "FAIR requires at least one provider. Pass an API key "
-                "(gemini_api_key, groq_api_key, openrouter_api_key, mistral_api_key, "
-                "kilo_api_key, zai_api_key, nvidia_api_key, ollama_cloud_api_key, "
-                "cloudflare_api_token) or set the corresponding environment variable."
+                "FAIR requires at least one safely eligible provider. "
+                "Use a runtime-zero-cost provider (OpenRouter Free or Kilo Free), "
+                "explicitly confirm a recurring free-tier account with "
+                "confirmed_free_providers, configure local Ollama, or pass a "
+                "reviewed custom provider."
             )
 
         settings = RoutingSettings(
@@ -340,7 +367,14 @@ class FAIR:
             models=models,
             request_limit=entry.get("request_limit"),
             qualification=_make_qualification(
-                provider_id, _FREE_STATUS[entry["access_class"]], models,
+                provider_id,
+                _FREE_STATUS[entry["access_class"]],
+                models,
+                (
+                    f"builtin-provider-review-2026-09-24:{provider_id}:runtime-zero-cost"
+                    if provider_id in _RUNTIME_ZERO_COST_PROVIDERS
+                    else f"builtin-provider-review-2026-09-24:{provider_id}:operator-confirmed"
+                ),
             ),
         )
         credential = SecretStr(api_key)
@@ -401,18 +435,24 @@ class FAIR:
         - output: the verified answer text (only when ACCEPTED)
         - quality: full QualityReport with scores and verification state
         """
-        request = SolveRequest(
-            client_id=client_id,
-            task=task,
-            task_type=task_type,
-            quality_level=quality_level or self._quality_level,
-            expected_schema=expected_schema,
-            validation=validation,
-            evidence=evidence or [],
-            cross_check_required=cross_check_required if cross_check_required is not None else self._cross_check,
-            max_output_tokens=max_output_tokens,
-            priority=priority,
-            cache_mode=cache_mode,
+        request = SolveRequest.model_validate(
+            {
+                "client_id": client_id,
+                "task": task,
+                "task_type": task_type,
+                "quality_level": quality_level or self._quality_level,
+                "expected_schema": expected_schema,
+                "validation": validation,
+                "evidence": evidence or [],
+                "cross_check_required": (
+                    cross_check_required
+                    if cross_check_required is not None
+                    else self._cross_check
+                ),
+                "max_output_tokens": max_output_tokens,
+                "priority": priority,
+                "cache_mode": cache_mode,
+            }
         )
         return await self._router.solve(request)
 

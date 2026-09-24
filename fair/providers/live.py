@@ -120,15 +120,15 @@ class TextAdapter:
     expected_provider = ""
     expected_access = ""
     remote = True
-    catalog_path = "/models"
+    catalog_path: str | None = "/models"
     catalog_key = "data"
     catalog_id_key = "id"
-    context_field = "context_length"
+    context_field: str | None = "context_length"
     zero_price_models = False
-    account_check_path = None
-    provider_preferences = None
+    account_check_path: str | None = None
+    provider_preferences: dict[str, object] | None = None
     output_tokens_key = "max_tokens"
-    extra_payload = {}
+    extra_payload: dict[str, object] = {}
     credential_header = "Authorization"
     credential_prefix = "Bearer "
 
@@ -421,12 +421,17 @@ class OpenRouterFreeAdapter(TextAdapter):
 
 
 class KiloFreeAdapter(TextAdapter):
-    """Kilo gateway mirrors the OpenRouter catalog; only ':free' models with zero pricing pass."""
+    """Kilo Gateway: only current ':free' models with zero catalog pricing pass."""
 
-    base_url = "https://api.kilo.ai/api/openrouter"
+    base_url = "https://api.kilo.ai/api/gateway"
     expected_provider = "kilo_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
+
+    def _after_completion(self, data):
+        usage = data.get("usage")
+        if not isinstance(usage, dict) or not zero(usage.get("cost_microdollars")):
+            raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
 
 class MistralAdapter(TextAdapter):

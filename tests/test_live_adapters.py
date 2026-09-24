@@ -114,7 +114,7 @@ def _transport(routes):
 
 
 class TestKilo:
-    MODEL = "nex-agi/nex-n2.5-mini:free"
+    MODEL = "nex-agi/nex-n2.5-pro:free"
 
     def _adapter(self, routes):
         transport, seen = _transport(routes)
@@ -128,10 +128,11 @@ class TestKilo:
         catalog = {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0", "discount": 0}}]}
         adapter, seen = self._adapter({
             ("GET", "/models"): (200, catalog),
-            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost_microdollars": 0})),
         })
         response = await adapter.complete(_request(self.MODEL))
         assert response.text == "pong"
+        assert str(seen[-1].url) == "https://api.kilo.ai/api/gateway/chat/completions"
         assert "provider" not in json.loads(seen[-1].content)
 
     async def test_priced_model_is_dropped_from_catalog(self):
@@ -143,7 +144,7 @@ class TestKilo:
         catalog = {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0"}}]}
         adapter, _ = self._adapter({
             ("GET", "/models"): (200, catalog),
-            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0.002})),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost_microdollars": 1})),
         })
         with pytest.raises(BillingViolation):
             await adapter.complete(_request(self.MODEL))
@@ -151,7 +152,7 @@ class TestKilo:
     def test_non_free_model_id_is_refused(self):
         with pytest.raises(AuthenticationFailed):
             KiloFreeAdapter(
-                _spec("kilo_free", "FREE_DYNAMIC", "nex-agi/nex-n2.5-mini"), _settings(),
+                _spec("kilo_free", "FREE_DYNAMIC", "nex-agi/nex-n2.5-pro"), _settings(),
                 credential=SecretStr("k"), transport=httpx.MockTransport(lambda r: httpx.Response(500)),
             )
 
@@ -321,23 +322,95 @@ class TestModuleWiring:
         lines += [f"{entry['env']}=secret-{n}" for n, entry in enumerate(_CLOUD_PROVIDERS.values())]
         env_file = tmp_path / ".env"
         env_file.write_text("\n".join(lines), encoding="utf-8")
-        fair = FAIR(env_file=str(env_file))
+        fair = FAIR(
+            env_file=str(env_file),
+            confirmed_free_providers=set(_CLOUD_PROVIDERS),
+        )
         assert {p["provider_id"] for p in fair.providers()} == set(_CLOUD_PROVIDERS)
         assert fair.skipped == {}
+
+    def test_recurring_provider_requires_explicit_free_account_confirmation(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+
+        fair = FAIR(kilo_api_key="k", groq_api_key="g")
+
+        assert {p["provider_id"] for p in fair.providers()} == {"kilo_free"}
+        assert "groq" in fair.skipped
+        assert "explicit free-tier account confirmation required" in fair.skipped["groq"]
+
+    def test_explicit_free_account_confirmation_allows_recurring_provider(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+
+        fair = FAIR(
+            groq_api_key="g",
+            confirmed_free_providers={"groq"},
+        )
+
+        assert [p["provider_id"] for p in fair.providers()] == ["groq"]
+        assert fair.skipped == {}
+
+    def test_unknown_free_provider_confirmation_is_rejected(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+
+        with pytest.raises(ValueError, match="Unknown confirmed free provider"):
+            FAIR(
+                kilo_api_key="k",
+                confirmed_free_providers={"not-a-provider"},
+            )
+
+    def test_nvidia_hosted_credit_api_is_never_eligible(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+        monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+
+        fair = FAIR(
+            nvidia_api_key="n",
+            kilo_api_key="k",
+        )
+
+        assert {p["provider_id"] for p in fair.providers()} == {"kilo_free"}
+        assert fair.skipped["nvidia_nim"].startswith("hosted preview API uses starter credits")
+
+    def test_ollama_cloud_credit_pricing_is_never_eligible(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+        monkeypatch.delenv("OLLAMA_CLOUD_API_KEY", raising=False)
+
+        fair = FAIR(
+            ollama_cloud_api_key="o",
+            kilo_api_key="k",
+        )
+
+        assert {p["provider_id"] for p in fair.providers()} == {"kilo_free"}
+        assert fair.skipped["ollama_cloud"].startswith("credit-priced cloud service")
 
     def test_cloudflare_without_account_is_skipped(self, monkeypatch):
         for entry in _CLOUD_PROVIDERS.values():
             monkeypatch.delenv(entry["env"], raising=False)
         monkeypatch.delenv("CLOUDFLARE_ACCOUNT_ID", raising=False)
-        fair = FAIR(cloudflare_api_token="t", groq_api_key="g")
+        fair = FAIR(
+            cloudflare_api_token="t",
+            groq_api_key="g",
+            confirmed_free_providers={"cloudflare_workers_ai", "groq"},
+        )
         assert [p["provider_id"] for p in fair.providers()] == ["groq"]
         assert "cloudflare_workers_ai" in fair.skipped
 
     def test_cooldown_matches_longest_provider_window(self, monkeypatch):
         for entry in _CLOUD_PROVIDERS.values():
             monkeypatch.delenv(entry["env"], raising=False)
-        assert FAIR(groq_api_key="g")._router.settings.cooldown_seconds == 360
-        assert FAIR(groq_api_key="g", cooldown_seconds=30)._router.settings.cooldown_seconds == 30
+        assert FAIR(
+            groq_api_key="g",
+            confirmed_free_providers={"groq"},
+        )._router.settings.cooldown_seconds == 360
+        assert FAIR(
+            groq_api_key="g",
+            confirmed_free_providers={"groq"},
+            cooldown_seconds=30,
+        )._router.settings.cooldown_seconds == 30
 
     def test_localhost_normalizes_to_loopback(self):
         assert _loopback("http://localhost:11434/") == "http://127.0.0.1:11434"

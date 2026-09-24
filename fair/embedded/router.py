@@ -201,6 +201,11 @@ class EmbeddedRouter:
                 report.state = "SERVICE_FAILED"
                 break
             if attempt is None:
+                # The verifier became unavailable between selection and
+                # reservation. Mark this exact route tried so the remaining
+                # verification budget can move on to another independent
+                # model instead of selecting the same route again.
+                tried.add((route[1].provider_id, route[2].model_id))
                 continue
             tried.add((attempt.provider_id, attempt.model_id))
             attempts.append(attempt)

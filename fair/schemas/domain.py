@@ -8,6 +8,16 @@ from fair.quality.version import ENGINE_VERSION
 from fair.schemas.qualification import ProviderQualification
 
 Priority = Literal["P0", "P1", "P2", "P3", "P4"]
+VerificationState = Literal[
+    "UNVERIFIED",
+    "STRUCTURE_VALIDATED",
+    "DETERMINISTIC_ARITHMETIC",
+    "HOST_REFERENCE_MATCH",
+    "SOURCE_DATA_MATCH",
+    "STRUCTURED_CLAIMS_SUPPORTED",
+    "BOUNDED_CODE_TESTS",
+    "NATIVE_CODE_TESTS",
+]
 
 
 class AccessClass(StrEnum):
@@ -212,16 +222,7 @@ class QualityReport(DTO):
     overall_score: float | None = Field(default=None, ge=0, le=100, allow_inf_nan=False)
     hard_reject: bool = False
     reject_reasons: list[str] = Field(default_factory=list)
-    verification_state: Literal[
-        "UNVERIFIED",
-        "STRUCTURE_VALIDATED",
-        "DETERMINISTIC_ARITHMETIC",
-        "HOST_REFERENCE_MATCH",
-        "SOURCE_DATA_MATCH",
-        "STRUCTURED_CLAIMS_SUPPORTED",
-        "BOUNDED_CODE_TESTS",
-        "NATIVE_CODE_TESTS",
-    ] = "UNVERIFIED"
+    verification_state: VerificationState = "UNVERIFIED"
     validator_results: dict[str, str] = Field(default_factory=dict)
     claim_checks: list[ClaimCheck] = Field(default_factory=list)
     source_policy: SourcePolicyReport = Field(default_factory=SourcePolicyReport)

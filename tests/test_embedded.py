@@ -465,6 +465,47 @@ class TestEmbeddedRouter:
         assert result.cross_check.state == "PASSED"
 
     @pytest.mark.asyncio
+    async def test_cross_check_reservation_race_tries_next_independent_model(self):
+        spec_a = _spec("a", models=[{"model_id": "m1", "context_window": 32768}])
+        spec_b = _spec("b", models=[{"model_id": "m2", "context_window": 32768}])
+        spec_c = _spec("c", models=[{"model_id": "m3", "context_window": 32768}])
+        adapter_a = MockAdapter("a", text="345")
+        adapter_b = MockAdapter("b", text="345")
+        adapter_c = MockAdapter("c", text="345")
+        router = _router(
+            entries=[
+                (spec_a, adapter_a),
+                (spec_b, adapter_b),
+                (spec_c, adapter_c),
+            ],
+            max_verification_attempts=2,
+        )
+
+        original_reserve = router.quota.reserve
+        lost_once = False
+
+        def reserve(spec):
+            nonlocal lost_once
+            if spec.provider_id == "b" and not lost_once:
+                lost_once = True
+                return False
+            return original_reserve(spec)
+
+        router.quota.reserve = reserve
+        result = await router.solve(
+            _request(
+                task="15*23",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+                cross_check_required=True,
+            )
+        )
+
+        assert result.status == "ACCEPTED"
+        assert result.cross_check.state == "PASSED"
+        assert adapter_b.calls == 0
+        assert adapter_c.calls == 1
+
+    @pytest.mark.asyncio
     async def test_cross_check_disagreement(self):
         spec_a = _spec("a", models=[{"model_id": "m1", "context_window": 32768}])
         spec_b = _spec("b", models=[{"model_id": "m2", "context_window": 32768}])
@@ -532,7 +573,7 @@ class TestMemoryCache:
 
 class TestFAIRModule:
     def test_no_providers_raises(self):
-        with pytest.raises(ValueError, match="at least one provider"):
+        with pytest.raises(ValueError, match="at least one safely eligible provider"):
             FAIR()
 
     def test_mock_provider(self):

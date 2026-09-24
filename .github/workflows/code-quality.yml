@@ -1,0 +1,93 @@
+name: FAIR Code Quality
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fair-code-quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-static:
+    name: Python static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Dependency consistency
+        run: python -m pip check
+      - name: Ruff
+        run: ruff check fair tests
+      - name: Mypy
+        run: mypy fair
+
+  tests:
+    name: Pytest + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Test
+        run: pytest -ra --cov=fair --cov-report=term-missing --cov-report=xml:coverage.xml
+      - name: Preserve coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fair-coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  dependency-audit:
+    name: Python dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pip-audit
+        run: python -m pip install "pip-audit>=2.9,<3"
+      - name: Audit runtime dependencies
+        run: pip-audit .
+
+  semgrep:
+    name: Semgrep security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install Semgrep
+        run: python -m pip install "semgrep>=1.100,<2"
+      - name: Scan
+        run: semgrep scan --config p/python --config p/security-audit --error --sarif --output semgrep.sarif fair
+      - name: Preserve Semgrep SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 14
