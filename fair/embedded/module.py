@@ -34,8 +34,15 @@ from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
 
 
+# Built-in provider policy was manually re-verified against current provider
+# documentation on this date. This MUST NOT be derived from process startup:
+# qualified() intentionally expires provider evidence after 30 days so stale
+# pricing/terms cannot be renewed merely by restarting FAIR.
+_BUILTIN_PROVIDER_REVIEWED_AT = datetime(2026, 9, 24, tzinfo=UTC)
+
+
 def _reviewed_at():
-    return datetime.now(UTC) - timedelta(seconds=10)
+    return _BUILTIN_PROVIDER_REVIEWED_AT
 
 
 def _make_qualification(provider_id, free_status, models, reference):
@@ -365,9 +372,9 @@ class FAIR:
                 _FREE_STATUS[entry["access_class"]],
                 models,
                 (
-                    "runtime-zero-cost-enforcement"
+                    f"builtin-provider-review-2026-09-24:{provider_id}:runtime-zero-cost"
                     if provider_id in _RUNTIME_ZERO_COST_PROVIDERS
-                    else "operator-confirmed-free-account"
+                    else f"builtin-provider-review-2026-09-24:{provider_id}:operator-confirmed"
                 ),
             ),
         )
