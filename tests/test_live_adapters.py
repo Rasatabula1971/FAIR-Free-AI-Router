@@ -128,10 +128,11 @@ class TestKilo:
         catalog = {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0", "discount": 0}}]}
         adapter, seen = self._adapter({
             ("GET", "/models"): (200, catalog),
-            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost_microdollars": 0})),
         })
         response = await adapter.complete(_request(self.MODEL))
         assert response.text == "pong"
+        assert str(seen[-1].url) == "https://api.kilo.ai/api/gateway/chat/completions"
         assert "provider" not in json.loads(seen[-1].content)
 
     async def test_priced_model_is_dropped_from_catalog(self):
@@ -143,7 +144,7 @@ class TestKilo:
         catalog = {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0"}}]}
         adapter, _ = self._adapter({
             ("GET", "/models"): (200, catalog),
-            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0.002})),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost_microdollars": 1})),
         })
         with pytest.raises(BillingViolation):
             await adapter.complete(_request(self.MODEL))
@@ -163,7 +164,7 @@ class TestOpenRouter:
         transport, seen = _transport({
             ("GET", "/models"): (200, {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0"}}]}),
             ("GET", "/key"): (200, {"data": {"is_free_tier": True}}),
-            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost_microdollars": 0})),
         })
         adapter = OpenRouterFreeAdapter(
             _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL), _settings(),
