@@ -3,6 +3,7 @@ from fair.schemas.domain import (
     NormalizedModelRequest,
     NormalizedModelResponse,
     ProviderHealth,
+    ProviderState,
     QuotaSnapshot,
 )
 
@@ -21,7 +22,7 @@ class MockAdapter:
 
     async def health(self) -> ProviderHealth:
         return ProviderHealth(
-            provider_id=self.provider_id, state="ACTIVE", source="OFFLINE_FIXTURE"
+            provider_id=self.provider_id, state=ProviderState.ACTIVE, source="OFFLINE_FIXTURE"
         )
 
     async def quota(self) -> QuotaSnapshot:
