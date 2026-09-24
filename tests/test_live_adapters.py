@@ -361,6 +361,19 @@ class TestModuleWiring:
                 confirmed_free_providers={"not-a-provider"},
             )
 
+    def test_ollama_cloud_credit_pricing_is_never_eligible(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+        monkeypatch.delenv("OLLAMA_CLOUD_API_KEY", raising=False)
+
+        fair = FAIR(
+            ollama_cloud_api_key="o",
+            kilo_api_key="k",
+        )
+
+        assert {p["provider_id"] for p in fair.providers()} == {"kilo_free"}
+        assert fair.skipped["ollama_cloud"].startswith("credit-priced cloud service")
+
     def test_cloudflare_without_account_is_skipped(self, monkeypatch):
         for entry in _CLOUD_PROVIDERS.values():
             monkeypatch.delenv(entry["env"], raising=False)
