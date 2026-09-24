@@ -51,7 +51,9 @@ is required.
 FAIR does not treat possession of an API key as proof that a recurring provider account is
 still on a free tier. For providers such as Gemini, Groq, Mistral, NVIDIA NIM, Ollama Cloud,
 Z.ai, and Cloudflare Workers AI, explicitly attest the account is currently free-only with
-`confirmed_free_providers={...}`. OpenRouter Free and Kilo Free are auto-confirmed because
+`confirmed_free_providers={...}`. This is an operator assertion that the account/provider
+configuration cannot auto-bill or otherwise incur paid API usage; do not set it merely
+because the provider offers a free tier. OpenRouter Free and Kilo Free are auto-confirmed because
 their adapters enforce zero-priced `:free` models and reject non-zero observed cost at
 runtime. Providers whose key is present but cannot be safely registered are listed in
 `fair.skipped` with the reason.
