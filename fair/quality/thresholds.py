@@ -16,7 +16,9 @@ ThresholdMap = dict[
 
 def validate_thresholds(value):
     thresholds = TypeAdapter(ThresholdMap).validate_python(value)
-    ordered = [thresholds[level] for level in LEVELS if level in thresholds]
-    if not ordered or ordered != sorted(ordered):
-        raise ValueError("Quality thresholds must be nonempty and nondecreasing by quality level")
+    if set(thresholds) != set(LEVELS):
+        raise ValueError(f"All quality levels required: {', '.join(LEVELS)}")
+    ordered = [thresholds[level] for level in LEVELS]
+    if ordered != sorted(ordered):
+        raise ValueError("Quality thresholds must be nondecreasing by quality level")
     return thresholds
