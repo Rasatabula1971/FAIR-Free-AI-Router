@@ -136,7 +136,7 @@ _CLOUD_PROVIDERS = {
         "access_class": "FREE_DYNAMIC",
         "models": _text_models(
             ("nvidia/nemotron-3-super-120b-a12b:free", 262144),
-            ("nex-agi/nex-n2.5-mini:free", 262144),
+            ("nex-agi/nex-n2.5-pro:free", 262144),
             ("poolside/laguna-s-2.1:free", 262144),
         ),
     },
