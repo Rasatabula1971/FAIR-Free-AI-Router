@@ -124,6 +124,14 @@ class TestKilo:
         )
         return adapter, seen
 
+    def test_http_client_uses_bounded_phase_timeouts(self):
+        adapter, _ = self._adapter({})
+        timeout = adapter._client.timeout
+        assert timeout.connect == 5
+        assert timeout.read == 25
+        assert timeout.write == 5
+        assert timeout.pool == 5
+
     async def test_zero_priced_free_model_completes(self):
         catalog = {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0", "discount": 0}}]}
         adapter, seen = self._adapter({
