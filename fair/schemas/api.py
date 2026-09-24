@@ -18,6 +18,7 @@ from fair.schemas.domain import (
     PrivacyClass,
     QualityReport,
     SourcePolicyReport,
+    VerificationState,
 )
 
 
@@ -82,16 +83,7 @@ class SolveResponse(DTO):
     attempts: list[Attempt]
     minimum_required: float
     best_quality_score: float | None = None
-    verification_state: Literal[
-        "UNVERIFIED",
-        "STRUCTURE_VALIDATED",
-        "DETERMINISTIC_ARITHMETIC",
-        "HOST_REFERENCE_MATCH",
-        "SOURCE_DATA_MATCH",
-        "STRUCTURED_CLAIMS_SUPPORTED",
-        "BOUNDED_CODE_TESTS",
-        "NATIVE_CODE_TESTS",
-    ] = "UNVERIFIED"
+    verification_state: VerificationState = "UNVERIFIED"
     output: str | None = None
     provider_id: str | None = None
     model_id: str | None = None
