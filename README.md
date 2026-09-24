@@ -37,7 +37,6 @@ print(result.output)  # "345"
 | Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
 | Mistral | `MISTRAL_API_KEY` | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Free recurring (10k neurons/day, metered) | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
-| NVIDIA NIM | `NVIDIA_API_KEY` | Free recurring | `meta/llama-3.3-70b-instruct`, `meta/llama-3.1-8b-instruct` |
 | OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, no data collection) | `gemma-4-26b`, `ling-3.0-flash-sante`, `north-mini-code`, `dots-3-note` |
 | Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
 | Z.ai | `ZAI_API_KEY` | Free dynamic (flash models) | `glm-4.5-flash`, `glm-4.7-flash` |
@@ -49,7 +48,7 @@ is required.
 
 FAIR does not treat possession of an API key as proof that a recurring provider account is
 still on a free tier. For providers such as Gemini, Groq, Mistral, NVIDIA NIM, Ollama Cloud,
-Z.ai, and Cloudflare Workers AI, explicitly attest the account is currently free-only with
+Z.ai and Cloudflare Workers AI, explicitly attest the account is currently free-only with
 `confirmed_free_providers={...}`. This is an operator assertion that the account/provider
 configuration cannot auto-bill or otherwise incur paid API usage; do not set it merely
 because the provider offers a free tier. OpenRouter Free and Kilo Free are auto-confirmed because
@@ -60,8 +59,9 @@ runtime. Providers whose key is present but cannot be safely registered are list
 Hugging Face is intentionally not supported: its router reports a nonzero `estimated_cost`
 on every call, which violates the free-only policy. Ollama Cloud is also excluded: its
 current Free plan is a starter usage-credit pool and cloud models have published per-token
-prices, so it does not satisfy FAIR's recurring-zero-cost requirement. Local Ollama remains
-fully supported.
+prices, so it does not satisfy FAIR's recurring-zero-cost requirement. NVIDIA's hosted NIM
+preview API is also excluded because its hosted access is credit-based for new accounts.
+Local Ollama remains fully supported.
 
 ## Validation contracts
 
@@ -131,7 +131,6 @@ FAIR(
     mistral_api_key="...",        # or env: MISTRAL_API_KEY
     kilo_api_key="...",           # or env: KILO_API_KEY
     zai_api_key="...",            # or env: ZAI_API_KEY
-    nvidia_api_key="...",         # or env: NVIDIA_API_KEY
     cloudflare_api_token="...",   # or env: CLOUDFLARE_API_TOKEN
     cloudflare_account_id="...",  # or env: CLOUDFLARE_ACCOUNT_ID
     confirmed_free_providers={     # explicit account-tier confirmation where required
