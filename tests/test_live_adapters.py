@@ -161,7 +161,7 @@ class TestKilo:
             "cost_microdollars": "NONZERO_OR_INVALID"
         }
 
-    async def test_missing_cost_field_fails_closed_with_safe_diagnostic(self):
+    async def test_missing_cost_field_uses_fresh_zero_price_catalog_fallback(self):
         catalog = {
             "data": [
                 {
@@ -176,6 +176,29 @@ class TestKilo:
             ("POST", "/chat/completions"): (
                 200,
                 _completion(self.MODEL, usage={"prompt_tokens": 1, "completion_tokens": 1}),
+            ),
+        })
+        response = await adapter.complete(_request(self.MODEL))
+        assert response.text == "pong"
+        assert adapter.safe_diagnostics() == {
+            "cost_microdollars": "CATALOG_ZERO_PRICE_FALLBACK"
+        }
+
+    async def test_missing_cost_field_without_exact_catalog_echo_fails_closed(self):
+        catalog = {
+            "data": [
+                {
+                    "id": self.MODEL,
+                    "context_length": 262144,
+                    "pricing": {"prompt": "0", "completion": "0"},
+                }
+            ]
+        }
+        adapter, _ = self._adapter({
+            ("GET", "/models"): (200, catalog),
+            ("POST", "/chat/completions"): (
+                200,
+                _completion("other/model:free", usage={"prompt_tokens": 1, "completion_tokens": 1}),
             ),
         })
         with pytest.raises(BillingViolation):

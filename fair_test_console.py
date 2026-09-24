@@ -301,7 +301,8 @@ def _print_kilo_diagnostic(fair: FAIR) -> None:
     )
     descriptions = {
         "ZERO": "present and verified zero",
-        "COST_FIELD_MISSING": "usage present, cost_microdollars missing",
+        "COST_FIELD_MISSING": "usage present, cost_microdollars missing and catalog proof unavailable",
+        "CATALOG_ZERO_PRICE_FALLBACK": "cost field missing; exact :free model verified by fresh zero-price Kilo catalog",
         "USAGE_MISSING": "usage object missing",
         "NONZERO_OR_INVALID": "present but non-zero or invalid",
         "NOT_OBSERVED": "no completion cost observation was reached",
@@ -313,7 +314,9 @@ def _print_kilo_diagnostic(fair: FAIR) -> None:
     print(f"Cost observation: {state}")
     print(f"Meaning:          {descriptions.get(str(state), 'unknown state')}")
     if state == "ZERO":
-        print("Safety result:    ZERO COST VERIFIED")
+        print("Safety result:    ZERO COST VERIFIED FROM RESPONSE")
+    elif state == "CATALOG_ZERO_PRICE_FALLBACK":
+        print("Safety result:    ZERO COST VERIFIED FROM FRESH KILO CATALOG")
     else:
         print("Safety result:    FAIL-CLOSED - zero cost was not proven")
 
