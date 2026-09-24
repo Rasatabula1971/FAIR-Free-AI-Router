@@ -1,0 +1,33 @@
+name: FAIR MegaLinter
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  megalinter:
+    name: MegaLinter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: oxsecurity/megalinter@v10
+        env:
+          VALIDATE_ALL_CODEBASE: "true"
+      - name: Preserve report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fair-megalinter-reports
+          path: megalinter-reports
+          if-no-files-found: ignore
+          retention-days: 14
