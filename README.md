@@ -53,8 +53,10 @@ Workers AI, explicitly attest the account is currently free-only with
 configuration cannot auto-bill or otherwise incur paid API usage; do not set it merely
 because the provider offers a free tier. OpenRouter Free and Kilo Free are auto-confirmed
 because their adapters enforce zero-priced `:free` models and reject non-zero observed cost at
-runtime. Providers whose key is present but cannot be safely registered are listed in
-`fair.skipped` with the reason.
+runtime. Built-in cloud-provider reviews are date-pinned and expire after 30 days;
+restarting FAIR does not renew them. An expired review fails closed until the provider
+definition is deliberately re-verified and updated. Providers whose key is present but
+cannot be safely registered are listed in `fair.skipped` with the reason.
 
 Hugging Face is intentionally not supported: its router reports a nonzero `estimated_cost`
 on every call, which violates the free-only policy. Ollama Cloud is also excluded: its
