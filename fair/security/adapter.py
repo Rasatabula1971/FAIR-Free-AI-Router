@@ -77,6 +77,14 @@ class CredentialedAdapter:
         except Exception:
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
 
+    def safe_diagnostics(self):
+        method = getattr(self._adapter, "safe_diagnostics", None)
+        if not callable(method):
+            return {}
+        result = method()
+        self._check(result)
+        return result
+
     async def close(self):
         if hasattr(self._adapter, "close"):
             await self._adapter.close()
