@@ -489,26 +489,49 @@ async def live_provider_test() -> bool:
 
 
 async def live_provider_sweep() -> bool:
-    configured = _configured_provider_ids()
-    if not configured:
-        print("No live providers are configured.")
-        return False
-
     print()
-    print("Testing configured providers one at a time.")
-    print("Each provider is isolated; a failure does not stop the remaining tests.")
-    results: list[tuple[str, bool]] = []
-    for provider_id in configured:
-        result = await _run_selected_live_provider(provider_id)
-        results.append((provider_id, result))
+    print("Testing FAIR provider matrix one provider at a time.")
+    print("Configured providers are isolated; one failure does not stop the sweep.")
+    print("Unconfigured providers are reported as SKIP instead of disappearing.")
+
+    results: list[tuple[str, str, str]] = []
+    attempted = 0
+    passed_count = 0
+
+    for entry in LIVE_PROVIDERS.values():
+        provider_id = str(entry["provider_id"])
+        label = str(entry["label"])
+        configured, reason = _provider_status(entry)
+
+        if not configured:
+            results.append((label, "SKIP", reason))
+            continue
+
+        attempted += 1
+        passed = await _run_selected_live_provider(provider_id)
+        if passed:
+            passed_count += 1
+            results.append((label, "PASS", "validated answer and FAIR safety checks"))
+        else:
+            results.append((label, "FAIL-CLOSED", "provider failed or zero-cost use was not proven"))
 
     print()
     print("Provider sweep summary")
     print("----------------------")
-    for provider_id, passed in results:
-        label = _entry_for_provider(provider_id)["label"]
-        print(f"  {label}: {'PASS' if passed else 'FAIL / FAIL-CLOSED'}")
-    return all(passed for _, passed in results)
+    for label, state, reason in results:
+        print(f"  {label:<24} {state:<11} {reason}")
+
+    print()
+    print(f"Configured providers attempted: {attempted}")
+    print(f"Passed:                       {passed_count}")
+    print(f"Failed / fail-closed:         {attempted - passed_count}")
+    print(f"Not configured:               {len(results) - attempted}")
+
+    if attempted == 0:
+        print()
+        print("No live providers are configured.")
+        return False
+    return passed_count == attempted
 
 
 async def failover_test() -> bool:
@@ -632,7 +655,56 @@ def _header() -> None:
     print()
 
 
+def _command_line_mode() -> int | None:
+    """Run one-shot modes used by START_FAIR.bat and automation."""
+    if len(sys.argv) < 2:
+        return None
+
+    command = sys.argv[1].strip().casefold()
+
+    if command in {"--menu", "menu"}:
+        return None
+
+    if command in {"--sweep", "sweep"}:
+        return 0 if asyncio.run(live_provider_sweep()) else 1
+
+    if command in {"--inventory", "inventory", "--matrix", "matrix"}:
+        _show_provider_configuration()
+        return 0
+
+    if command in {"--offline", "offline"}:
+        validation_ok = asyncio.run(quick_offline_test())
+        failover_ok = asyncio.run(failover_test())
+        return 0 if validation_ok and failover_ok else 1
+
+    if command in {"--pytest", "pytest"}:
+        return 0 if full_test_suite() else 1
+
+    if command in {"--provider", "provider"}:
+        if len(sys.argv) < 3:
+            print("Usage: fair_test_console.py --provider PROVIDER_ID")
+            print("Known provider IDs:")
+            for entry in LIVE_PROVIDERS.values():
+                print(f"  {entry['provider_id']}")
+            return 2
+        provider_id = sys.argv[2].strip()
+        try:
+            _entry_for_provider(provider_id)
+        except ValueError:
+            print(f"Unknown provider: {provider_id}")
+            return 2
+        return 0 if asyncio.run(_run_selected_live_provider(provider_id)) else 1
+
+    print(f"Unknown FAIR test mode: {sys.argv[1]}")
+    print("Supported: --menu, --sweep, --inventory, --offline, --pytest, --provider ID")
+    return 2
+
+
 def main() -> int:
+    command_status = _command_line_mode()
+    if command_status is not None:
+        return command_status
+
     while True:
         _header()
         choice = input("Choose 1-9: ").strip()
