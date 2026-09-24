@@ -33,7 +33,6 @@ from fair.schemas.domain import ModelDescriptor, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
 
-
 # Built-in provider policy was manually re-verified against current provider
 # documentation on this date. This MUST NOT be derived from process startup:
 # qualified() intentionally expires provider evidence after 30 days so stale
