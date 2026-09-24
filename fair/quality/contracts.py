@@ -110,8 +110,7 @@ class FunctionCase(DTO):
         return bounded(value)
 
 
-class FunctionValidation(DTO):
-    kind: Literal["python_function"]
+class FunctionValidationBase(DTO):
     function_name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
     cases: list[FunctionCase] = Field(min_length=1, max_length=32)
 
@@ -132,7 +131,11 @@ class FunctionValidation(DTO):
         return value
 
 
-class NativeFunctionValidation(FunctionValidation):
+class FunctionValidation(FunctionValidationBase):
+    kind: Literal["python_function"]
+
+
+class NativeFunctionValidation(FunctionValidationBase):
     kind: Literal["native_python_function"]
 
 
@@ -147,10 +150,14 @@ ValidationContract = Annotated[
 ]
 
 
+def _default_source_classes() -> set[Literal["PRIMARY", "SECONDARY"]]:
+    return {"PRIMARY", "SECONDARY"}
+
+
 class SourcePolicy(DTO):
     max_age_seconds: int = Field(default=SECONDS_IN_DAY, ge=1, le=SECONDS_IN_YEAR)
     allowed_source_classes: set[Literal["PRIMARY", "SECONDARY"]] = Field(
-        default_factory=lambda: {"PRIMARY", "SECONDARY"}, min_length=1, max_length=2
+        default_factory=_default_source_classes, min_length=1, max_length=2
     )
     min_independent_origins: int = Field(default=1, ge=1, le=10)
 
