@@ -60,7 +60,8 @@ FAIR verifies AI responses before accepting them:
 - **`grounded_claims`** — structured fact-checking across supplied evidence sources
 
 Passing `expected_schema` with no contract checks JSON Schema conformance of the
-output. That proves shape, not truth, so it scores 85: accepted at `commodity` and
+output. A single markdown code fence around the whole answer is tolerated (free models
+add one even when told not to); prose around the JSON is still a schema failure. That proves shape, not truth, so it scores 85: accepted at `commodity` and
 `standard`, escalated at `advanced` and `high_impact_support`. Tasks the profiler
 flags as needing code or grounding still require a matching contract.
 
@@ -122,7 +123,8 @@ FAIR(
     env_file=".env",              # optional dotenv file; process env takes precedence
     providers=[(spec, adapter)],  # custom providers (e.g. MockAdapter for testing)
     quality_level="standard",     # commodity|standard|advanced|high_impact_support
-    max_attempts=3,               # retry budget across providers
+    max_attempts=3,               # answered attempts (judged by the quality gate) before escalating
+    max_unanswered_attempts=6,    # models that never answered (down/slow/throttled) tolerated per solve
     timeout_seconds=15,           # per-attempt timeout
     cooldown_seconds=360,         # provider sit-out after circuit-break/throttle (Groq's window)
     cache_enabled=True,           # in-memory LRU cache for deterministic tasks

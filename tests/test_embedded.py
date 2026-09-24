@@ -308,6 +308,107 @@ class TestEmbeddedRouter:
         assert result.provider_id == "b"
 
     @pytest.mark.asyncio
+    async def test_unanswered_providers_do_not_spend_the_answer_budget(self):
+        """Three providers down (timeouts, 503s, connection errors) used to end
+        the search at max_attempts=3 with healthy models untried, reported as
+        ALL_FREE_MODELS_UNAVAILABLE as if every model had been asked."""
+        entries = [
+            (_spec(f"down{i}"), MockAdapter(f"down{i}", error=TimeoutError())) for i in range(4)
+        ] + [(_spec("zz-healthy"), MockAdapter("zz-healthy", text="345"))]
+        router = _router(entries=entries, max_attempts=1, max_unanswered_attempts=6)
+        result = await router.solve(
+            _request(task="15*23", validation={"kind": "arithmetic", "expression": "15*23"})
+        )
+        assert result.status == "ACCEPTED"
+        assert result.provider_id == "zz-healthy"
+        dispositions = [a.disposition for a in result.attempts]
+        assert dispositions.count("INFRA_FAILURE") == 4 and dispositions[-1] == "ACCEPTED"
+
+    @pytest.mark.asyncio
+    async def test_unanswered_budget_still_bounds_a_fleet_wide_outage(self):
+        entries = [
+            (_spec(f"down{i}"), MockAdapter(f"down{i}", error=TimeoutError())) for i in range(5)
+        ] + [(_spec("zz-healthy"), MockAdapter("zz-healthy", text="345"))]
+        router = _router(entries=entries, max_attempts=3, max_unanswered_attempts=2)
+        result = await router.solve(
+            _request(task="15*23", validation={"kind": "arithmetic", "expression": "15*23"})
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.reason_code == "ALL_FREE_MODELS_UNAVAILABLE"
+        # Two unanswered attempts tolerated, the third ends the search.
+        assert len(result.attempts) == 3
+        assert all(a.disposition == "INFRA_FAILURE" for a in result.attempts)
+
+    @pytest.mark.asyncio
+    async def test_answered_budget_is_unchanged_by_unanswered_attempts(self):
+        """Three quality failures still escalate at max_attempts=3, exactly as before."""
+        entries = [(_spec(f"bad{i}"), MockAdapter(f"bad{i}", text="wrong")) for i in range(4)]
+        router = _router(entries=entries, max_attempts=3)
+        result = await router.solve(
+            _request(task="15*23", validation={"kind": "arithmetic", "expression": "15*23"})
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.reason_code == "ALL_FREE_MODELS_FAILED_QUALITY"
+        assert len(result.attempts) == 3
+
+    @pytest.mark.asyncio
+    async def test_attempt_records_why_it_failed(self):
+        from fair.providers.base import ProviderUnavailable
+
+        class Boom(Exception):
+            def __str__(self):
+                return "https://api.example/v1?key=SECRET"
+
+        entries = [
+            (_spec("a-timeout"), MockAdapter("a-timeout", error=TimeoutError())),
+            (_spec("b-http"), MockAdapter("b-http", error=ProviderUnavailable("HTTP_503"))),
+            (_spec("c-boom"), MockAdapter("c-boom", error=Boom())),
+        ]
+        router = _router(entries=entries, max_attempts=1, max_unanswered_attempts=3)
+        result = await router.solve(
+            _request(task="15*23", validation={"kind": "arithmetic", "expression": "15*23"})
+        )
+        details = {a.provider_id: (a.error_type, a.error_detail) for a in result.attempts}
+        assert details["a-timeout"] == ("PROVIDER_UNAVAILABLE", "TimeoutError")
+        assert details["b-http"] == ("PROVIDER_UNAVAILABLE", "HTTP_503")
+        # An arbitrary exception's text may carry a credential: class name only.
+        assert details["c-boom"] == ("PROVIDER_UNAVAILABLE", "Boom")
+        assert "SECRET" not in result.model_dump_json()
+
+    @pytest.mark.asyncio
+    async def test_fenced_json_answer_passes_the_schema_check(self):
+        """Free models wrap JSON in a markdown fence even when told not to; the
+        document inside is what the schema is about. Scoring it 0 discarded
+        otherwise-correct answers and escalated."""
+        router = _router(
+            entries=[(_spec(), MockAdapter("a", text='```json\n{"items": [1, 2]}\n```'))]
+        )
+        result = await router.solve(
+            _request(
+                task="list them",
+                task_type="extraction",
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.attempts[0].quality.validator_results["schema"] == "PASS"
+
+    @pytest.mark.asyncio
+    async def test_prose_around_json_is_still_a_schema_failure(self):
+        router = _router(
+            entries=[(_spec(), MockAdapter("a", text='Here you go:\n{"items": []}\nEnjoy!'))]
+        )
+        result = await router.solve(
+            _request(
+                task="list them",
+                task_type="extraction",
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.attempts[0].quality.validator_results["schema"] == "FAIL"
+
+    @pytest.mark.asyncio
     async def test_billing_violation_stops_system(self):
         router = _router(entries=[(_spec(), MockAdapter("a", error=BillingViolation()))])
         with pytest.raises(BillingViolation):

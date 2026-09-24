@@ -7,7 +7,7 @@ from fair.quality.arithmetic import calculate, numeric_answer
 from fair.quality.claims import validate_claims
 from fair.quality.code_validator import validate_function
 from fair.quality.grounding import grounded_result
-from fair.quality.json_data import strict_json
+from fair.quality.json_data import json_document
 from fair.quality.thresholds import STRUCTURE_VALIDATED_SCORE
 from fair.schemas.domain import QualityReport, SourcePolicyReport
 
@@ -26,7 +26,7 @@ def evaluate(
         reasons.append("INCOMPLETE_RESPONSE")
     if request.expected_schema is not None:
         try:
-            data = strict_json(response.text)
+            data = json_document(response.text)
             Draft202012Validator(request.expected_schema).validate(data)
             verification = "STRUCTURE_VALIDATED"
             checks["schema"] = "PASS"
@@ -70,7 +70,7 @@ def evaluate(
                 reasons.append("ARITHMETIC_MISMATCH")
         elif kind == "reference_json":
             try:
-                actual = json.dumps(strict_json(response.text), sort_keys=True, allow_nan=False)
+                actual = json.dumps(json_document(response.text), sort_keys=True, allow_nan=False)
                 expected = json.dumps(request.validation.expected, sort_keys=True, allow_nan=False)
                 matched = actual == expected
             except (ValueError, RecursionError):
@@ -82,7 +82,7 @@ def evaluate(
         elif kind == "grounded_json":
             expected = grounded_result(request.validation, request.evidence)
             try:
-                actual = strict_json(response.text)
+                actual = json_document(response.text)
                 matched = json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
             except (ValueError, RecursionError):
                 matched = False
