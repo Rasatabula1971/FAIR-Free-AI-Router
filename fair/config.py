@@ -1,4 +1,4 @@
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from fair.constants import SECONDS_IN_DAY
 from fair.quality.contracts import SourcePolicy
@@ -27,7 +27,14 @@ class RoutingSettings(DTO):
     circuit_window_seconds: float = Field(default=60, gt=0)
     # Groq's request window refills at 86.4 s per request; a short burst reports ~5m45s.
     cooldown_seconds: float = Field(default=360, gt=0)
-    quality_weight: float = Field(default=0.65, ge=0)
-    quota_weight: float = Field(default=0.20, ge=0)
-    reliability_weight: float = Field(default=0.15, ge=0)
+    quality_weight: float = Field(default=0.65, ge=0, le=1, allow_inf_nan=False)
+    quota_weight: float = Field(default=0.20, ge=0, le=1, allow_inf_nan=False)
+    reliability_weight: float = Field(default=0.15, ge=0, le=1, allow_inf_nan=False)
     source_policy: SourcePolicy | None = None
+
+    @model_validator(mode="after")
+    def selector_weights_sum_to_one(self):
+        total = self.quality_weight + self.quota_weight + self.reliability_weight
+        if not 0.99 <= total <= 1.01:
+            raise ValueError(f"Selector weights must sum to 1.0 (got {total:.4f})")
+        return self
