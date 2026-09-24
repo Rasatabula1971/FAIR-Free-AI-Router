@@ -2,18 +2,19 @@
 
 
 import pytest
+from pydantic import SecretStr
 
 from fair.config import RoutingSettings
 from fair.embedded import FAIR
 from fair.embedded.performance import MemoryPerformanceRegistry
 from fair.embedded.quota import MemoryQuotaGovernor
 from fair.embedded.router import EmbeddedRouter
-from fair.providers.base import (
-    BillingViolation,
-)
+from fair.providers.base import AuthenticationFailed, BillingViolation
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
+from fair.quality.thresholds import validate_thresholds
 from fair.schemas.domain import ProviderSpec
+from fair.security.adapter import CredentialedAdapter
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -48,6 +49,71 @@ def _router(entries=None, on_event=None, **settings_kw):
         registry.register(spec, adapter)
     settings = RoutingSettings(**settings_kw)
     return EmbeddedRouter(registry, settings, _thresholds(), on_event=on_event)
+
+
+# ── Configuration / policy hardening ─────────────────────────────────────
+
+
+class TestConfigurationHardening:
+    def test_selector_weights_must_sum_to_one(self):
+        with pytest.raises(ValueError, match="Selector weights must sum to 1.0"):
+            RoutingSettings(
+                quality_weight=0.7,
+                quota_weight=0.2,
+                reliability_weight=0.2,
+            )
+
+    def test_selector_weights_are_bounded(self):
+        with pytest.raises(ValueError):
+            RoutingSettings(
+                quality_weight=1.1,
+                quota_weight=0.0,
+                reliability_weight=0.0,
+            )
+
+    def test_quality_threshold_map_must_be_complete(self):
+        incomplete = {
+            "commodity": 75,
+            "standard": 82,
+            "advanced": 88,
+        }
+        with pytest.raises(ValueError, match="All quality levels required"):
+            validate_thresholds(incomplete)
+
+    def test_duplicate_provider_is_reported_before_admission(self):
+        registry = Registry()
+        registry.register(_spec(), MockAdapter("a"))
+
+        invalid_duplicate = _spec(requires_paid_subscription=True)
+        with pytest.raises(ValueError, match="Duplicate provider"):
+            registry.register_credentialed(
+                invalid_duplicate,
+                lambda credential: MockAdapter("a"),
+                None,
+            )
+
+
+class TestCredentialGuardHardening:
+    def _guard(self):
+        return CredentialedAdapter(
+            "a",
+            MockAdapter("a"),
+            SecretStr("secret-token"),
+        )
+
+    def test_bytes_are_scanned_for_credential_leakage(self):
+        guard = self._guard()
+        with pytest.raises(AuthenticationFailed, match="CREDENTIAL_EXPOSURE_BLOCKED"):
+            guard._check(b"prefix-secret-token-suffix")
+
+    def test_deeply_nested_values_fail_closed(self):
+        guard = self._guard()
+        value = "safe"
+        for _ in range(34):
+            value = [value]
+
+        with pytest.raises(AuthenticationFailed, match="CREDENTIAL_CHECK_DEPTH_EXCEEDED"):
+            guard._check(value)
 
 
 # ── MemoryQuotaGovernor ──────────────────────────────────────────────────
