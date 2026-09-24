@@ -19,18 +19,26 @@ uses `.venv` when present, creates it when missing, installs FAIR plus the devel
 test tools if needed, and then opens an interactive menu:
 
 1. Quick offline validation test
-2. Test a live provider
-3. Test routing/failover with deterministic offline providers
-4. Test a live independent cross-check
-5. Run the full pytest suite
-6. Show eligible and skipped providers
-7. Exit
+2. Test one selected live provider
+3. Test all configured live providers one at a time
+4. Test routing/failover with deterministic offline providers
+5. Test a live cross-check using exactly two selected providers
+6. Run the full pytest suite
+7. Show provider configuration and FAIR eligibility
+8. Clear this-session free-account confirmations
+9. Exit
 
-Live tests read the existing `.env` file. API keys are never printed by the console.
+Live tests read the existing `.env` file. API keys and raw provider responses are never
+printed by the console. A one-provider test constructs FAIR with only that selected
+provider, so a Gemini test cannot silently route through Kilo or OpenRouter. Cross-check
+tests similarly use only the two providers selected for that test.
+
 OpenRouter Free and Kilo Free retain FAIR's runtime zero-cost checks. Providers whose
 API keys may belong to paid/billable accounts still require an explicit free-only
-account confirmation; the console asks for that confirmation for the current session
-and does not persist it.
+account confirmation for the current console session. Kilo tests also expose a
+secret-safe billing diagnostic state such as `ZERO`, `COST_FIELD_MISSING`,
+`USAGE_MISSING`, or `NONZERO_OR_INVALID`; FAIR still fails closed unless a zero
+cost is actually observed.
 
 ## Quick start
 
