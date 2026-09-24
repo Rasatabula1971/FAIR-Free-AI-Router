@@ -40,7 +40,7 @@ def _reviewed_at():
     return datetime.now(UTC) - timedelta(seconds=10)
 
 
-def _make_qualification(provider_id, free_status, models):
+def _make_qualification(provider_id, free_status, models, reference):
     reviewed = _reviewed_at()
     return ProviderQualification(
         provider_id=provider_id,
@@ -52,11 +52,11 @@ def _make_qualification(provider_id, free_status, models):
         can_auto_bill=False,
         reviewed_at=reviewed,
         expires_at=reviewed + timedelta(days=29),
-        reviewer_reference="embedded-module-auto",
-        billing_reference="embedded-module-auto",
-        terms_reference="embedded-module-auto",
-        privacy_reference="embedded-module-auto",
-        limits_reference="embedded-module-auto",
+        reviewer_reference=reference,
+        billing_reference=reference,
+        terms_reference=reference,
+        privacy_reference=reference,
+        limits_reference=reference,
         models=[
             ModelQualification(
                 model_id=m.model_id,
@@ -64,13 +64,13 @@ def _make_qualification(provider_id, free_status, models):
                 input_price_per_million=0,
                 output_price_per_million=0,
                 request_price=0,
-                pricing_reference="embedded-module-auto",
+                pricing_reference=reference,
                 paid_tools_enabled=False,
                 live_test_passed=True,
                 live_test_at=reviewed,
-                live_test_reference="embedded-module-auto",
+                live_test_reference=reference,
                 zero_charge_verified=True,
-                zero_charge_reference="embedded-module-auto",
+                zero_charge_reference=reference,
             )
             for m in models
         ],
@@ -85,6 +85,12 @@ def _text_models(*entries):
 
 
 _FREE_STATUS = {"FREE_RECURRING": "verified_free_plan", "FREE_DYNAMIC": "verified_zero_price_model"}
+
+# These gateways prove zero price at request time: catalog entries must be
+# explicitly free/zero-priced and the completion response must report zero
+# cost. Free-plan providers whose same API key can belong to a billable
+# account are NOT auto-confirmed.
+_RUNTIME_ZERO_COST_PROVIDERS = frozenset({"openrouter_free", "kilo_free"})
 
 # Cloud providers: constructor keyword, environment variable, adapter, access class, models.
 _CLOUD_PROVIDERS = {
@@ -240,6 +246,7 @@ class FAIR:
         ollama_cloud_api_key: str | None = None,
         cloudflare_api_token: str | None = None,
         cloudflare_account_id: str | None = None,
+        confirmed_free_providers: set[str] | None = None,
         ollama_url: str | None = None,
         ollama_models: list[str] | None = None,
         env_file: str | None = None,
@@ -278,11 +285,26 @@ class FAIR:
         }
         cloudflare_account_id = cloudflare_account_id or env.get("CLOUDFLARE_ACCOUNT_ID")
 
-        live_settings = LiveSettings(enabled=True, confirmed_providers=set(_CLOUD_PROVIDERS) | {"ollama_local"})
+        confirmed = set(confirmed_free_providers or ())
+        unknown_confirmations = confirmed - set(_CLOUD_PROVIDERS)
+        if unknown_confirmations:
+            names = ", ".join(sorted(unknown_confirmations))
+            raise ValueError(f"Unknown confirmed free provider(s): {names}")
+        confirmed |= set(_RUNTIME_ZERO_COST_PROVIDERS)
+        live_settings = LiveSettings(
+            enabled=True,
+            confirmed_providers=confirmed | {"ollama_local"},
+        )
 
         for provider_id, entry in _CLOUD_PROVIDERS.items():
             key = given[entry["kwarg"]] or env.get(entry["env"])
             if not key or not key.strip():
+                continue
+            if provider_id not in confirmed:
+                self.skipped[provider_id] = (
+                    "explicit free-tier account confirmation required; "
+                    "pass confirmed_free_providers with this provider_id"
+                )
                 continue
             extra = {}
             if provider_id == "cloudflare_workers_ai":
@@ -340,7 +362,14 @@ class FAIR:
             models=models,
             request_limit=entry.get("request_limit"),
             qualification=_make_qualification(
-                provider_id, _FREE_STATUS[entry["access_class"]], models,
+                provider_id,
+                _FREE_STATUS[entry["access_class"]],
+                models,
+                (
+                    "runtime-zero-cost-enforcement"
+                    if provider_id in _RUNTIME_ZERO_COST_PROVIDERS
+                    else "operator-confirmed-free-account"
+                ),
             ),
         )
         credential = SecretStr(api_key)
