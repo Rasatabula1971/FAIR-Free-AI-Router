@@ -223,7 +223,7 @@ def _offline_router(
 def _arithmetic_request(*, cross_check: bool = False) -> SolveRequest:
     return SolveRequest(
         client_id="fair-test-console",
-        task="What is 15 multiplied by 23?",
+        task="What is 15 multiplied by 23? Return only the numeric answer, with no words or explanation.",
         quality_level="standard",
         validation={"kind": "arithmetic", "expression": "15*23"},
         cross_check_required=cross_check,
@@ -455,7 +455,7 @@ async def _run_selected_live_provider(provider_id: str) -> bool:
             _print_live_inventory(fair)
             try:
                 result = await fair.solve(
-                    "What is 15 multiplied by 23?",
+                    "What is 15 multiplied by 23? Return only the numeric answer, with no words or explanation.",
                     validation={"kind": "arithmetic", "expression": "15*23"},
                     cache_mode="bypass",
                 )
@@ -574,7 +574,7 @@ async def live_cross_check_test() -> bool:
             _print_live_inventory(fair)
             try:
                 result = await fair.solve(
-                    "What is 15 multiplied by 23?",
+                    "What is 15 multiplied by 23? Return only the numeric answer, with no words or explanation.",
                     validation={"kind": "arithmetic", "expression": "15*23"},
                     cross_check_required=True,
                     cache_mode="bypass",
