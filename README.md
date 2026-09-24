@@ -40,7 +40,7 @@ print(result.output)  # "345"
 | NVIDIA NIM | `NVIDIA_API_KEY` | Free recurring | `meta/llama-3.3-70b-instruct`, `meta/llama-3.1-8b-instruct` |
 | Ollama Cloud | `OLLAMA_CLOUD_API_KEY` | Free recurring | `gpt-oss:20b` |
 | OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, no data collection) | `gemma-4-26b`, `ling-3.0-flash-sante`, `north-mini-code`, `dots-3-note` |
-| Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-mini`, `laguna-s-2.1` |
+| Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
 | Z.ai | `ZAI_API_KEY` | Free dynamic (flash models) | `glm-4.5-flash`, `glm-4.7-flash` |
 | Ollama (local) | `OLLAMA_HOST` or `OLLAMA_URL` | Free local | auto-discovered from the daemon |
 
