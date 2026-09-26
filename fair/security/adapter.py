@@ -48,7 +48,9 @@ class CredentialedAdapter:
         if isinstance(value, str):
             if self._credential.get_secret_value() in value:
                 # Only the provider identifier is logged; the credential value is never emitted.
-                logger.error("Credential exposure blocked for provider %s", self.provider_id)  # nosemgrep
+                logger.error(
+                    "Credential exposure blocked for provider %s", self.provider_id
+                )  # nosemgrep
                 raise AuthenticationFailed("CREDENTIAL_EXPOSURE_BLOCKED")
         elif isinstance(value, dict):
             for key, item in value.items():

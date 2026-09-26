@@ -148,11 +148,16 @@ class TestRejectedSources:
         assert self._status(future) == "FUTURE_REVIEW"
 
     def test_content_observed_longer_ago_than_the_policy_allows(self):
-        assert self._status({}, policy={"min_independent_origins": 1, "max_age_seconds": 60}) == "STALE"
+        assert (
+            self._status({}, policy={"min_independent_origins": 1, "max_age_seconds": 60})
+            == "STALE"
+        )
 
     def test_a_source_class_the_policy_excludes(self):
         policy = {"min_independent_origins": 1, "allowed_source_classes": ["PRIMARY"]}
-        assert self._status({"source_class": "SECONDARY"}, policy=policy) == "SOURCE_CLASS_DISALLOWED"
+        assert (
+            self._status({"source_class": "SECONDARY"}, policy=policy) == "SOURCE_CLASS_DISALLOWED"
+        )
 
     def test_no_review_at_all(self):
         assert self._status(reviews=[]) == "REVIEW_UNAVAILABLE"

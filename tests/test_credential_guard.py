@@ -57,8 +57,10 @@ class _Echo:
     async def health(self):
         if self.error:
             raise self.error
-        return self.payload if self.payload is not None else ProviderHealth(
-            provider_id="a", state="ACTIVE", source="OFFLINE_FIXTURE"
+        return (
+            self.payload
+            if self.payload is not None
+            else ProviderHealth(provider_id="a", state="ACTIVE", source="OFFLINE_FIXTURE")
         )
 
     async def quota(self):

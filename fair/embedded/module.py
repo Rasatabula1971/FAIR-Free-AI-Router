@@ -286,7 +286,9 @@ class FAIR:
         ollama_models: list[str] | None = None,
         env_file: str | None = None,
         providers: list[tuple[ProviderSpec, ProviderAdapter]] | None = None,
-        quality_level: Literal["commodity", "standard", "advanced", "high_impact_support"] = "standard",
+        quality_level: Literal[
+            "commodity", "standard", "advanced", "high_impact_support"
+        ] = "standard",
         max_attempts: int = 3,
         max_unanswered_attempts: int = 6,
         max_verification_attempts: int = 2,
@@ -525,9 +527,7 @@ class FAIR:
                 "evidence": evidence or [],
                 "source_policy": source_policy,
                 "cross_check_required": (
-                    cross_check_required
-                    if cross_check_required is not None
-                    else self._cross_check
+                    cross_check_required if cross_check_required is not None else self._cross_check
                 ),
                 "max_output_tokens": max_output_tokens,
                 "priority": priority,

@@ -32,6 +32,8 @@ jobs:
         run: python -m pip check
       - name: Ruff
         run: ruff check fair tests
+      - name: Ruff format
+        run: ruff format --check fair tests
       - name: Mypy
         run: mypy fair
 

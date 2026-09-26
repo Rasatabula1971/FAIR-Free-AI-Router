@@ -407,7 +407,9 @@ def _chat(model_id=LOCAL_MODEL, content="pong", **overrides):
 class TestOllamaLocal:
     def _adapter(self, routes, spec=None, settings=None):
         transport, seen = _transport(routes)
-        adapter = OllamaLocalAdapter(spec or _local_spec(), settings or _settings(), transport=transport)
+        adapter = OllamaLocalAdapter(
+            spec or _local_spec(), settings or _settings(), transport=transport
+        )
         return adapter, seen
 
     async def test_a_local_model_completes(self):

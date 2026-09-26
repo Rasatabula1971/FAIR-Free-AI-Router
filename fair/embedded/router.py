@@ -180,8 +180,15 @@ class EmbeddedRouter:
         return attempt, response, validator_failed
 
     async def _cross_check(
-        self, request_id, request, profile, primary_route, primary_response, primary_attempt,
-        attempts, tried,
+        self,
+        request_id,
+        request,
+        profile,
+        primary_route,
+        primary_response,
+        primary_attempt,
+        attempts,
+        tried,
     ):
         report = CrossCheckReport(
             required=True,
@@ -196,7 +203,9 @@ class EmbeddedRouter:
             candidates = [
                 route
                 for route in self.selector.candidates(
-                    request, profile, tried,
+                    request,
+                    profile,
+                    tried,
                     eligible=lambda spec, model: independent(primary_route, (0, spec, model)),
                 )
                 if independent(primary_route, route)
@@ -208,7 +217,12 @@ class EmbeddedRouter:
                 break
             try:
                 attempt, response, failed = await self._attempt(
-                    request_id, request, profile, route, len(attempts) + 1, "CROSS_CHECK",
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    len(attempts) + 1,
+                    "CROSS_CHECK",
                 )
             except (BillingViolation, asyncio.CancelledError):
                 raise
@@ -292,7 +306,12 @@ class EmbeddedRouter:
             route = candidates[0]
             try:
                 attempt, response, validator_failed = await self._attempt(
-                    request_id, request, profile, route, len(attempts) + 1, "PRIMARY",
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    len(attempts) + 1,
+                    "PRIMARY",
                 )
             except (BillingViolation, asyncio.CancelledError):
                 raise
@@ -320,7 +339,14 @@ class EmbeddedRouter:
                 continue
             if required:
                 cross_check, disagreement = await self._cross_check(
-                    request_id, request, profile, route, response, attempt, attempts, tried,
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    response,
+                    attempt,
+                    attempts,
+                    tried,
                 )
                 validator_failed = cross_check.state == "SERVICE_FAILED"
                 if cross_check.state != "PASSED":
@@ -370,7 +396,9 @@ class EmbeddedRouter:
             provider_id=accepted_response.provider_id if accepted_response else None,
             model_id=accepted_response.model_id if accepted_response else None,
             quality=accepted_quality,
-            verification_state=accepted_quality.verification_state if accepted_quality else "UNVERIFIED",
+            verification_state=accepted_quality.verification_state
+            if accepted_quality
+            else "UNVERIFIED",
             source_policy=reviewed.source_policy if reviewed else SourcePolicyReport(),
             cross_check=cross_check,
             model_disagreement=disagreement,

@@ -464,9 +464,7 @@ class KiloFreeAdapter(TextAdapter):
             self._model_cache is not None
             and 0 <= self.clock() - self._model_cache_at < self._catalog_ttl
         )
-        catalog_ids = {
-            model.model_id for model in (self._model_cache or [])
-        }
+        catalog_ids = {model.model_id for model in (self._model_cache or [])}
         if (
             fresh_catalog
             and isinstance(response_model, str)

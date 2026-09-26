@@ -213,7 +213,10 @@ class TestSelectorEligibility:
     def _profile(self, **overrides):
         from fair.classifier.task_profiler import profile_task
 
-        return profile_task(_request(**overrides), {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92})
+        return profile_task(
+            _request(**overrides),
+            {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
+        )
 
     def test_a_provider_with_no_adapter_is_not_a_candidate(self):
         registry = Registry()
@@ -259,9 +262,12 @@ class TestSelectorEligibility:
 
     def test_an_eligibility_filter_can_exclude_a_model(self):
         selector, _ = self._selector([(_spec(), MockAdapter("a"))])
-        assert selector.candidates(
-            _request(), self._profile(), set(), eligible=lambda spec, model: False
-        ) == []
+        assert (
+            selector.candidates(
+                _request(), self._profile(), set(), eligible=lambda spec, model: False
+            )
+            == []
+        )
         assert (
             len(
                 selector.candidates(
@@ -446,9 +452,7 @@ class TestQualified:
         assert not qualified(spec, NOW)
 
     def test_a_priced_model_review_is_unqualified(self):
-        qualification = _qualification(
-            models=[_model_qualification(input_price_per_million=1)]
-        )
+        qualification = _qualification(models=[_model_qualification(input_price_per_million=1)])
         spec = _spec(access_class="FREE_RECURRING", qualification=qualification)
         assert not qualified(spec, NOW)
 

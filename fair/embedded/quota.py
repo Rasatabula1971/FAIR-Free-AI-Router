@@ -121,7 +121,11 @@ class MemoryQuotaGovernor:
         if observation.provider_id != spec.provider_id:
             raise ValueError("Quota observation identity mismatch")
         remaining = observation.quota_remaining_estimate
-        if remaining is None or observation.quota_limit is None or remaining > observation.quota_limit:
+        if (
+            remaining is None
+            or observation.quota_limit is None
+            or remaining > observation.quota_limit
+        ):
             return
         state = self._state(spec.provider_id)
         if spec.request_limit is not None:
@@ -152,7 +156,10 @@ class MemoryQuotaGovernor:
         state.failures = [
             t for t in state.failures if t >= now - self.settings.circuit_window_seconds
         ] + [now]
-        if state.circuit_state == "HALF_OPEN" or len(state.failures) >= self.settings.circuit_failures:
+        if (
+            state.circuit_state == "HALF_OPEN"
+            or len(state.failures) >= self.settings.circuit_failures
+        ):
             self._open(state)
 
     def success(self, provider_id):

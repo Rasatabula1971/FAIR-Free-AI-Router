@@ -1,6 +1,5 @@
 """Tests for the embedded FAIR module — no database, no server."""
 
-
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -34,6 +33,7 @@ def _aged():
     """A built-in review date old enough to fall outside the 29-day window."""
     return datetime.now(UTC) - timedelta(days=90)
 
+
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
@@ -54,11 +54,13 @@ def _spec(name="a", **overrides):
         auto_billing_required=False,
         programmatic_access=True,
         production_eligibility=True,
-        models=[{
-            "model_id": "model",
-            "context_window": 32768,
-            "capabilities": {"reasoning", "coding", "structured_output"},
-        }],
+        models=[
+            {
+                "model_id": "model",
+                "context_window": 32768,
+                "capabilities": {"reasoning", "coding", "structured_output"},
+            }
+        ],
     )
     return ProviderSpec(**(values | overrides))
 
@@ -690,9 +692,7 @@ class TestFAIRModule:
         spec = _spec()
         adapter = MockAdapter("a", text="345")
         fair = FAIR(providers=[(spec, adapter)], quality_level="commodity")
-        result = await fair.solve(
-            "15*23", validation={"kind": "arithmetic", "expression": "15*23"}
-        )
+        result = await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
         assert result.status == "ACCEPTED"
         assert result.minimum_required == 75
 
@@ -705,9 +705,7 @@ class TestFAIRModule:
         result = await fair.solve("anything")
         assert result.status != "ACCEPTED"
         fair.stopped = False
-        result = await fair.solve(
-            "15*23", validation={"kind": "arithmetic", "expression": "15*23"}
-        )
+        result = await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
         assert result.status == "ACCEPTED"
 
     @pytest.mark.asyncio
@@ -958,7 +956,9 @@ class TestCredentialedAdapterDiagnostics:
     @pytest.mark.asyncio
     async def test_the_router_records_the_preserved_code(self):
         adapter = CredentialedAdapter(
-            "a", MockAdapter("a", error=ProviderUnavailable("HTTP_503")), SecretStr("cred-0123456789")
+            "a",
+            MockAdapter("a", error=ProviderUnavailable("HTTP_503")),
+            SecretStr("cred-0123456789"),
         )
         router = _router(entries=[(_spec(), adapter)])
         result = await router.solve(_request(task="hello"))

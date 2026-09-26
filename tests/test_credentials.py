@@ -166,9 +166,7 @@ class TestAPIKeysAuthenticate:
         keys = APIKeys({"one": CLIENT_KEY}, "")
         assert keys.authenticate([ADMIN_KEY], administrator=True) is None
 
-    @pytest.mark.parametrize(
-        "headers", [[], [CLIENT_KEY, CLIENT_KEY], [""], ["has space"], [None]]
-    )
+    @pytest.mark.parametrize("headers", [[], [CLIENT_KEY, CLIENT_KEY], [""], ["has space"], [None]])
     def test_exactly_one_well_formed_header_is_required(self, headers):
         assert self._keys().authenticate(headers) is None
 
@@ -303,7 +301,9 @@ class TestProviderCredentialEnvFile:
         assert resolver.for_provider("one").get_secret_value() == CLIENT_KEY
 
     def test_a_byte_order_mark_is_tolerated(self, tmp_path):
-        resolver = self._resolver(tmp_path, f"PROVIDER_ONE_KEY={CLIENT_KEY}\n", encoding="utf-8-sig")
+        resolver = self._resolver(
+            tmp_path, f"PROVIDER_ONE_KEY={CLIENT_KEY}\n", encoding="utf-8-sig"
+        )
         assert resolver.for_provider("one").get_secret_value() == CLIENT_KEY
 
     @pytest.mark.parametrize(

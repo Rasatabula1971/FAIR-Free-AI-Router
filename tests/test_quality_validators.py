@@ -60,7 +60,8 @@ def _answer(claim_id, value, sources):
                     "status": "answered",
                     "value": value,
                     "sources": [
-                        {"source_id": source_id, "pointer": pointer} for source_id, pointer in sources
+                        {"source_id": source_id, "pointer": pointer}
+                        for source_id, pointer in sources
                     ],
                 }
             ]
@@ -138,7 +139,8 @@ class TestCalculate:
 
 class TestNumericAnswer:
     @pytest.mark.parametrize(
-        "text,expected", [("345", 345), (" 345 ", 345), ("-7", -7), ("+7", 7), ("1/2", "1/2"), ("2.50", "5/2")]
+        "text,expected",
+        [("345", 345), (" 345 ", 345), ("-7", -7), ("+7", 7), ("1/2", "1/2"), ("2.50", "5/2")],
     )
     def test_accepted_answer_forms(self, text, expected):
         from fractions import Fraction
@@ -398,7 +400,10 @@ class _Validation:
 class TestCompare:
     def test_arithmetic_agreement_is_exact_value(self):
         request = _Request(_Validation("arithmetic"))
-        assert compare(request, _Response("345"), _Response("345.0"), False) == (True, "EXACT_VALUE")
+        assert compare(request, _Response("345"), _Response("345.0"), False) == (
+            True,
+            "EXACT_VALUE",
+        )
 
     def test_arithmetic_disagreement(self):
         request = _Request(_Validation("arithmetic"))
