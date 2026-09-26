@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from fair.quality.version import ENGINE_VERSION
 from fair.schemas.qualification import ProviderQualification
@@ -16,7 +16,6 @@ VerificationState = Literal[
     "SOURCE_DATA_MATCH",
     "STRUCTURED_CLAIMS_SUPPORTED",
     "BOUNDED_CODE_TESTS",
-    "NATIVE_CODE_TESTS",
 ]
 
 
@@ -97,7 +96,20 @@ class ProviderSpec(DTO):
     max_data_class: PrivacyClass = "PUBLIC"
     models: list[ModelDescriptor] = Field(default_factory=list)
     request_limit: int | None = Field(default=None, gt=0)
+    # When FAIR counts requests locally it must also know when that count
+    # clears, or the ceiling becomes permanent for the life of the process.
+    # A provider that reports its own reset window does not need this.
+    request_limit_window: Literal["DAILY_UTC", "DAILY_PACIFIC"] | None = None
     qualification: ProviderQualification | None = None
+
+    @model_validator(mode="after")
+    def local_counter_resets(self):
+        if self.request_limit is not None and self.request_limit_window is None:
+            raise ValueError(
+                "A locally counted request_limit requires a request_limit_window; "
+                "without one the counter never clears"
+            )
+        return self
 
 
 class TaskProfile(DTO):

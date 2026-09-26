@@ -415,6 +415,10 @@ class OpenRouterFreeAdapter(TextAdapter):
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
     account_check_path = "/key"
+    # _after_completion fails closed unless the response reports a zero cost,
+    # and OpenRouter only returns usage accounting when it is asked for. Without
+    # this every completion would be rejected as an unconfirmed cost.
+    extra_payload = {"usage": {"include": True}}
     provider_preferences = {
         "allow_fallbacks": False,
         "require_parameters": True,
@@ -460,9 +464,7 @@ class KiloFreeAdapter(TextAdapter):
             self._model_cache is not None
             and 0 <= self.clock() - self._model_cache_at < self._catalog_ttl
         )
-        catalog_ids = {
-            model.model_id for model in (self._model_cache or [])
-        }
+        catalog_ids = {model.model_id for model in (self._model_cache or [])}
         if (
             fresh_catalog
             and isinstance(response_model, str)

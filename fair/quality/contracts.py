@@ -135,17 +135,17 @@ class FunctionValidation(FunctionValidationBase):
     kind: Literal["python_function"]
 
 
-class NativeFunctionValidation(FunctionValidationBase):
-    kind: Literal["native_python_function"]
-
-
+# A native_python_function contract used to sit here. It was unreachable: the
+# router never supplied a native execution result, so the engine could only
+# ever report it UNAVAILABLE. Running model-authored code natively is not a
+# capability FAIR offers -- python_function validates against the bounded
+# evaluator in quality/code_validator.py instead.
 ValidationContract = Annotated[
     ArithmeticValidation
     | ReferenceValidation
     | GroundedValidation
     | ClaimsValidation
-    | FunctionValidation
-    | NativeFunctionValidation,
+    | FunctionValidation,
     Field(discriminator="kind"),
 ]
 

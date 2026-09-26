@@ -13,7 +13,8 @@ from pydantic import SecretStr
 
 from fair.config import RoutingSettings
 from fair.embedded.router import EmbeddedRouter
-from fair.providers.base import ProviderAdapter
+from fair.governor.policy import AdmissionDenied
+from fair.providers.base import AuthenticationFailed, ProviderAdapter
 from fair.providers.live import (
     TEXT_CAPABILITIES,
     CloudflareWorkersAiAdapter,
@@ -27,11 +28,13 @@ from fair.providers.live import (
     ZaiFreeAdapter,
 )
 from fair.providers.registry import Registry
+from fair.quality.source_reviews import SourceReviewRegistry
 from fair.quality.thresholds import DEFAULT_THRESHOLDS
 from fair.schemas.api import SolveRequest, SolveResponse
-from fair.schemas.domain import ModelDescriptor, ProviderSpec
+from fair.schemas.domain import ModelDescriptor, PrivacyClass, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
+from fair.security.credentials import CredentialConfigurationError
 
 # Built-in provider policy was manually re-verified against current provider
 # documentation on this date. This MUST NOT be derived from process startup:
@@ -81,10 +84,39 @@ def _make_qualification(provider_id, free_status, models, reference):
     )
 
 
+def _skip_reason(error):
+    """Why a configured provider was not registered.
+
+    AdmissionDenied on a built-in provider means its manual review has aged
+    out of the qualification window, which is the expected way this fires.
+    """
+    if isinstance(error, AdmissionDenied):
+        return (
+            "provider review is expired or no longer satisfies free-only admission; "
+            "re-verify provider terms and pricing, then update the built-in review date"
+        )
+    if isinstance(error, AuthenticationFailed):
+        return "provider adapter refused admission with its configured credential"
+    return "provider adapter initialization failed"
+
+
+# Not every free model accepts response_format, and advertising a capability
+# the model does not have sends a request the gateway rejects -- OpenRouter is
+# configured with require_parameters, so an unsupported parameter fails the
+# call rather than being dropped. Models list their own capabilities when they
+# differ from the full text set.
+_NO_STRUCTURED_OUTPUT = frozenset(TEXT_CAPABILITIES) - {"structured_output"}
+
+
 def _text_models(*entries):
+    """Each entry is (model_id, context_window) or (model_id, context_window, capabilities)."""
     return [
-        ModelDescriptor(model_id=model_id, context_window=context, capabilities=set(TEXT_CAPABILITIES))
-        for model_id, context in entries
+        ModelDescriptor(
+            model_id=entry[0],
+            context_window=entry[1],
+            capabilities=set(entry[2]) if len(entry) > 2 else set(TEXT_CAPABILITIES),
+        )
+        for entry in entries
     ]
 
 
@@ -103,7 +135,12 @@ _CLOUD_PROVIDERS = {
         "env": "GEMINI_API_KEY",
         "adapter": GeminiAdapter,
         "access_class": "FREE_RECURRING",
+        # Gemini returns no rate-limit headers, so this local ceiling is the
+        # only request guard FAIR has. It is a conservative floor, not a claim
+        # about the account's real allowance: Google's per-day limit varies by
+        # model and tier, and a 429 still exhausts the provider on its own.
         "request_limit": 1500,
+        "request_limit_window": "DAILY_PACIFIC",
         "models": _text_models(("gemini-3.5-flash-lite", 1048576), ("gemini-3.6-flash", 1048576)),
     },
     "groq": {
@@ -111,7 +148,11 @@ _CLOUD_PROVIDERS = {
         "env": "GROQ_API_KEY",
         "adapter": GroqAdapter,
         "access_class": "FREE_RECURRING",
+        # Groq reports x-ratelimit-reset-requests, and an observed reset always
+        # overrides this window. It only covers the case where no response has
+        # carried usable headers yet.
         "request_limit": 1000,
+        "request_limit_window": "DAILY_UTC",
         "models": _text_models(("openai/gpt-oss-20b", 131072), ("openai/gpt-oss-120b", 131072)),
     },
     "openrouter_free": {
@@ -121,9 +162,10 @@ _CLOUD_PROVIDERS = {
         "access_class": "FREE_DYNAMIC",
         "models": _text_models(
             ("google/gemma-4-26b-a4b-it:free", 262144),
-            ("inclusionai/ling-3.0-flash-sante:free", 262144),
-            ("cohere/north-mini-code:free", 256000),
-            ("dots-studio/dots-3-note-preview:free", 512000),
+            # These two do not support response_format; without this they would
+            # be selected for schema requests and rejected by the gateway.
+            ("inclusionai/ling-3.0-flash-sante:free", 262144, _NO_STRUCTURED_OUTPUT),
+            ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
         ),
     },
     "mistral": {
@@ -244,7 +286,9 @@ class FAIR:
         ollama_models: list[str] | None = None,
         env_file: str | None = None,
         providers: list[tuple[ProviderSpec, ProviderAdapter]] | None = None,
-        quality_level: Literal["commodity", "standard", "advanced", "high_impact_support"] = "standard",
+        quality_level: Literal[
+            "commodity", "standard", "advanced", "high_impact_support"
+        ] = "standard",
         max_attempts: int = 3,
         max_unanswered_attempts: int = 6,
         max_verification_attempts: int = 2,
@@ -254,6 +298,7 @@ class FAIR:
         cache_ttl_seconds: int = 3600,
         cache_max_entries: int = 1000,
         cross_check_required: bool = False,
+        source_reviews: list[dict] | str | None = None,
         on_event: Callable[[str, dict], None] | None = None,
     ):
         self._registry = Registry()
@@ -316,7 +361,14 @@ class FAIR:
                     self.skipped[provider_id] = "CLOUDFLARE_ACCOUNT_ID missing"
                     continue
                 extra["account_id"] = cloudflare_account_id
-            self._register_cloud(provider_id, entry, key.strip(), live_settings, extra)
+            try:
+                self._register_cloud(provider_id, entry, key.strip(), live_settings, extra)
+            except (AdmissionDenied, AuthenticationFailed, CredentialConfigurationError) as error:
+                # One provider whose review has expired, or whose adapter will
+                # not admit itself, must not deny the application every other
+                # provider. Only these three are expected here; a genuine
+                # programming error still surfaces.
+                self.skipped[provider_id] = _skip_reason(error)
 
         ollama_url = ollama_url or env.get("OLLAMA_URL") or env.get("OLLAMA_HOST")
         if not ollama_url and env.get("OLLAMA_ENABLED"):
@@ -347,8 +399,19 @@ class FAIR:
             cache_ttl_seconds=cache_ttl_seconds,
             cache_max_entries=cache_max_entries,
         )
+        reviews = None
+        if source_reviews is not None:
+            reviews = (
+                SourceReviewRegistry.from_file(source_reviews)
+                if isinstance(source_reviews, str)
+                else SourceReviewRegistry(source_reviews)
+            )
         self._router = EmbeddedRouter(
-            self._registry, settings, dict(DEFAULT_THRESHOLDS), on_event=on_event,
+            self._registry,
+            settings,
+            dict(DEFAULT_THRESHOLDS),
+            on_event=on_event,
+            source_reviews=reviews,
         )
 
     def _register_cloud(self, provider_id, entry, api_key, settings, extra):
@@ -366,6 +429,7 @@ class FAIR:
             terms_last_verified=_reviewed_at(),
             models=models,
             request_limit=entry.get("request_limit"),
+            request_limit_window=entry.get("request_limit_window"),
             qualification=_make_qualification(
                 provider_id,
                 _FREE_STATUS[entry["access_class"]],
@@ -408,6 +472,10 @@ class FAIR:
             auto_billing_required=False,
             programmatic_access=True,
             production_eligibility=True,
+            # Inference never leaves the host, so local Ollama is the only
+            # route eligible for data above PUBLIC. Remote adapters reject a
+            # non-PUBLIC max_data_class outright (providers/live.py:_admit).
+            max_data_class="RESTRICTED",
             models=_text_models(*discovered),
         )
         self._registry.register(spec, OllamaLocalAdapter(spec, settings))
@@ -418,9 +486,13 @@ class FAIR:
         *,
         task_type: str | None = None,
         quality_level: str | None = None,
+        privacy_class: PrivacyClass = "PUBLIC",
+        required_capabilities: set[str] | None = None,
+        freshness_required: bool = False,
         expected_schema: dict | None = None,
         validation: dict | None = None,
         evidence: list[dict] | None = None,
+        source_policy: dict | None = None,
         cross_check_required: bool | None = None,
         max_output_tokens: int = 1024,
         client_id: str = "embedded",
@@ -428,6 +500,12 @@ class FAIR:
         cache_mode: str = "default",
     ) -> SolveResponse:
         """Send a task to free AI models with quality verification.
+
+        ``privacy_class`` bounds which providers may see the task: a provider is
+        only eligible when its ``max_data_class`` is at least as permissive.
+        Remote adapters are PUBLIC-only by construction, so anything above
+        PUBLIC routes to local Ollama or not at all -- an unroutable class
+        escalates rather than downgrading to a cloud provider.
 
         Returns a SolveResponse with:
         - status: "ACCEPTED" (verified answer), "ESCALATION_REQUIRED" (no model passed),
@@ -441,13 +519,15 @@ class FAIR:
                 "task": task,
                 "task_type": task_type,
                 "quality_level": quality_level or self._quality_level,
+                "privacy_class": privacy_class,
+                "required_capabilities": required_capabilities or set(),
+                "freshness_required": freshness_required,
                 "expected_schema": expected_schema,
                 "validation": validation,
                 "evidence": evidence or [],
+                "source_policy": source_policy,
                 "cross_check_required": (
-                    cross_check_required
-                    if cross_check_required is not None
-                    else self._cross_check
+                    cross_check_required if cross_check_required is not None else self._cross_check
                 ),
                 "max_output_tokens": max_output_tokens,
                 "priority": priority,

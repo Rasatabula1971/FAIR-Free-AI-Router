@@ -12,9 +12,7 @@ from fair.quality.thresholds import STRUCTURE_VALIDATED_SCORE
 from fair.schemas.domain import QualityReport, SourcePolicyReport, VerificationState
 
 
-def evaluate(
-    request, profile, response, *, native_result=None, source_review=None
-) -> QualityReport:
+def evaluate(request, profile, response, *, source_review=None) -> QualityReport:
     reasons = []
     checks = {}
     claim_checks = []
@@ -103,13 +101,6 @@ def evaluate(
                 sum(claim.status == "SUPPORTED" for claim in claim_checks)
             )
             verification = "STRUCTURED_CLAIMS_SUPPORTED" if matched else "UNVERIFIED"
-        elif kind == "native_python_function":
-            matched, failure = native_result if native_result is not None else (None, None)
-            checks[kind] = "UNAVAILABLE" if matched is None else "PASS" if matched else "FAIL"
-            checks["code_test_count"] = str(len(request.validation.cases))
-            verification = "NATIVE_CODE_TESTS" if matched else "UNVERIFIED"
-            if matched is False and failure is not None:
-                reasons.append(failure)
         else:
             matched, failure = validate_function(response.text, request.validation)
             checks["python_function"] = "PASS" if matched else "FAIL"
@@ -129,7 +120,7 @@ def evaluate(
             profile.required_capabilities
             - (
                 {"structured_output", "coding"}
-                if kind in {"python_function", "native_python_function"}
+                if kind == "python_function"
                 else {"structured_output"}
             )
         )
@@ -190,6 +181,5 @@ def acceptable(report, profile):
             "SOURCE_DATA_MATCH",
             "STRUCTURED_CLAIMS_SUPPORTED",
             "BOUNDED_CODE_TESTS",
-            "NATIVE_CODE_TESTS",
         }
     )

@@ -24,6 +24,7 @@ from fair.schemas.domain import (
     Attempt,
     CrossCheckReport,
     NormalizedModelRequest,
+    SourcePolicyReport,
 )
 
 
@@ -41,16 +42,28 @@ def _failure_detail(error):
 
 
 class EmbeddedRouter:
-    def __init__(self, registry, settings, thresholds, *, on_event=None):
+    def __init__(self, registry, settings, thresholds, *, on_event=None, source_reviews=None):
         self.registry = registry
         self.settings = settings
         self.thresholds = validate_thresholds(thresholds)
         self.on_event = on_event
+        self.source_reviews = source_reviews
         self.stopped = False
         self.quota = MemoryQuotaGovernor(settings)
         self.performance = MemoryPerformanceRegistry(settings)
         self.selector = MemorySelector(registry, self.quota, settings, self.performance)
         self.cache = MemoryCache(self)
+
+    def _source_review(self, request):
+        """None when no registry is configured.
+
+        The quality engine treats a missing review as BLOCKED whenever the
+        request carried a source policy, so an unconfigured registry withholds
+        the answer instead of silently accepting unreviewed evidence.
+        """
+        if self.source_reviews is None:
+            return None
+        return self.source_reviews.evaluate(request)
 
     def _emit(self, event_type, payload):
         if self.on_event is not None:
@@ -125,7 +138,9 @@ class EmbeddedRouter:
             error_detail = _failure_detail(error)
         else:
             try:
-                quality = evaluate(request, profile, response)
+                quality = evaluate(
+                    request, profile, response, source_review=self._source_review(request)
+                )
             except asyncio.CancelledError:
                 cancelled = True
                 quality = None
@@ -165,8 +180,15 @@ class EmbeddedRouter:
         return attempt, response, validator_failed
 
     async def _cross_check(
-        self, request_id, request, profile, primary_route, primary_response, primary_attempt,
-        attempts, tried,
+        self,
+        request_id,
+        request,
+        profile,
+        primary_route,
+        primary_response,
+        primary_attempt,
+        attempts,
+        tried,
     ):
         report = CrossCheckReport(
             required=True,
@@ -181,7 +203,9 @@ class EmbeddedRouter:
             candidates = [
                 route
                 for route in self.selector.candidates(
-                    request, profile, tried,
+                    request,
+                    profile,
+                    tried,
                     eligible=lambda spec, model: independent(primary_route, (0, spec, model)),
                 )
                 if independent(primary_route, route)
@@ -193,7 +217,12 @@ class EmbeddedRouter:
                 break
             try:
                 attempt, response, failed = await self._attempt(
-                    request_id, request, profile, route, len(attempts) + 1, "CROSS_CHECK",
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    len(attempts) + 1,
+                    "CROSS_CHECK",
                 )
             except (BillingViolation, asyncio.CancelledError):
                 raise
@@ -277,7 +306,12 @@ class EmbeddedRouter:
             route = candidates[0]
             try:
                 attempt, response, validator_failed = await self._attempt(
-                    request_id, request, profile, route, len(attempts) + 1, "PRIMARY",
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    len(attempts) + 1,
+                    "PRIMARY",
                 )
             except (BillingViolation, asyncio.CancelledError):
                 raise
@@ -305,7 +339,14 @@ class EmbeddedRouter:
                 continue
             if required:
                 cross_check, disagreement = await self._cross_check(
-                    request_id, request, profile, route, response, attempt, attempts, tried,
+                    request_id,
+                    request,
+                    profile,
+                    route,
+                    response,
+                    attempt,
+                    attempts,
+                    tried,
                 )
                 validator_failed = cross_check.state == "SERVICE_FAILED"
                 if cross_check.state != "PASSED":
@@ -334,6 +375,12 @@ class EmbeddedRouter:
             for a in attempts
             if a.quality is not None and a.quality.overall_score is not None
         ]
+        # Surface the source-policy verdict even when no attempt was accepted:
+        # BLOCKED is the reason the caller is holding an escalation, and without
+        # this the response reports NOT_REQUESTED for a policy that did run.
+        reviewed = accepted_quality or next(
+            (a.quality for a in reversed(attempts) if a.quality is not None), None
+        )
         result = SolveResponse(
             request_id=request_id,
             status="FAILED"
@@ -349,7 +396,10 @@ class EmbeddedRouter:
             provider_id=accepted_response.provider_id if accepted_response else None,
             model_id=accepted_response.model_id if accepted_response else None,
             quality=accepted_quality,
-            verification_state=accepted_quality.verification_state if accepted_quality else "UNVERIFIED",
+            verification_state=accepted_quality.verification_state
+            if accepted_quality
+            else "UNVERIFIED",
+            source_policy=reviewed.source_policy if reviewed else SourcePolicyReport(),
             cross_check=cross_check,
             model_disagreement=disagreement,
         )

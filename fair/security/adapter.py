@@ -1,18 +1,31 @@
 """Guard a trusted provider adapter against accidental credential reflection."""
 
 import logging
+import re
 
 from pydantic import BaseModel
 
 from fair.providers.base import (
     AuthenticationFailed,
     BillingViolation,
+    MalformedResponse,
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
 )
 
 logger = logging.getLogger(__name__)
+
+# A FAIR-authored diagnostic code, e.g. HTTP_503 or INVALID_CHAT_COMPLETION.
+# Upstream response text is never shaped like this, so a message that matches
+# cannot be carrying a provider body, a URL or a credential. Anything else is
+# replaced with a generic code rather than being passed on.
+_SAFE_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+
+def _safe_code(error, fallback):
+    code = str(error)
+    return code if _SAFE_CODE.fullmatch(code) else fallback
 
 
 class CredentialedAdapter:
@@ -34,8 +47,11 @@ class CredentialedAdapter:
             value = value.decode("utf-8", errors="replace")
         if isinstance(value, str):
             if self._credential.get_secret_value() in value:
-                # Only the provider identifier is logged; the credential value is never emitted.
-                logger.error("Credential exposure blocked for provider %s", self.provider_id)  # nosemgrep
+                # Only the provider identifier is logged; the credential value is never
+                # emitted. The suppression below sits on its own line so a formatter
+                # cannot detach it from the call the way a trailing comment was.
+                # nosemgrep
+                logger.error("Credential exposure blocked for provider %s", self.provider_id)
                 raise AuthenticationFailed("CREDENTIAL_EXPOSURE_BLOCKED")
         elif isinstance(value, dict):
             for key, item in value.items():
@@ -61,6 +77,17 @@ class CredentialedAdapter:
         except RateLimited as error:
             logger.info("Rate limited by provider %s", self.provider_id)
             raise RateLimited("RATE_LIMITED", retry_after=error.retry_after) from None
+        except MalformedResponse as error:
+            # FAIR's own adapters compose these codes; they distinguish a bad
+            # envelope from an oversized body from a budget violation, which
+            # the attempt log needs. Only the code survives, never upstream text.
+            code = _safe_code(error, "MALFORMED_PROVIDER_RESPONSE")
+            logger.warning("Malformed response from provider %s: %s", self.provider_id, code)
+            raise MalformedResponse(code) from None
+        except ProviderUnavailable as error:
+            code = _safe_code(error, "PROVIDER_UNAVAILABLE")
+            logger.warning("Provider %s unavailable: %s", self.provider_id, code)
+            raise ProviderUnavailable(code) from None
         except Exception:
             logger.warning("Provider %s unavailable", self.provider_id)
             raise ProviderUnavailable("PROVIDER_UNAVAILABLE") from None

@@ -1,25 +1,49 @@
 """Tests for the embedded FAIR module — no database, no server."""
 
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from fair.config import RoutingSettings
-from fair.embedded import FAIR
+from fair.embedded import FAIR, module
+from fair.embedded.module import _CLOUD_PROVIDERS
 from fair.embedded.performance import MemoryPerformanceRegistry
 from fair.embedded.quota import MemoryQuotaGovernor
 from fair.embedded.router import EmbeddedRouter
-from fair.providers.base import AuthenticationFailed, BillingViolation
+from fair.providers.base import (
+    AuthenticationFailed,
+    BillingViolation,
+    MalformedResponse,
+    ProviderUnavailable,
+)
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.quality.thresholds import validate_thresholds
-from fair.schemas.domain import ProviderSpec
+from fair.schemas.api import SolveRequest
+from fair.schemas.domain import ProviderSpec, QuotaSnapshot
 from fair.security.adapter import CredentialedAdapter
+
+
+def _now():
+    return datetime.now(UTC) - timedelta(seconds=10)
+
+
+def _aged():
+    """A built-in review date old enough to fall outside the 29-day window."""
+    return datetime.now(UTC) - timedelta(days=90)
+
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
 def _spec(name="a", **overrides):
+    # A request_limit without a reset window is rejected by ProviderSpec, since
+    # a counter that never clears permanently disables the provider. Tests that
+    # only care about the ceiling get a window for free; a test about the window
+    # itself passes its own.
+    if "request_limit" in overrides:
+        overrides.setdefault("request_limit_window", "DAILY_UTC")
     values = dict(
         provider_id=name,
         access_class="FREE_LOCAL",
@@ -30,11 +54,13 @@ def _spec(name="a", **overrides):
         auto_billing_required=False,
         programmatic_access=True,
         production_eligibility=True,
-        models=[{
-            "model_id": "model",
-            "context_window": 32768,
-            "capabilities": {"reasoning", "coding", "structured_output"},
-        }],
+        models=[
+            {
+                "model_id": "model",
+                "context_window": 32768,
+                "capabilities": {"reasoning", "coding", "structured_output"},
+            }
+        ],
     )
     return ProviderSpec(**(values | overrides))
 
@@ -666,9 +692,7 @@ class TestFAIRModule:
         spec = _spec()
         adapter = MockAdapter("a", text="345")
         fair = FAIR(providers=[(spec, adapter)], quality_level="commodity")
-        result = await fair.solve(
-            "15*23", validation={"kind": "arithmetic", "expression": "15*23"}
-        )
+        result = await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
         assert result.status == "ACCEPTED"
         assert result.minimum_required == 75
 
@@ -681,9 +705,7 @@ class TestFAIRModule:
         result = await fair.solve("anything")
         assert result.status != "ACCEPTED"
         fair.stopped = False
-        result = await fair.solve(
-            "15*23", validation={"kind": "arithmetic", "expression": "15*23"}
-        )
+        result = await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
         assert result.status == "ACCEPTED"
 
     @pytest.mark.asyncio
@@ -716,3 +738,261 @@ def _request(task="test", **kwargs):
 
     defaults = dict(client_id="test", task=task, quality_level="standard")
     return SolveRequest(**(defaults | kwargs))
+
+
+# ── Privacy classification (facade must be able to use it) ───────────────
+
+
+class TestPrivacyRouting:
+    """privacy_class is only a control if the public API can set it.
+
+    The selector has always enforced it, and remote adapters have always
+    refused a non-PUBLIC data class. What was missing was any way for an
+    application calling FAIR.solve() to say the task was not public, so every
+    task was implicitly PUBLIC.
+    """
+
+    def _public_only(self):
+        """Stands in for any remote provider: PUBLIC is the ProviderSpec default."""
+        return _spec("public_only")
+
+    def _restricted_ok(self):
+        return _spec("restricted_ok", max_data_class="RESTRICTED")
+
+    @pytest.mark.asyncio
+    async def test_confidential_task_never_reaches_a_public_only_provider(self):
+        public = MockAdapter("public_only", text="345")
+        async with FAIR(providers=[(self._public_only(), public)]) as fair:
+            result = await fair.solve(
+                "What is 15*23?",
+                privacy_class="CONFIDENTIAL",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+            )
+        assert public.calls == 0, "confidential task was dispatched to a PUBLIC provider"
+        assert result.status == "ESCALATION_REQUIRED"
+
+    @pytest.mark.asyncio
+    async def test_confidential_task_routes_to_the_local_provider_only(self):
+        public = MockAdapter("public_only", text="345")
+        restricted = MockAdapter("restricted_ok", text="345")
+        providers = [(self._public_only(), public), (self._restricted_ok(), restricted)]
+        async with FAIR(providers=providers) as fair:
+            result = await fair.solve(
+                "What is 15*23?",
+                privacy_class="CONFIDENTIAL",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+            )
+        assert result.status == "ACCEPTED"
+        assert result.provider_id == "restricted_ok"
+        assert public.calls == 0
+        assert restricted.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_public_task_still_reaches_the_public_provider(self):
+        public = MockAdapter("public_only", text="345")
+        async with FAIR(providers=[(self._public_only(), public)]) as fair:
+            result = await fair.solve(
+                "What is 15*23?",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+            )
+        assert result.status == "ACCEPTED"
+        assert public.calls == 1
+
+    def test_discovered_local_ollama_accepts_restricted_data(self):
+        fair = FAIR(ollama_url="http://127.0.0.1:11434", ollama_models=["llama3"])
+        spec = fair._registry.providers["ollama_local"]
+        assert spec.max_data_class == "RESTRICTED"
+
+    @pytest.mark.asyncio
+    async def test_source_policy_without_a_review_registry_blocks(self):
+        """An exposed control must not be silently inert."""
+        adapter = MockAdapter("a", text='{"answer": "x"}')
+        evidence = [{"source_id": "s1", "review_id": "r1", "text": '{"answer": "x"}'}]
+        validation = {
+            "kind": "grounded_json",
+            "fields": [{"output_key": "answer", "source_id": "s1", "pointer": "/answer"}],
+        }
+        async with FAIR(providers=[(_spec(), adapter)]) as fair:
+            result = await fair.solve(
+                "extract",
+                validation=validation,
+                evidence=evidence,
+                source_policy={"min_independent_origins": 1},
+            )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.source_policy.state == "BLOCKED"
+        assert "SOURCE_REVIEW_REQUIRED" in result.source_policy.reasons
+        assert result.attempts[0].quality.source_policy.state == "BLOCKED"
+
+
+# ── Provider admission failures are per-provider ─────────────────────────
+
+
+class TestExpiredProviderReview:
+    """A stale built-in review must cost one provider, not the whole router."""
+
+    def test_expired_review_skips_the_provider_and_keeps_the_rest(self, monkeypatch):
+        monkeypatch.setattr(module, "_BUILTIN_PROVIDER_REVIEWED_AT", _aged())
+        fair = FAIR(
+            gemini_api_key="k",
+            confirmed_free_providers={"google_gemini_api"},
+            ollama_url="http://127.0.0.1:11434",
+            ollama_models=["llama3"],
+        )
+        assert "google_gemini_api" in fair.skipped
+        assert "expired" in fair.skipped["google_gemini_api"]
+        assert "google_gemini_api" not in fair._registry.adapters
+        assert "ollama_local" in fair._registry.adapters
+
+    def test_every_provider_expired_is_still_a_clear_configuration_error(self, monkeypatch):
+        monkeypatch.setattr(module, "_BUILTIN_PROVIDER_REVIEWED_AT", _aged())
+        with pytest.raises(ValueError, match="at least one safely eligible provider"):
+            FAIR(gemini_api_key="k", confirmed_free_providers={"google_gemini_api"})
+
+    def test_a_programming_error_in_registration_is_not_swallowed(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise TypeError("adapter signature changed")
+
+        monkeypatch.setitem(_CLOUD_PROVIDERS["google_gemini_api"], "adapter", boom)
+        with pytest.raises(TypeError, match="adapter signature changed"):
+            FAIR(gemini_api_key="k", confirmed_free_providers={"google_gemini_api"})
+
+
+# ── Locally counted quotas must recover ──────────────────────────────────
+
+
+class TestRequestLimitWindow:
+    def test_a_request_limit_requires_a_reset_window(self):
+        with pytest.raises(ValueError, match="requires a request_limit_window"):
+            ProviderSpec(
+                provider_id="a",
+                access_class="FREE_LOCAL",
+                status="ACTIVE",
+                current_access_cost_usd=0,
+                requires_paid_subscription=False,
+                requires_credit_purchase=False,
+                auto_billing_required=False,
+                programmatic_access=True,
+                production_eligibility=True,
+                request_limit=10,
+            )
+
+    def test_exhausted_local_counter_recovers_at_the_next_window(self):
+        now = [datetime(2026, 9, 26, 12, tzinfo=UTC).timestamp()]
+        gov = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        spec = _spec(request_limit=2, request_limit_window="DAILY_PACIFIC")
+        assert gov.reserve(spec) and gov.reserve(spec)
+        assert not gov.available(spec), "ceiling should hold inside the window"
+        now[0] += 5 * 86400
+        assert gov.available(spec), "counter never cleared: provider disabled until restart"
+        assert gov.remaining(spec) == 2
+
+    def test_a_provider_reported_reset_overrides_the_window(self):
+        now = [1000.0]
+        gov = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        spec = _spec(request_limit=5, request_limit_window="DAILY_UTC")
+        gov.reserve(spec)
+        gov.observe(
+            spec,
+            QuotaSnapshot(
+                provider_id="a", quota_limit=5, quota_remaining_estimate=0, reset_at=1100.0
+            ),
+        )
+        assert gov.state("a").reset_at == 1100.0
+        now[0] = 1101.0
+        assert gov.available(spec)
+
+    def test_every_builtin_limit_declares_its_window(self):
+        for provider_id, entry in _CLOUD_PROVIDERS.items():
+            if entry.get("request_limit") is not None:
+                assert entry.get("request_limit_window") is not None, provider_id
+
+
+# ── Sanitized provider diagnostics survive the credential guard ──────────
+
+
+class TestCredentialedAdapterDiagnostics:
+    class _Failing:
+        provider_id = "p"
+
+        def __init__(self, error):
+            self.error = error
+
+        async def health(self):
+            raise self.error
+
+    def _guard(self, error, secret="cred-0123456789"):
+        return CredentialedAdapter("p", self._Failing(error), SecretStr(secret))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error,expected",
+        [
+            (ProviderUnavailable("HTTP_503"), "HTTP_503"),
+            (ProviderUnavailable("HTTP_404"), "HTTP_404"),
+            (MalformedResponse("INVALID_CHAT_COMPLETION"), "INVALID_CHAT_COMPLETION"),
+            (MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE"), "PROVIDER_RESPONSE_TOO_LARGE"),
+        ],
+    )
+    async def test_fair_authored_codes_are_preserved(self, error, expected):
+        with pytest.raises(type(error)) as caught:
+            await self._guard(error).health()
+        assert str(caught.value) == expected
+
+    @pytest.mark.asyncio
+    async def test_a_message_carrying_upstream_text_is_replaced(self):
+        leak = ProviderUnavailable("https://api.example.com/v1?key=cred-0123456789")
+        with pytest.raises(ProviderUnavailable) as caught:
+            await self._guard(leak).health()
+        assert str(caught.value) == "PROVIDER_UNAVAILABLE"
+        assert "cred-0123456789" not in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_exception_is_still_reduced(self):
+        with pytest.raises(ProviderUnavailable) as caught:
+            await self._guard(RuntimeError("connect to 10.0.0.1 failed: cred-0123456789")).health()
+        assert str(caught.value) == "PROVIDER_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_the_router_records_the_preserved_code(self):
+        adapter = CredentialedAdapter(
+            "a",
+            MockAdapter("a", error=ProviderUnavailable("HTTP_503")),
+            SecretStr("cred-0123456789"),
+        )
+        router = _router(entries=[(_spec(), adapter)])
+        result = await router.solve(_request(task="hello"))
+        assert result.attempts[0].error_detail == "HTTP_503"
+
+
+# ── The removed native contract is gone from the public surface ──────────
+
+
+class TestRemovedNativeContract:
+    def test_native_python_function_is_rejected(self):
+        with pytest.raises(ValidationError):
+            SolveRequest.model_validate(
+                {
+                    "client_id": "c",
+                    "task": "t",
+                    "validation": {
+                        "kind": "native_python_function",
+                        "function_name": "f",
+                        "cases": [{"arguments": [1], "expected": 1}],
+                    },
+                }
+            )
+
+    def test_bounded_python_function_is_still_accepted(self):
+        request = SolveRequest.model_validate(
+            {
+                "client_id": "c",
+                "task": "t",
+                "validation": {
+                    "kind": "python_function",
+                    "function_name": "f",
+                    "cases": [{"arguments": [1], "expected": 1}],
+                },
+            }
+        )
+        assert request.validation.kind == "python_function"
