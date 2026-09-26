@@ -150,12 +150,12 @@ class TestAttemptFailureHandling:
 
     @pytest.mark.asyncio
     async def test_a_validator_crash_fails_the_request_rather_than_accepting(self, monkeypatch):
-        import fair.embedded.router as router_module
-
         def boom(*args, **kwargs):
             raise RuntimeError("validator exploded")
 
-        monkeypatch.setattr(router_module, "evaluate", boom)
+        # Patched by dotted path: importing the module here as well as importing
+        # names from it at the top would import fair.embedded.router both ways.
+        monkeypatch.setattr("fair.embedded.router.evaluate", boom)
         router = _router(entries=[(_spec(), MockAdapter("a", text="345"))])
         result = await router.solve(_request())
         assert result.status == "FAILED"
