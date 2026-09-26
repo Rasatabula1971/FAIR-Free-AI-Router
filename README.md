@@ -130,6 +130,49 @@ result = await fair.solve(
 )
 ```
 
+## Data privacy classes
+
+`privacy_class` bounds which providers may see a task. A provider is eligible only when
+its `max_data_class` is at least as permissive as the request, and every remote adapter
+is PUBLIC-only by construction, so anything above `PUBLIC` routes to local Ollama or does
+not route at all. An unroutable classification escalates; it is never downgraded to a
+cloud provider.
+
+```python
+result = await fair.solve(
+    "Summarize this internal incident report: ...",
+    privacy_class="CONFIDENTIAL",
+)
+# With no local provider configured this returns ESCALATION_REQUIRED and no
+# cloud provider is contacted.
+```
+
+Discovered local Ollama models are registered with `max_data_class="RESTRICTED"`, so a
+local daemon is what makes `INTERNAL`, `CONFIDENTIAL` and `RESTRICTED` traffic routable.
+
+## Source review policies
+
+`source_policy` constrains which supplied evidence a grounded contract may rely on: how
+recently it was observed, which source classes are allowed, and how many independent
+origins must corroborate each value. Policies are evaluated against operator-supplied
+reviews, so a policy without a matching review blocks the answer rather than passing it.
+
+```python
+fair = FAIR(ollama_url="http://127.0.0.1:11434", source_reviews="reviews.yaml")
+
+result = await fair.solve(
+    "Extract the reported revenue",
+    validation={"kind": "grounded_json", "fields": [...]},
+    evidence=[{"source_id": "s1", "review_id": "r1", "text": "..."}],
+    source_policy={"min_independent_origins": 2, "max_age_seconds": 86400},
+)
+result.source_policy.state  # PASSED, BLOCKED, SERVICE_FAILED or NOT_REQUESTED
+```
+
+Reviews are snapshots an operator has checked; the policy does not establish real-world
+truth. Without `source_reviews`, any request carrying a `source_policy` is reported
+`BLOCKED` with `SOURCE_REVIEW_REQUIRED`.
+
 ## Cross-checking
 
 Request a second independent model to verify the answer:
@@ -178,7 +221,30 @@ FAIR(
     cooldown_seconds=360,         # provider sit-out after circuit-break/throttle (Groq's window)
     cache_enabled=True,           # in-memory LRU cache for deterministic tasks
     cross_check_required=False,   # require independent verification
+    source_reviews="reviews.yaml", # operator-reviewed evidence snapshots (path or list)
     on_event=callback,            # optional (event_type, payload) callback
+)
+```
+
+### solve() options
+
+```python
+await fair.solve(
+    task,
+    task_type=None,               # override keyword-based task inference
+    quality_level=None,           # per-request override of the constructor default
+    privacy_class="PUBLIC",       # PUBLIC|INTERNAL|CONFIDENTIAL|RESTRICTED
+    required_capabilities=None,   # additional model capabilities the task needs
+    freshness_required=False,     # task needs current information
+    expected_schema=None,         # JSON Schema the answer must conform to
+    validation=None,              # a validation contract (see above)
+    evidence=None,                # source documents for grounded contracts
+    source_policy=None,           # constraints on which evidence may be relied on
+    cross_check_required=None,    # per-request override
+    max_output_tokens=1024,
+    client_id="embedded",
+    priority="P2",
+    cache_mode="default",         # default|bypass|refresh
 )
 ```
 
