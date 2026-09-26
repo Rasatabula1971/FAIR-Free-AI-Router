@@ -24,6 +24,7 @@ from fair.schemas.domain import (
     Attempt,
     CrossCheckReport,
     NormalizedModelRequest,
+    SourcePolicyReport,
 )
 
 
@@ -41,16 +42,28 @@ def _failure_detail(error):
 
 
 class EmbeddedRouter:
-    def __init__(self, registry, settings, thresholds, *, on_event=None):
+    def __init__(self, registry, settings, thresholds, *, on_event=None, source_reviews=None):
         self.registry = registry
         self.settings = settings
         self.thresholds = validate_thresholds(thresholds)
         self.on_event = on_event
+        self.source_reviews = source_reviews
         self.stopped = False
         self.quota = MemoryQuotaGovernor(settings)
         self.performance = MemoryPerformanceRegistry(settings)
         self.selector = MemorySelector(registry, self.quota, settings, self.performance)
         self.cache = MemoryCache(self)
+
+    def _source_review(self, request):
+        """None when no registry is configured.
+
+        The quality engine treats a missing review as BLOCKED whenever the
+        request carried a source policy, so an unconfigured registry withholds
+        the answer instead of silently accepting unreviewed evidence.
+        """
+        if self.source_reviews is None:
+            return None
+        return self.source_reviews.evaluate(request)
 
     def _emit(self, event_type, payload):
         if self.on_event is not None:
@@ -125,7 +138,9 @@ class EmbeddedRouter:
             error_detail = _failure_detail(error)
         else:
             try:
-                quality = evaluate(request, profile, response)
+                quality = evaluate(
+                    request, profile, response, source_review=self._source_review(request)
+                )
             except asyncio.CancelledError:
                 cancelled = True
                 quality = None
@@ -334,6 +349,12 @@ class EmbeddedRouter:
             for a in attempts
             if a.quality is not None and a.quality.overall_score is not None
         ]
+        # Surface the source-policy verdict even when no attempt was accepted:
+        # BLOCKED is the reason the caller is holding an escalation, and without
+        # this the response reports NOT_REQUESTED for a policy that did run.
+        reviewed = accepted_quality or next(
+            (a.quality for a in reversed(attempts) if a.quality is not None), None
+        )
         result = SolveResponse(
             request_id=request_id,
             status="FAILED"
@@ -350,6 +371,7 @@ class EmbeddedRouter:
             model_id=accepted_response.model_id if accepted_response else None,
             quality=accepted_quality,
             verification_state=accepted_quality.verification_state if accepted_quality else "UNVERIFIED",
+            source_policy=reviewed.source_policy if reviewed else SourcePolicyReport(),
             cross_check=cross_check,
             model_disagreement=disagreement,
         )

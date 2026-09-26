@@ -253,6 +253,46 @@ class TestOpenRouter:
         assert payload["provider"]["data_collection"] == "deny"
         assert payload["provider"]["max_price"] == {"prompt": 0, "completion": 0, "request": 0, "image": 0}
 
+    async def test_completion_requests_usage_accounting(self):
+        """The zero-cost check needs usage in the response, which must be asked for."""
+        transport, seen = _transport({
+            ("GET", "/models"): (200, {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0"}}]}),
+            ("GET", "/key"): (200, {"data": {"is_free_tier": True}}),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
+        })
+        adapter = OpenRouterFreeAdapter(
+            _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL), _settings(),
+            credential=SecretStr("k"), transport=transport,
+        )
+        await adapter.complete(_request(self.MODEL))
+        assert json.loads(seen[-1].content)["usage"] == {"include": True}
+
+    async def test_absent_usage_block_fails_closed(self):
+        """No cost evidence is not zero cost."""
+        transport, _ = _transport({
+            ("GET", "/models"): (200, {"data": [{"id": self.MODEL, "context_length": 262144, "pricing": {"prompt": "0", "completion": "0"}}]}),
+            ("GET", "/key"): (200, {"data": {"is_free_tier": True}}),
+            ("POST", "/chat/completions"): (200, _completion(self.MODEL)),
+        })
+        adapter = OpenRouterFreeAdapter(
+            _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL), _settings(),
+            credential=SecretStr("k"), transport=transport,
+        )
+        with pytest.raises(BillingViolation):
+            await adapter.complete(_request(self.MODEL))
+
+    def test_models_without_response_format_do_not_claim_structured_output(self):
+        """require_parameters means an unsupported response_format fails the call."""
+        capabilities = {
+            model.model_id: model.capabilities
+            for model in _CLOUD_PROVIDERS["openrouter_free"]["models"]
+        }
+        assert "structured_output" not in capabilities["inclusionai/ling-3.0-flash-sante:free"]
+        assert "structured_output" not in capabilities["cohere/north-mini-code:free"]
+        assert "structured_output" in capabilities["google/gemma-4-26b-a4b-it:free"]
+        # Every configured model still has to be routable for ordinary text work.
+        assert all("reasoning" in caps for caps in capabilities.values())
+
 
 class TestMistral:
     MODEL = "ministral-8b-latest"

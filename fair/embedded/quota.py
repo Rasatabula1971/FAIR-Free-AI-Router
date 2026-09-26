@@ -1,8 +1,25 @@
 """In-memory quota governor — same circuit breaker logic, zero SQL."""
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from time import time
+from zoneinfo import ZoneInfo
+
+_WINDOW_ZONES = {"DAILY_UTC": UTC, "DAILY_PACIFIC": ZoneInfo("America/Los_Angeles")}
+
+
+def next_window_reset(window, now):
+    """Unix time of the next local midnight for a daily quota window.
+
+    Derived from the calendar rather than by adding 86400 seconds, so a daily
+    allowance tracked in a zone that observes DST still clears at midnight
+    local time on the day the offset changes.
+    """
+    zone = _WINDOW_ZONES[window]
+    local = datetime.fromtimestamp(now, zone)
+    tomorrow = (local + timedelta(days=1)).date()
+    return datetime.combine(tomorrow, datetime.min.time(), tzinfo=zone).timestamp()
 
 
 @dataclass
@@ -68,6 +85,16 @@ class MemoryQuotaGovernor:
             state.circuit_state = "HALF_OPEN"
             state.probe_until = self.clock() + self.settings.timeout_seconds + 5
         state.used += 1
+        if (
+            state.reset_at is None
+            and spec.request_limit is not None
+            and spec.request_limit_window is not None
+        ):
+            # Anchor the local counter to the provider's own daily window the
+            # first time it is used. Without this the count only ever clears
+            # when the provider volunteers a reset timestamp, and a provider
+            # that never does one strands its own ceiling until FAIR restarts.
+            state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
         return True
 
     def _open(self, state):
