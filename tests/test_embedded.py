@@ -409,6 +409,43 @@ class TestSharedQuotaLedger:
         assert await gov.available_async(spec)
 
     @pytest.mark.asyncio
+    async def test_only_one_concurrent_half_open_probe_is_reserved(self):
+        import time
+        from threading import Lock
+
+        class SlowLedger:
+            path = "slow.sqlite3"
+
+            def __init__(self):
+                self.calls = 0
+                self.lock = Lock()
+
+            def reserve(self, *args):
+                with self.lock:
+                    self.calls += 1
+                time.sleep(0.05)
+                return True
+
+        ledger = SlowLedger()
+        gov = MemoryQuotaGovernor(
+            RoutingSettings(),
+            shared_ledger=ledger,
+            application_id="corp",
+        )
+        spec = _spec(request_limit=10)
+        state = gov.state("a")
+        state.circuit_state = "OPEN"
+        state.blocked_until = 0
+
+        results = await __import__("asyncio").gather(
+            *(gov.reserve_async(spec, f"app-{index}") for index in range(5))
+        )
+
+        assert sum(results) == 1
+        assert ledger.calls == 1
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+
+    @pytest.mark.asyncio
     async def test_async_locked_ledger_fails_closed_without_exception(self):
         import sqlite3
 
@@ -816,7 +853,7 @@ class TestEmbeddedRouter:
         )
         assert result.status == "ACCEPTED"
         assert router.quota.state("a").security_blocked is False
-        assert router.quota.effective_status(_spec("a")) == "THROTTLED"
+        assert router.quota.effective_status(_spec("a")) == "ACTIVE"
 
     @pytest.mark.asyncio
     async def test_on_event_callback(self):
