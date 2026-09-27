@@ -556,10 +556,7 @@ class MistralAdapter(TextAdapter):
             return False
         limits = data.get("limits")
         completion = limits.get("completion") if isinstance(limits, dict) else None
-        return (
-            isinstance(completion, dict)
-            and completion.get("monthly_limit_reached") is True
-        )
+        return isinstance(completion, dict) and completion.get("monthly_limit_reached") is True
 
     async def complete(self, request):
         try:
@@ -572,9 +569,7 @@ class MistralAdapter(TextAdapter):
                     quota_remaining_estimate=0,
                     reset_at=reset_at,
                 )
-                raise QuotaExceeded(
-                    "MONTHLY_USAGE_LIMIT_REACHED", reset_at=reset_at
-                ) from None
+                raise QuotaExceeded("MONTHLY_USAGE_LIMIT_REACHED", reset_at=reset_at) from None
             raise
 
 
