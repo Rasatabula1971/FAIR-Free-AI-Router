@@ -139,10 +139,11 @@ def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT):
 
 _FREE_STATUS = {"FREE_RECURRING": "verified_free_plan", "FREE_DYNAMIC": "verified_zero_price_model"}
 
-# These gateways prove zero price at request time: catalog entries must be
-# explicitly free/zero-priced and the completion response must report zero
-# cost. Free-plan providers whose same API key can belong to a billable
-# account are NOT auto-confirmed.
+# These gateways prove zero price at request time. OpenRouter requires a zero
+# completion cost observation; Kilo accepts either zero cost_microdollars or an
+# exact fresh ':free' model from the live zero-priced catalog. Free-plan
+# providers whose same API key can belong to a billable account are NOT
+# auto-confirmed.
 _RUNTIME_ZERO_COST_PROVIDERS = frozenset({"openrouter_free", "kilo_free"})
 
 # Cloud providers: constructor keyword, environment variable, adapter, access class, models.
