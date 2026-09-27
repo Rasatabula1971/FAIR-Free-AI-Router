@@ -35,7 +35,9 @@ def compare(request, first, second, both_validated):
                 "EXACT_VALUE",
             )
         if kind in {"reference_json", "grounded_json"} or (
-            kind is None and request.expected_schema is not None and both_validated
+            kind is None
+            and getattr(request, "expected_schema", None) is not None
+            and both_validated
         ):
             return (
                 json.dumps(json_document(first.text), sort_keys=True)
