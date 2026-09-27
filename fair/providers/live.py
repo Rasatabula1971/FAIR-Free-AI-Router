@@ -585,18 +585,51 @@ class MistralAdapter(TextAdapter):
 
 
 class ZaiFreeAdapter(TextAdapter):
-    """Z.ai flash models are zero-priced but absent from /models; the completion echo verifies them."""
+    """Z.ai's explicitly zero-priced text models on the general API endpoint."""
 
     base_url = "https://api.z.ai/api/paas/v4"
     expected_provider = "zai_free"
     expected_access = "FREE_DYNAMIC"
     catalog_path = None
+    inspect_error_body = True
     extra_payload = {"thinking": {"type": "disabled"}}
+    free_model_ids = frozenset({"glm-4.7-flash", "glm-4.5-flash"})
 
     def _admit(self):
         super()._admit()
-        if any(not model.model_id.endswith("-flash") for model in self.spec.models):
+        if any(model.model_id not in self.free_model_ids for model in self.spec.models):
             raise AuthenticationFailed("EXPLICIT_FREE_MODEL_REQUIRED")
+
+    @staticmethod
+    def _error_code(data):
+        error = data.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+        else:
+            code = data.get("code")
+        if isinstance(code, bool):
+            return None
+        if isinstance(code, (int, str)):
+            return str(code)
+        return None
+
+    def _error_from_body(self, status, headers, data):
+        code = self._error_code(data)
+        if status == 429 and code == "1302":
+            # Z.ai publishes account/model-specific rate limits in the console,
+            # not one universal reset window. Respect Retry-After when supplied;
+            # otherwise the router's normal temporary cooldown applies.
+            raise RateLimited(
+                "RATE_LIMITED",
+                retry_after=retry_seconds(headers.get("retry-after"), self.clock()),
+            )
+        if status == 429 and code == "1305":
+            raise ProviderUnavailable("PROVIDER_TEMPORARILY_OVERLOADED")
+        if status in {402, 429} and code == "1113":
+            # A zero-priced model should not require prepaid balance. Treat this
+            # as loss of confirmed free access and block this provider only.
+            raise BillingViolation("FREE_MODEL_ACCESS_NOT_CONFIRMED")
+        self._error(status, headers)
 
 
 class NvidiaNimAdapter(TextAdapter):

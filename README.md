@@ -122,6 +122,15 @@ uses the Admin API billing-period `end_date` as the reset time. If that exact pe
 temporarily unavailable, FAIR waits six hours and checks again rather than guessing a month
 boundary. Without the admin key, FAIR never guesses that a generic 429 is monthly exhaustion.
 
+For Z.ai, FAIR only admits the text models Z.ai currently lists at zero price:
+`glm-4.7-flash` and `glm-4.5-flash`. A model ending in `-flash` is not automatically
+free; for example, newer Flash models may be paid. Z.ai publishes account/model-specific
+rate limits in its console rather than one universal reset window. FAIR therefore treats
+Z.ai rate-limit code 1302 as temporary, honors `Retry-After` when supplied, and otherwise
+uses its normal cooldown before rechecking. Z.ai overload code 1305 is treated as provider
+availability, not quota. If a zero-priced model returns insufficient-balance code 1113,
+FAIR blocks Z.ai rather than risking paid fallback.
+
 FAIR does not treat possession of an API key as proof that a recurring provider account is
 still on a free tier. For providers such as Gemini, Groq, Mistral, Z.ai, and Cloudflare
 Workers AI, explicitly attest the account is currently free-only with
