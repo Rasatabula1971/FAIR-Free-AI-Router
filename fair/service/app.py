@@ -183,13 +183,9 @@ def _service_error(status_code: int, error_type: str, result) -> JSONResponse:
     )
 
 
-def create_app(
-    fair: FAIR, client_keys: dict[str, str], *, admin_key: str | None = None
-) -> FastAPI:
+def create_app(fair: FAIR, client_keys: dict[str, str], *, admin_key: str | None = None) -> FastAPI:
     client_keys = parse_client_keys(json.dumps(client_keys))
-    if admin_key is not None and (
-        len(admin_key) < 24 or admin_key.startswith("replace-with")
-    ):
+    if admin_key is not None and (len(admin_key) < 24 or admin_key.startswith("replace-with")):
         raise ValueError("FAIR_SERVICE_ADMIN_KEY must be a non-placeholder key of 24+ characters")
     if admin_key is not None and admin_key in client_keys.values():
         raise ValueError("FAIR_SERVICE_ADMIN_KEY must be distinct from every client key")
@@ -213,9 +209,7 @@ def create_app(
     async def health():
         listed = await fair.providers_async()
         admissible = sum(provider["status"] != "REVIEW_EXPIRED" for provider in listed)
-        routable = sum(
-            provider["status"] in {"ACTIVE", "QUOTA_PRESSURE"} for provider in listed
-        )
+        routable = sum(provider["status"] in {"ACTIVE", "QUOTA_PRESSURE"} for provider in listed)
         payload = {
             "status": (
                 "stopped"
