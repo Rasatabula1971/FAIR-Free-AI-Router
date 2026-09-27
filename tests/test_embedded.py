@@ -1027,6 +1027,11 @@ class TestOpenRouterReviewedModels:
         assert "structured_output" not in models["cohere/north-mini-code:free"].capabilities
         assert all(model_id.endswith(":free") for model_id in models)
 
+    def test_openrouter_free_account_daily_limit_is_locally_guarded(self):
+        provider = _CLOUD_PROVIDERS["openrouter_free"]
+        assert provider["request_limit"] == 50
+        assert provider["request_limit_window"] == "DAILY_UTC"
+
 
 class TestExpiredProviderReview:
     """A stale built-in review must cost one provider, not the whole router."""
