@@ -14,9 +14,7 @@ class MemorySelector:
         self.settings = settings
         self.performance = performance
 
-    async def candidates_async(
-        self, request, profile, tried, benchmark_checks=None, eligible=None
-    ):
+    async def candidates_async(self, request, profile, tried, benchmark_checks=None, eligible=None):
         candidates = []
         for spec in self.registry.providers.values():
             try:
