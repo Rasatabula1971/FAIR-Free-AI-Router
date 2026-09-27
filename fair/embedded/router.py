@@ -158,8 +158,9 @@ class EmbeddedRouter:
             disposition, error_type = "INFRA_FAILURE", "AUTHENTICATION_FAILED"
             error_detail = _failure_detail(error)
         except asyncio.CancelledError:
+            # Caller cancellation says nothing about provider health. Penalizing
+            # the provider here lets one client open a shared circuit breaker.
             cancelled = True
-            self.quota.failure(spec.provider_id)
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
         except Exception as error:
             self.quota.failure(spec.provider_id)

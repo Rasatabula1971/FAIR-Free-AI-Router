@@ -6,6 +6,7 @@ that: router.py was at 77%, selector.py 82%, grounding.py 71%,
 qualification.py 83%.
 """
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -138,6 +139,19 @@ class TestAttemptFailureHandling:
         assert result.provider_id == "b"
         assert router.stopped is False
         assert router.quota.state("a").security_blocked is True
+
+    @pytest.mark.asyncio
+    async def test_client_cancellation_does_not_penalize_provider_health(self):
+        router = _router(
+            entries=[(_spec(), MockAdapter("a", error=asyncio.CancelledError()))],
+            circuit_failures=1,
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await router.solve(_request())
+        state = router.quota.state("a")
+        assert state.failures == []
+        assert state.circuit_state == "CLOSED"
+        assert router.quota.effective_status(_spec()) == "ACTIVE"
 
     @pytest.mark.asyncio
     async def test_an_unexpected_exception_counts_as_a_provider_failure(self):
