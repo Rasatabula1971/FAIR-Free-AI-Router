@@ -216,6 +216,10 @@ _CLOUD_PROVIDERS = {
         "env": "KILO_API_KEY",
         "adapter": KiloFreeAdapter,
         "access_class": "FREE_DYNAMIC",
+        # Kilo currently limits all free-model requests, authenticated or
+        # anonymous, to 200 requests/hour per public IP.
+        "request_limit": 200,
+        "request_limit_window": "HOURLY",
         "models": _text_models(
             ("nvidia/nemotron-3-super-120b-a12b:free", 262144),
             ("nex-agi/nex-n2.5-pro:free", 262144),
