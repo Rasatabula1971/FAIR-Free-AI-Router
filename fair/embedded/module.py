@@ -171,10 +171,19 @@ _CLOUD_PROVIDERS = {
         "adapter": OpenRouterFreeAdapter,
         "access_class": "FREE_DYNAMIC",
         "models": _text_models(
-            ("google/gemma-4-26b-a4b-it:free", 262144),
-            # These two do not support response_format; without this they would
-            # be selected for schema requests and rejected by the gateway.
-            ("inclusionai/ling-3.0-flash-sante:free", 262144, _NO_STRUCTURED_OUTPUT),
+            # Reviewed against OpenRouter on 2026-09-27. Nemotron 3 Ultra is
+            # the primary long-context reasoning/agent model but its free
+            # endpoint does not accept response_format.
+            (
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                1000000,
+                _NO_STRUCTURED_OUTPUT,
+            ),
+            # FAIR sends strict JSON Schema through response_format. Nex-N2.5
+            # Mini's free endpoint explicitly supports that contract.
+            ("nex-agi/nex-n2.5-mini:free", 262144),
+            # Keep a fast coding-specialist fallback. It does not accept
+            # response_format, so it must not be selected for schema requests.
             ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
         ),
     },
