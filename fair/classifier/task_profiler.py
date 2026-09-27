@@ -50,8 +50,13 @@ def profile_task(request: SolveRequest, thresholds: dict[str, float]) -> TaskPro
     return TaskProfile(
         task_class=task_class,
         required_capabilities=required,
-        # UTF-8 byte count is a conservative bound, not a tokenizer claim.
-        context_tokens_estimate=len(model_task(request).encode("utf-8")) + 1024,
+        # Mirror the adapters' pre-dispatch budget check. json.dumps escapes
+        # non-ASCII input, so raw UTF-8 length can materially under-estimate
+        # the payload that is actually sent.
+        context_tokens_estimate=len(json.dumps(model_task(request)).encode("utf-8"))
+        + (len(json.dumps(request.expected_schema)) if request.expected_schema else 0)
+        + request.max_output_tokens
+        + 512,
         minimum_quality_score=thresholds[request.quality_level],
         requires_grounding=grounding,
     )
