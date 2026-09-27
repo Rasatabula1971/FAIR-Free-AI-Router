@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -248,14 +249,23 @@ def _read_env_file(path):
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export ") :].lstrip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            values[key.strip()] = value.strip().strip("'\"")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            else:
+                value = value.split(" #", 1)[0].split("\t#", 1)[0].rstrip()
+            values[key.strip()] = value
     return values
 
 
 def _loopback(url):
+    if "://" not in url:
+        url = "http://" + url
     parts = urlsplit(url)
     if parts.hostname == "localhost":
         netloc = "127.0.0.1" + (f":{parts.port}" if parts.port else "")
@@ -613,19 +623,25 @@ class FAIR:
         ]
 
     async def providers_async(self) -> list[dict]:
-        result = []
-        for provider in self._registry.providers.values():
-            result.append(
-                {
-                    "provider_id": provider.provider_id,
-                    "status": await self._router.quota.effective_status_async(provider),
-                    "access_class": provider.access_class,
-                    "models": [model.model_id for model in provider.models],
-                    "quota_pool_id": self._router.quota.pool_id(provider.provider_id),
-                    "quota_remaining": await self._router.quota.remaining_async(provider),
-                }
+        async def describe(provider):
+            status, remaining = await asyncio.gather(
+                self._router.quota.effective_status_async(provider),
+                self._router.quota.remaining_async(provider),
             )
-        return result
+            return {
+                "provider_id": provider.provider_id,
+                "status": status,
+                "access_class": provider.access_class,
+                "models": [model.model_id for model in provider.models],
+                "quota_pool_id": self._router.quota.pool_id(provider.provider_id),
+                "quota_remaining": remaining,
+            }
+
+        return list(
+            await asyncio.gather(
+                *(describe(provider) for provider in self._registry.providers.values())
+            )
+        )
 
     def quota_usage(self) -> dict:
         """Return secret-free shared quota usage grouped by application."""
@@ -643,6 +659,18 @@ class FAIR:
         return {
             "provider_id": provider_id,
             "status": self._router.quota.effective_status(self._registry.providers[provider_id]),
+        }
+
+    async def resume_provider_async(self, provider_id: str) -> dict:
+        """Nonblocking provider resume for the central HTTP service."""
+        if provider_id not in self._registry.providers:
+            raise ValueError("Unknown provider")
+        self._router.quota.unblock_security(provider_id)
+        return {
+            "provider_id": provider_id,
+            "status": await self._router.quota.effective_status_async(
+                self._registry.providers[provider_id]
+            ),
         }
 
     def clear_cache(self, client_id: str = "embedded") -> dict:
