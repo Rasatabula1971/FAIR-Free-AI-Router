@@ -628,8 +628,8 @@ class TestZai:
         assert error.value.retry_after == 17
 
     async def test_usage_limit_uses_explicit_reset_timestamp(self):
-        now = datetime(2026, 9, 27, tzinfo=UTC).timestamp()
-        reset_at = datetime(2026, 9, 28, 3, tzinfo=UTC).timestamp()
+        now = datetime.now(UTC).timestamp()
+        reset_at = now + 5 * 60 * 60
         transport, _ = _transport(
             {
                 ("POST", "/chat/completions"): (
@@ -638,7 +638,7 @@ class TestZai:
                         "error": {
                             "code": 1308,
                             "message": "usage limit reached",
-                            "next_flush_time": "2026-09-28T03:00:00Z",
+                            "next_flush_time": reset_at,
                         }
                     },
                 ),
