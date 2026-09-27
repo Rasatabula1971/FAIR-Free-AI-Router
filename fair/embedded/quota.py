@@ -17,7 +17,9 @@ _WINDOW_ZONES = {"DAILY_UTC": UTC, "DAILY_PACIFIC": ZoneInfo("America/Los_Angele
 
 
 def next_window_reset(window, now):
-    """Unix time of the next local midnight for a daily quota window."""
+    """Unix time when FAIR's conservative local quota window clears."""
+    if window == "HOURLY":
+        return now + 3600
     zone = _WINDOW_ZONES[window]
     local = datetime.fromtimestamp(now, zone)
     tomorrow = (local + timedelta(days=1)).date()
