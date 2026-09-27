@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -118,13 +119,18 @@ def _skip_reason(error):
 # differ from the full text set.
 _NO_STRUCTURED_OUTPUT = frozenset(TEXT_CAPABILITIES) - {"structured_output"}
 
+# TextAdapter and OllamaLocalAdapter refuse max_output_tokens above this
+# before dispatch. Declaring the cap lets the selector skip those routes.
+_TEXT_ADAPTER_MAX_OUTPUT = 4096
 
-def _text_models(*entries):
+
+def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT):
     """Each entry is (model_id, context_window) or (model_id, context_window, capabilities)."""
     return [
         ModelDescriptor(
             model_id=entry[0],
             context_window=entry[1],
+            max_output_tokens=max_output_tokens,
             capabilities=set(entry[2]) if len(entry) > 2 else set(TEXT_CAPABILITIES),
         )
         for entry in entries
@@ -133,10 +139,11 @@ def _text_models(*entries):
 
 _FREE_STATUS = {"FREE_RECURRING": "verified_free_plan", "FREE_DYNAMIC": "verified_zero_price_model"}
 
-# These gateways prove zero price at request time: catalog entries must be
-# explicitly free/zero-priced and the completion response must report zero
-# cost. Free-plan providers whose same API key can belong to a billable
-# account are NOT auto-confirmed.
+# These gateways prove zero price at request time. OpenRouter requires a zero
+# completion cost observation; Kilo accepts either zero cost_microdollars or an
+# exact fresh ':free' model from the live zero-priced catalog. Free-plan
+# providers whose same API key can belong to a billable account are NOT
+# auto-confirmed.
 _RUNTIME_ZERO_COST_PROVIDERS = frozenset({"openrouter_free", "kilo_free"})
 
 # Cloud providers: constructor keyword, environment variable, adapter, access class, models.
@@ -152,7 +159,11 @@ _CLOUD_PROVIDERS = {
         # model and tier, and a 429 still exhausts the provider on its own.
         "request_limit": 1500,
         "request_limit_window": "DAILY_PACIFIC",
-        "models": _text_models(("gemini-3.5-flash-lite", 1048576), ("gemini-3.6-flash", 1048576)),
+        "models": _text_models(
+            ("gemini-3.5-flash-lite", 1048576),
+            ("gemini-3.6-flash", 1048576),
+            max_output_tokens=None,
+        ),
     },
     "groq": {
         "kwarg": "groq_api_key",
@@ -239,14 +250,23 @@ def _read_env_file(path):
     with open(path, encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
+            if line.startswith("export "):
+                line = line[len("export ") :].lstrip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            values[key.strip()] = value.strip().strip("'\"")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            else:
+                value = value.split(" #", 1)[0].split("\t#", 1)[0].rstrip()
+            values[key.strip()] = value
     return values
 
 
 def _loopback(url):
+    if "://" not in url:
+        url = "http://" + url
     parts = urlsplit(url)
     if parts.hostname == "localhost":
         netloc = "127.0.0.1" + (f":{parts.port}" if parts.port else "")
@@ -405,7 +425,10 @@ class FAIR:
         if not ollama_url and env.get("OLLAMA_ENABLED"):
             ollama_url = "http://127.0.0.1:11434"
         if ollama_url:
-            self._register_ollama(_loopback(ollama_url), ollama_models, live_settings)
+            try:
+                self._register_ollama(_loopback(ollama_url), ollama_models, live_settings)
+            except (ValueError, AdmissionDenied, AuthenticationFailed):
+                self.skipped["ollama_local"] = "Ollama requires a literal loopback HTTP endpoint"
 
         if providers:
             for spec, adapter in providers:
@@ -491,6 +514,8 @@ class FAIR:
         self._registry.register(spec, adapter)
 
     def _register_ollama(self, url, model_ids, settings):
+        # Validate before mutating the shared settings used by cloud adapters.
+        LiveSettings(ollama_url=url)
         if model_ids:
             discovered = [(model_id, _LOCAL_CONTEXT_CAP) for model_id in model_ids]
         else:
@@ -598,9 +623,56 @@ class FAIR:
             for p in self._registry.providers.values()
         ]
 
+    async def providers_async(self) -> list[dict]:
+        async def describe(provider):
+            status, remaining = await asyncio.gather(
+                self._router.quota.effective_status_async(provider),
+                self._router.quota.remaining_async(provider),
+            )
+            return {
+                "provider_id": provider.provider_id,
+                "status": status,
+                "access_class": provider.access_class,
+                "models": [model.model_id for model in provider.models],
+                "quota_pool_id": self._router.quota.pool_id(provider.provider_id),
+                "quota_remaining": remaining,
+            }
+
+        return list(
+            await asyncio.gather(
+                *(describe(provider) for provider in self._registry.providers.values())
+            )
+        )
+
     def quota_usage(self) -> dict:
         """Return secret-free shared quota usage grouped by application."""
         return self._router.quota.usage_report(self._registry.providers.values())
+
+    async def quota_usage_async(self) -> dict:
+        """Nonblocking quota report for the central HTTP service."""
+        return await self._router.quota.usage_report_async(self._registry.providers.values())
+
+    def resume_provider(self, provider_id: str) -> dict:
+        """Clear a provider-local security block after explicit operator review."""
+        if provider_id not in self._registry.providers:
+            raise ValueError("Unknown provider")
+        self._router.quota.unblock_security(provider_id)
+        return {
+            "provider_id": provider_id,
+            "status": self._router.quota.effective_status(self._registry.providers[provider_id]),
+        }
+
+    async def resume_provider_async(self, provider_id: str) -> dict:
+        """Nonblocking provider resume for the central HTTP service."""
+        if provider_id not in self._registry.providers:
+            raise ValueError("Unknown provider")
+        self._router.quota.unblock_security(provider_id)
+        return {
+            "provider_id": provider_id,
+            "status": await self._router.quota.effective_status_async(
+                self._registry.providers[provider_id]
+            ),
+        }
 
     def clear_cache(self, client_id: str = "embedded") -> dict:
         return self._router.cache.clear(client_id)

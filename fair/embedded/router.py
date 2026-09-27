@@ -10,11 +10,14 @@ from fair.embedded.performance import MemoryPerformanceRegistry
 from fair.embedded.quota import MemoryQuotaGovernor
 from fair.embedded.selector import MemorySelector
 from fair.providers.base import (
+    AccessDenied,
     AuthenticationFailed,
     BillingViolation,
+    ModelUnavailable,
     ProviderError,
     QuotaExceeded,
     RateLimited,
+    RequestNotSupported,
 )
 from fair.quality.consensus import compare, independent
 from fair.quality.engine import acceptable, evaluate
@@ -90,13 +93,12 @@ class EmbeddedRouter:
 
     async def _attempt(self, request_id, request, profile, route, number, role):
         score, spec, model = route
-        remaining = self.quota.remaining(spec)
-        if not self.quota.reserve(spec, request.client_id):
+        remaining = await self.quota.remaining_async(spec)
+        if not await self.quota.reserve_async(spec, request.client_id):
             return None, None, False
         start = monotonic()
         quality = response = error_type = error_detail = None
         validator_failed = cancelled = False
-        billing_violation = False
         self._emit(
             "EXECUTING",
             {
@@ -124,21 +126,32 @@ class EmbeddedRouter:
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
                 raise ValueError("Response identity mismatch")
             if response.quota is not None:
-                self.quota.observe(spec, response.quota)
+                await self.quota.observe_async(spec, response.quota)
             self.quota.success(spec.provider_id)
         except BillingViolation as error:
-            billing_violation = True
+            # Fail closed on this provider only. One uncertain/nonzero cost report
+            # must not take unrelated free providers or local Ollama offline.
             self.quota.block_security(spec.provider_id)
-            self.stopped = True
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
             error_detail = _failure_detail(error)
         except QuotaExceeded as error:
-            self.quota.exhaust(spec, reset_at=error.reset_at)
+            await self.quota.exhaust_async(spec, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
             error_detail = _failure_detail(error)
         except RateLimited as error:
             self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
+            error_detail = _failure_detail(error)
+        except RequestNotSupported as error:
+            disposition, error_type = "CAPABILITY_MISMATCH", "REQUEST_NOT_SUPPORTED_BY_ROUTE"
+            error_detail = _failure_detail(error)
+        except ModelUnavailable as error:
+            disposition, error_type = "INFRA_FAILURE", "MODEL_UNAVAILABLE"
+            error_detail = _failure_detail(error)
+        except AccessDenied as error:
+            # 403 can be request/model-specific. Do not let one application's
+            # denied request throttle this provider for every other client.
+            disposition, error_type = "CAPABILITY_MISMATCH", "ACCESS_DENIED"
             error_detail = _failure_detail(error)
         except AuthenticationFailed as error:
             self.quota.block_security(spec.provider_id)
@@ -186,11 +199,13 @@ class EmbeddedRouter:
             quality=quality,
             role=role,
         )
-        if attempt.disposition != "CANCELLED":
+        if attempt.disposition != "CANCELLED" and attempt.error_type not in {
+            "REQUEST_NOT_SUPPORTED_BY_ROUTE",
+            "MODEL_UNAVAILABLE",
+            "ACCESS_DENIED",
+        }:
             self.performance.record(attempt, profile.task_class)
         self._emit("ATTEMPT_COMPLETED", attempt.model_dump(mode="json"))
-        if billing_violation:
-            raise BillingViolation("PROVIDER_COST_POLICY_VIOLATION")
         if cancelled:
             raise asyncio.CancelledError
         return attempt, response, validator_failed
@@ -218,7 +233,7 @@ class EmbeddedRouter:
                 break
             candidates = [
                 route
-                for route in self.selector.candidates(
+                for route in await self.selector.candidates_async(
                     request,
                     profile,
                     tried,
@@ -262,7 +277,7 @@ class EmbeddedRouter:
             if failed:
                 report.state = "SERVICE_FAILED"
                 break
-            if attempt.disposition in {"INFRA_FAILURE", "QUOTA_FAILURE"}:
+            if attempt.disposition in {"INFRA_FAILURE", "QUOTA_FAILURE", "CAPABILITY_MISMATCH"}:
                 continue
             try:
                 agreement, basis = compare(
@@ -316,7 +331,7 @@ class EmbeddedRouter:
             if self.stopped:
                 reason = "SYSTEM_STOPPED"
                 break
-            candidates = self.selector.candidates(request, profile, tried)
+            candidates = await self.selector.candidates_async(request, profile, tried)
             if not candidates:
                 break
             route = candidates[0]
@@ -344,7 +359,7 @@ class EmbeddedRouter:
             attempts.append(attempt)
             if attempt.disposition in {"INFRA_FAILURE", "QUOTA_FAILURE"}:
                 unanswered += 1
-            else:
+            elif attempt.disposition != "CAPABILITY_MISMATCH":
                 answered += 1
             if validator_failed:
                 break

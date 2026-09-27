@@ -9,11 +9,12 @@ from fair import FAIR
 from fair.providers.mock import MockAdapter
 from fair.schemas.domain import ProviderSpec
 from fair.service import app as service
-from fair.service.__main__ import _port
+from fair.service.__main__ import _host, _port
 from fair.service.app import SERVICE_MODEL_ID, create_app, parse_client_keys
 
 CORP_KEY = "corp-client-key-0123456789"
 VIDEO_KEY = "video-client-key-0123456789"
+ADMIN_KEY = "admin-service-key-01234567890123456789"
 
 
 def _spec(**overrides):
@@ -75,6 +76,7 @@ class TestServiceAuth:
             '{"corp":"short"}',
             '{"":"0123456789abcdef"}',
             '{"corp":"0123456789abcdef","video":"0123456789abcdef"}',
+            '{"corp":"replace-with-random-client-key"}',
         ],
     )
     def test_invalid_client_configuration_fails_closed(self, raw):
@@ -84,6 +86,17 @@ class TestServiceAuth:
     def test_valid_client_configuration(self):
         assert parse_client_keys(json.dumps({"corp": CORP_KEY})) == {"corp": CORP_KEY}
 
+    @pytest.mark.asyncio
+    async def test_non_ascii_bearer_token_is_rejected_without_crashing(self):
+        resolver = service._client_resolver({"corp": CORP_KEY})
+        with pytest.raises(Exception) as captured:
+            await resolver("Bearer ☃")
+        assert getattr(captured.value, "status_code", None) == 401
+
+    def test_admin_key_must_not_equal_a_client_key(self):
+        with pytest.raises(ValueError, match="distinct"):
+            create_app(_fair(), {"corp": CORP_KEY}, admin_key=CORP_KEY)
+
 
 class TestServiceEndpoints:
     def test_health_is_local_safe_and_does_not_require_client_key(self):
@@ -91,7 +104,12 @@ class TestServiceEndpoints:
         with TestClient(app) as client:
             response = client.get("/health")
             assert response.status_code == 200
-            assert response.json() == {"status": "ok", "providers": 1}
+            assert response.json() == {
+                "status": "ok",
+                "providers": 1,
+                "admissible_providers": 1,
+                "routable_providers": 1,
+            }
 
     def test_models_exposes_router_not_provider_credentials(self):
         app = create_app(_fair(), {"corp": CORP_KEY})
@@ -160,6 +178,43 @@ class TestServiceEndpoints:
             payload = client.get("/v1/fair/providers", headers=_headers()).json()
         assert payload["providers"][0]["provider_id"] == "mock"
         assert payload["skipped"] == {}
+
+    def test_health_is_not_ready_when_all_providers_are_security_blocked(self):
+        fair = _fair()
+        fair._router.quota.block_security("mock")
+        app = create_app(fair, {"corp": CORP_KEY})
+        with TestClient(app) as client:
+            response = client.get("/health")
+        assert response.status_code == 503
+        payload = response.json()
+        assert payload["status"] == "no_routable_providers"
+        assert payload["routable_providers"] == 0
+
+    def test_admin_api_is_disabled_without_admin_key(self):
+        app = create_app(_fair(), {"corp": CORP_KEY})
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/fair/admin/providers/mock/resume",
+                headers=_headers(),
+            )
+        assert response.status_code == 404
+
+    def test_admin_can_resume_only_with_the_admin_key(self):
+        fair = _fair()
+        fair._router.quota.block_security("mock")
+        app = create_app(fair, {"corp": CORP_KEY}, admin_key=ADMIN_KEY)
+        with TestClient(app) as client:
+            denied = client.post(
+                "/v1/fair/admin/providers/mock/resume",
+                headers=_headers(),
+            )
+            assert denied.status_code == 401
+            resumed = client.post(
+                "/v1/fair/admin/providers/mock/resume",
+                headers={"Authorization": f"Bearer {ADMIN_KEY}"},
+            )
+        assert resumed.status_code == 200
+        assert resumed.json()["status"] == "ACTIVE"
 
 
 class TestOpenAICompatibility:
@@ -295,6 +350,20 @@ class TestServiceConfiguration:
         assert app.title == "FAIR Free AI Router"
         assert captured["confirmed_free_providers"] == {"groq"}
         assert captured["quota_pool_ids"] == {"mock": "account-a"}
+
+    def test_service_host_is_loopback_only(self, monkeypatch):
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "localhost")
+        assert _host() == "127.0.0.1"
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "127.0.0.1")
+        assert _host() == "127.0.0.1"
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "::1")
+        assert _host() == "::1"
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "0.0.0.0")
+        with pytest.raises(SystemExit, match="loopback-only"):
+            _host()
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "fair.internal")
+        with pytest.raises(SystemExit, match="literal loopback"):
+            _host()
 
     def test_port_parser(self, monkeypatch):
         monkeypatch.setenv("FAIR_SERVICE_PORT", "8123")

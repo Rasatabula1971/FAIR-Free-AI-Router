@@ -120,13 +120,23 @@ class TestAttemptFailureHandling:
         assert router.quota.state("a").security_blocked is True
 
     @pytest.mark.asyncio
-    async def test_a_billing_violation_blocks_the_provider_and_stops_the_router(self):
-        """It propagates rather than returning a response: dispatch must halt."""
+    async def test_a_billing_violation_blocks_only_that_provider(self):
         error = BillingViolation("PROVIDER_REPORTED_NONZERO_OR_INVALID_COST")
-        router = _router(entries=[(_spec(), MockAdapter("a", error=error))])
-        with pytest.raises(BillingViolation):
-            await router.solve(_request())
-        assert router.stopped is True
+        router = _router(
+            entries=[
+                (_spec("a"), MockAdapter("a", error=error)),
+                (_spec("b"), MockAdapter("b", text="345")),
+            ]
+        )
+        result = await router.solve(
+            _request(
+                task="15*23",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.provider_id == "b"
+        assert router.stopped is False
         assert router.quota.state("a").security_blocked is True
 
     @pytest.mark.asyncio
@@ -252,6 +262,13 @@ class TestSelectorEligibility:
         selector, _ = self._selector([(spec, MockAdapter("a"))])
         profile = self._profile(required_capabilities={"structured_output"})
         assert selector.candidates(_request(), profile, set()) == []
+
+    def test_a_model_with_too_small_output_budget_is_not_offered(self):
+        spec = _spec()
+        spec.models[0].max_output_tokens = 64
+        selector, _ = self._selector([(spec, MockAdapter("a"))])
+        request = _request(max_output_tokens=65)
+        assert selector.candidates(request, self._profile(max_output_tokens=65), set()) == []
 
     def test_a_task_beyond_the_context_window_is_not_offered(self):
         spec = _spec()

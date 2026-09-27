@@ -20,7 +20,7 @@ class RateLimited(ProviderError):
 
 
 class BillingViolation(ProviderError):
-    """Unexpected cost report: withhold the normal free-only response and stop dispatch."""
+    """Unexpected/unknown cost: block the offending provider and withhold its response."""
 
 
 class QuotaExceeded(ProviderError):
@@ -39,6 +39,18 @@ class AuthenticationFailed(ProviderError):
 
 class MalformedResponse(ProviderError):
     pass
+
+
+class RequestNotSupported(MalformedResponse):
+    """The request cannot use this route; provider health is not implicated."""
+
+
+class ModelUnavailable(AuthenticationFailed):
+    """A reviewed model is absent or changed; the provider credential is not implicated."""
+
+
+class AccessDenied(AuthenticationFailed):
+    """HTTP 403: this request was denied; it is not proof the credential is invalid."""
 
 
 class ProviderAdapter(Protocol):

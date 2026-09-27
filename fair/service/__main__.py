@@ -1,6 +1,20 @@
 """Run the local FAIR HTTP service."""
 
+import ipaddress
 import os
+
+
+def _host() -> str:
+    raw = os.environ.get("FAIR_SERVICE_HOST", "127.0.0.1").strip()
+    if raw.casefold() == "localhost":
+        return "127.0.0.1"
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError as error:
+        raise SystemExit("FAIR_SERVICE_HOST must be a literal loopback address") from error
+    if not address.is_loopback:
+        raise SystemExit("FAIR service is loopback-only; remote binding is not supported")
+    return raw
 
 
 def _port() -> int:
@@ -23,7 +37,7 @@ def main():
     uvicorn.run(
         "fair.service.app:create_app_from_env",
         factory=True,
-        host=os.environ.get("FAIR_SERVICE_HOST", "127.0.0.1"),
+        host=_host(),
         port=_port(),
         proxy_headers=False,
     )

@@ -6,12 +6,15 @@ import re
 from pydantic import BaseModel
 
 from fair.providers.base import (
+    AccessDenied,
     AuthenticationFailed,
     BillingViolation,
     MalformedResponse,
+    ModelUnavailable,
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
+    RequestNotSupported,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +71,13 @@ class CredentialedAdapter:
         except BillingViolation:
             logger.error("Billing violation from provider %s", self.provider_id)
             raise BillingViolation("PROVIDER_REPORTED_NONZERO_OR_INVALID_COST") from None
+        except ModelUnavailable as error:
+            code = _safe_code(error, "REVIEWED_MODEL_UNAVAILABLE")
+            logger.warning("Model unavailable at provider %s: %s", self.provider_id, code)
+            raise ModelUnavailable(code) from None
+        except AccessDenied:
+            logger.warning("Access denied by provider %s", self.provider_id)
+            raise AccessDenied("PROVIDER_ACCESS_DENIED") from None
         except AuthenticationFailed:
             logger.error("Authentication failed for provider %s", self.provider_id)
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
@@ -77,6 +87,9 @@ class CredentialedAdapter:
         except RateLimited as error:
             logger.info("Rate limited by provider %s", self.provider_id)
             raise RateLimited("RATE_LIMITED", retry_after=error.retry_after) from None
+        except RequestNotSupported as error:
+            code = _safe_code(error, "REQUEST_NOT_SUPPORTED")
+            raise RequestNotSupported(code) from None
         except MalformedResponse as error:
             # FAIR's own adapters compose these codes; they distinguish a bad
             # envelope from an oversized body from a budget violation, which
