@@ -27,7 +27,6 @@ from fair.providers.live import (
     MistralAdapter,
     OllamaLocalAdapter,
     OpenRouterFreeAdapter,
-    ZaiFreeAdapter,
 )
 from fair.providers.registry import Registry
 from fair.quality.source_reviews import SourceReviewRegistry
@@ -224,13 +223,6 @@ _CLOUD_PROVIDERS = {
             ("poolside/laguna-s-2.1:free", 262144),
         ),
     },
-    "zai_free": {
-        "kwarg": "zai_api_key",
-        "env": "ZAI_API_KEY",
-        "adapter": ZaiFreeAdapter,
-        "access_class": "FREE_DYNAMIC",
-        "models": _text_models(("glm-4.5-flash", 131072), ("glm-4.7-flash", 131072)),
-    },
     "cloudflare_workers_ai": {
         "kwarg": "cloudflare_api_token",
         "env": "CLOUDFLARE_API_TOKEN",
@@ -370,7 +362,6 @@ class FAIR:
             "openrouter_api_key": openrouter_api_key,
             "mistral_api_key": mistral_api_key,
             "kilo_api_key": kilo_api_key,
-            "zai_api_key": zai_api_key,
             "nvidia_api_key": nvidia_api_key,
             "ollama_cloud_api_key": ollama_cloud_api_key,
             "cloudflare_api_token": cloudflare_api_token,
@@ -388,8 +379,20 @@ class FAIR:
                 "hosted preview API uses starter credits and is not eligible for FAIR "
                 "recurring-free routing"
             )
+        zai_key = zai_api_key or env.get("ZAI_API_KEY")
+        if zai_key and zai_key.strip():
+            self.skipped["zai_free"] = (
+                "Z.ai offers trial, prepaid, and paid plan access; it has no recurring "
+                "free API tier eligible for FAIR"
+            )
 
         confirmed = set(confirmed_free_providers or ())
+        if "zai_free" in confirmed:
+            self.skipped.setdefault(
+                "zai_free",
+                "Z.ai has no recurring free API tier eligible for FAIR",
+            )
+            confirmed.discard("zai_free")
         unknown_confirmations = confirmed - set(_CLOUD_PROVIDERS)
         if unknown_confirmations:
             names = ", ".join(sorted(unknown_confirmations))

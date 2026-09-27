@@ -78,7 +78,6 @@ print(result.output)  # "345"
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Workers Free only; Cloudflare hard-stops at 10k neurons/day | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
 | OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, `data_collection=deny`, 50 requests/day on a free account) | `nemotron-3-ultra-550b-a55b`†, `nex-n2.5-mini`, `north-mini-code`† |
 | Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
-| Z.ai | `ZAI_API_KEY` | Free dynamic (flash models) | `glm-4.5-flash`, `glm-4.7-flash` |
 | Ollama (local) | `OLLAMA_HOST` or `OLLAMA_URL` | Free local | auto-discovered from the daemon |
 
 † Nemotron 3 Ultra and North Mini Code do not accept `response_format`, so they are not
@@ -100,7 +99,7 @@ len(fair.providers())                  # 2  -> openrouter_free, kilo_free
 len(fair.skipped)                      # 5  -> each with the reason
 
 fair = FAIR(**all_seven_keys, confirmed_free_providers={
-    "google_gemini_api", "groq", "mistral", "zai_free", "cloudflare_workers_ai",
+    "google_gemini_api", "groq", "mistral", "cloudflare_workers_ai",
 })
 len(fair.providers())                  # 7, nothing skipped
 ```
@@ -433,7 +432,6 @@ FAIR(
     openrouter_api_key="...",     # or env: OPENROUTER_API_KEY
     mistral_api_key="...",        # or env: MISTRAL_API_KEY
     kilo_api_key="...",           # or env: KILO_API_KEY
-    zai_api_key="...",            # or env: ZAI_API_KEY
     cloudflare_api_token="...",   # or env: CLOUDFLARE_API_TOKEN
     cloudflare_account_id="...",  # or env: CLOUDFLARE_ACCOUNT_ID
     confirmed_free_providers={     # explicit account-tier confirmation where required

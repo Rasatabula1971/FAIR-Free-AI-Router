@@ -12,7 +12,6 @@ from fair.providers.base import (
     AccessDenied,
     AuthenticationFailed,
     BillingViolation,
-    ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
 )
@@ -585,150 +584,10 @@ class TestMistral:
 
 
 class TestZai:
-    MODEL = "glm-4.5-flash"
-
-    async def test_thinking_disabled_and_catalog_skipped(self):
-        transport, seen = _transport(
-            {
-                ("POST", "/chat/completions"): (200, _completion(self.MODEL)),
-            }
-        )
-        adapter = ZaiFreeAdapter(
-            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
-            _settings(),
-            credential=SecretStr("k"),
-            transport=transport,
-        )
-        response = await adapter.complete(_request(self.MODEL))
-        assert response.text == "pong"
-        assert [r.method for r in seen] == ["POST"]
-        assert json.loads(seen[0].content)["thinking"] == {"type": "disabled"}
-
-    async def test_true_rate_limit_uses_retry_after(self):
-        def rate_limited(_request):
-            return httpx.Response(
-                429,
-                json={"error": {"code": 1302, "message": "rate limit reached"}},
-                headers={"retry-after": "17"},
-            )
-
-        transport, _ = _transport(
-            {
-                ("POST", "/chat/completions"): rate_limited,
-            }
-        )
-        adapter = ZaiFreeAdapter(
-            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
-            _settings(),
-            credential=SecretStr("k"),
-            transport=transport,
-        )
-        with pytest.raises(RateLimited) as error:
-            await adapter.complete(_request(self.MODEL))
-        assert error.value.retry_after == 17
-
-    async def test_usage_limit_uses_explicit_reset_timestamp(self):
-        now = datetime.now(UTC).timestamp()
-        reset_at = now + 5 * 60 * 60
-        transport, _ = _transport(
-            {
-                ("POST", "/chat/completions"): (
-                    429,
-                    {
-                        "error": {
-                            "code": 1308,
-                            "message": "usage limit reached",
-                            "next_flush_time": reset_at,
-                        }
-                    },
-                ),
-            }
-        )
-        adapter = ZaiFreeAdapter(
-            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
-            _settings(),
-            credential=SecretStr("k"),
-            transport=transport,
-            clock=lambda: now,
-        )
-        with pytest.raises(QuotaExceeded, match="USAGE_LIMIT_EXHAUSTED") as error:
-            await adapter.complete(_request(self.MODEL))
-        assert error.value.reset_at == reset_at
-        quota = await adapter.quota()
-        assert quota.quota_remaining_estimate == 0
-        assert quota.reset_at == reset_at
-
-    async def test_weekly_or_monthly_limit_without_reset_still_exhausts(self):
-        transport, _ = _transport(
-            {
-                ("POST", "/chat/completions"): (
-                    429,
-                    {"error": {"code": "1310", "message": "weekly/monthly limit exhausted"}},
-                ),
-            }
-        )
-        adapter = ZaiFreeAdapter(
-            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
-            _settings(),
-            credential=SecretStr("k"),
-            transport=transport,
-        )
-        with pytest.raises(QuotaExceeded, match="USAGE_LIMIT_EXHAUSTED") as error:
-            await adapter.complete(_request(self.MODEL))
-        assert error.value.reset_at is None
-        quota = await adapter.quota()
-        assert quota.quota_remaining_estimate == 0
-        assert quota.reset_at is None
-
-    async def test_provider_overload_is_not_misclassified_as_quota(self):
-        transport, _ = _transport(
-            {
-                ("POST", "/chat/completions"): (
-                    429,
-                    {"error": {"code": "1305", "message": "temporarily overloaded"}},
-                ),
-            }
-        )
-        adapter = ZaiFreeAdapter(
-            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
-            _settings(),
-            credential=SecretStr("k"),
-            transport=transport,
-        )
-        with pytest.raises(ProviderUnavailable, match="PROVIDER_TEMPORARILY_OVERLOADED"):
-            await adapter.complete(_request(self.MODEL))
-
-    async def test_insufficient_balance_on_free_model_fails_closed(self):
-        transport, _ = _transport(
-            {
-                ("POST", "/chat/completions"): (
-                    429,
-                    {"error": {"code": 1113, "message": "insufficient balance"}},
-                ),
-            }
-        )
-        adapter = ZaiFreeAdapter(
-            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
-            _settings(),
-            credential=SecretStr("k"),
-            transport=transport,
-        )
-        with pytest.raises(BillingViolation, match="FREE_MODEL_ACCESS_NOT_CONFIRMED"):
-            await adapter.complete(_request(self.MODEL))
-
-    def test_paid_flash_model_is_refused(self):
-        with pytest.raises(AuthenticationFailed):
+    def test_zai_is_never_admitted_as_free_provider(self):
+        with pytest.raises(AuthenticationFailed, match="NO_RECURRING_FREE_TIER"):
             ZaiFreeAdapter(
-                _spec("zai_free", "FREE_DYNAMIC", "glm-5.3-flash"),
-                _settings(),
-                credential=SecretStr("k"),
-                transport=httpx.MockTransport(lambda r: httpx.Response(500)),
-            )
-
-    def test_non_flash_model_is_refused(self):
-        with pytest.raises(AuthenticationFailed):
-            ZaiFreeAdapter(
-                _spec("zai_free", "FREE_DYNAMIC", "glm-5"),
+                _spec("zai_free", "FREE_DYNAMIC", "glm-4.5-flash"),
                 _settings(),
                 credential=SecretStr("k"),
                 transport=httpx.MockTransport(lambda r: httpx.Response(500)),
@@ -943,6 +802,20 @@ class TestModuleWiring:
 
         assert {p["provider_id"] for p in fair.providers()} == {"kilo_free"}
         assert fair.skipped["ollama_cloud"].startswith("credit-priced cloud service")
+
+    def test_zai_trial_or_paid_api_is_never_eligible(self, monkeypatch):
+        for entry in _CLOUD_PROVIDERS.values():
+            monkeypatch.delenv(entry["env"], raising=False)
+        monkeypatch.delenv("ZAI_API_KEY", raising=False)
+
+        fair = FAIR(
+            zai_api_key="z",
+            kilo_api_key="k",
+            confirmed_free_providers={"zai_free"},
+        )
+
+        assert {p["provider_id"] for p in fair.providers()} == {"kilo_free"}
+        assert fair.skipped["zai_free"].startswith("Z.ai")
 
     def test_cloudflare_without_account_is_skipped(self, monkeypatch):
         for entry in _CLOUD_PROVIDERS.values():

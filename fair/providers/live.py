@@ -585,95 +585,17 @@ class MistralAdapter(TextAdapter):
 
 
 class ZaiFreeAdapter(TextAdapter):
-    """Z.ai's explicitly zero-priced text models on the general API endpoint."""
+    """Legacy compatibility shim that fails closed.
 
-    base_url = "https://api.z.ai/api/paas/v4"
+    Z.ai offers trial, prepaid, and paid-plan API access, not a recurring free
+    API tier. FAIR therefore must never admit this provider.
+    """
+
     expected_provider = "zai_free"
     expected_access = "FREE_DYNAMIC"
-    catalog_path = None
-    inspect_error_body = True
-    extra_payload = {"thinking": {"type": "disabled"}}
-    free_model_ids = frozenset({"glm-4.7-flash", "glm-4.5-flash"})
 
     def _admit(self):
-        super()._admit()
-        if any(model.model_id not in self.free_model_ids for model in self.spec.models):
-            raise AuthenticationFailed("EXPLICIT_FREE_MODEL_REQUIRED")
-
-    @staticmethod
-    def _error_code(data):
-        error = data.get("error")
-        if isinstance(error, dict):
-            code = error.get("code")
-        else:
-            code = data.get("code")
-        if isinstance(code, bool):
-            return None
-        if isinstance(code, (int, str)):
-            return str(code)
-        return None
-
-    def _reset_at_from_error(self, data):
-        """Use only explicit, machine-readable reset timestamps when Z.ai supplies one."""
-        error = data.get("error")
-        if not isinstance(error, dict):
-            return None
-        candidates = [error.get("next_flush_time"), error.get("reset_at"), error.get("reset_time")]
-        message = error.get("message")
-        if isinstance(message, str):
-            candidates.extend(re.findall(r"\\b\\d{10}(?:\\.\\d+)?\\b", message))
-            candidates.extend(
-                re.findall(
-                    r"\\b\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:?\\d{2})\\b",
-                    message,
-                )
-            )
-        now = self.clock()
-        for value in candidates:
-            try:
-                reset_at = float(value)
-            except (TypeError, ValueError):
-                if not isinstance(value, str):
-                    continue
-                try:
-                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if parsed.tzinfo is None:
-                    continue
-                reset_at = parsed.timestamp()
-            if now < reset_at <= now + 40 * SECONDS_IN_DAY:
-                return reset_at
-        return None
-
-    def _error_from_body(self, status, headers, data):
-        code = self._error_code(data)
-        if status == 429 and code == "1302":
-            # Z.ai publishes account/model-specific rate limits in the console,
-            # not one universal reset window. Respect Retry-After when supplied;
-            # otherwise the router's normal temporary cooldown applies.
-            raise RateLimited(
-                "RATE_LIMITED",
-                retry_after=retry_seconds(headers.get("retry-after"), self.clock()),
-            )
-        if status == 429 and code in {"1308", "1310"}:
-            # These are documented usage-limit exhaustion codes. When Z.ai gives
-            # a reset timestamp, propagate it; otherwise FAIR rechecks after its
-            # conservative exhaustion interval instead of hammering the provider.
-            reset_at = self._reset_at_from_error(data)
-            self._quota = QuotaSnapshot(
-                provider_id=self.provider_id,
-                quota_remaining_estimate=0,
-                reset_at=reset_at,
-            )
-            raise QuotaExceeded("USAGE_LIMIT_EXHAUSTED", reset_at=reset_at)
-        if status == 429 and code == "1305":
-            raise ProviderUnavailable("PROVIDER_TEMPORARILY_OVERLOADED")
-        if status in {402, 429} and code == "1113":
-            # A zero-priced model should not require prepaid balance. Treat this
-            # as loss of confirmed free access and block this provider only.
-            raise BillingViolation("FREE_MODEL_ACCESS_NOT_CONFIRMED")
-        self._error(status, headers)
+        raise AuthenticationFailed("NO_RECURRING_FREE_TIER")
 
 
 class NvidiaNimAdapter(TextAdapter):
@@ -1055,7 +977,6 @@ LIVE_CREDENTIAL_BINDINGS = {
     "google_gemini_api": "GEMINI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "kilo_free": "KILO_API_KEY",
-    "zai_free": "ZAI_API_KEY",
     "nvidia_nim": "NVIDIA_API_KEY",
     "ollama_cloud": "OLLAMA_CLOUD_API_KEY",
 }
@@ -1070,7 +991,6 @@ def register_live(registry, specs, settings, transport=None, *, credentials=None
         "google_gemini_api": GeminiAdapter,
         "mistral": MistralAdapter,
         "kilo_free": KiloFreeAdapter,
-        "zai_free": ZaiFreeAdapter,
         "nvidia_nim": NvidiaNimAdapter,
         "ollama_cloud": OllamaCloudAdapter,
     }
