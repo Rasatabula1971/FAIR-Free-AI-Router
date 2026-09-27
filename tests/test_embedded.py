@@ -9,7 +9,7 @@ from fair.config import RoutingSettings
 from fair.embedded import FAIR, module
 from fair.embedded.module import _CLOUD_PROVIDERS
 from fair.embedded.performance import MemoryPerformanceRegistry
-from fair.embedded.quota import MemoryQuotaGovernor, SharedQuotaLedger
+from fair.embedded.quota import MemoryQuotaGovernor, SharedQuotaLedger, next_window_reset
 from fair.embedded.router import EmbeddedRouter
 from fair.providers.base import (
     AccessDenied,
@@ -1304,6 +1304,16 @@ class TestBuiltinReviewDate:
         )
         assert "google_gemini_api" in fair.skipped
         assert "google_gemini_api" not in fair._registry.adapters
+
+
+class TestKiloReviewedQuota:
+    def test_kilo_free_hourly_limit_is_locally_guarded(self):
+        provider = _CLOUD_PROVIDERS["kilo_free"]
+        assert provider["request_limit"] == 200
+        assert provider["request_limit_window"] == "HOURLY"
+
+    def test_hourly_window_resets_one_hour_later(self):
+        assert next_window_reset("HOURLY", 1000.0) == 4600.0
 
 
 class TestOpenRouterReviewedModels:
