@@ -612,9 +612,38 @@ class FAIR:
             for p in self._registry.providers.values()
         ]
 
+    async def providers_async(self) -> list[dict]:
+        result = []
+        for provider in self._registry.providers.values():
+            result.append(
+                {
+                    "provider_id": provider.provider_id,
+                    "status": await self._router.quota.effective_status_async(provider),
+                    "access_class": provider.access_class,
+                    "models": [model.model_id for model in provider.models],
+                    "quota_pool_id": self._router.quota.pool_id(provider.provider_id),
+                    "quota_remaining": await self._router.quota.remaining_async(provider),
+                }
+            )
+        return result
+
     def quota_usage(self) -> dict:
         """Return secret-free shared quota usage grouped by application."""
         return self._router.quota.usage_report(self._registry.providers.values())
+
+    async def quota_usage_async(self) -> dict:
+        """Nonblocking quota report for the central HTTP service."""
+        return await self._router.quota.usage_report_async(self._registry.providers.values())
+
+    def resume_provider(self, provider_id: str) -> dict:
+        """Clear a provider-local security block after explicit operator review."""
+        if provider_id not in self._registry.providers:
+            raise ValueError("Unknown provider")
+        self._router.quota.unblock_security(provider_id)
+        return {
+            "provider_id": provider_id,
+            "status": self._router.quota.effective_status(self._registry.providers[provider_id]),
+        }
 
     def clear_cache(self, client_id: str = "embedded") -> dict:
         return self._router.cache.clear(client_id)
