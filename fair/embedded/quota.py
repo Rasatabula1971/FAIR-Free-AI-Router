@@ -142,10 +142,15 @@ class SharedQuotaLedger:
             used = max(used, observed_limit - remaining)
             if reset_at is not None and now < reset_at <= now + 86400:
                 current_reset = reset_at
+            # Persist exhaustion only when the ledger knows how it will
+            # recover. A provider can report zero remaining without a reset
+            # timestamp; storing that forever would strand every application
+            # until the SQLite file was manually edited.
+            shared_exhausted = remaining == 0 and current_reset is not None
             database.execute(
                 "UPDATE quota_pool_state SET used = ?, exhausted = ?, reset_at = ? "
                 "WHERE pool_id = ?",
-                (used, int(remaining == 0), current_reset, pool_id),
+                (used, int(shared_exhausted), current_reset, pool_id),
             )
 
     def exhaust(self, pool_id, reset_at, now):
