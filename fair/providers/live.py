@@ -635,10 +635,7 @@ class GeminiAdapter(TextAdapter):
         if not isinstance(details, list):
             return None
         for detail in details:
-            if (
-                isinstance(detail, dict)
-                and str(detail.get("@type", "")).endswith("RetryInfo")
-            ):
+            if isinstance(detail, dict) and str(detail.get("@type", "")).endswith("RetryInfo"):
                 delay = duration(detail.get("retryDelay"))
                 if delay is not None:
                     return delay
@@ -651,9 +648,8 @@ class GeminiAdapter(TextAdapter):
         if not isinstance(details, list):
             return ids
         for detail in details:
-            if (
-                not isinstance(detail, dict)
-                or not str(detail.get("@type", "")).endswith("QuotaFailure")
+            if not isinstance(detail, dict) or not str(detail.get("@type", "")).endswith(
+                "QuotaFailure"
             ):
                 continue
             violations = detail.get("violations")
@@ -672,9 +668,8 @@ class GeminiAdapter(TextAdapter):
 
         code = error.get("code")
         quota_ids = self._quota_ids(error)
-        daily = (
-            code == "quota_exceeded"
-            or any("perday" in quota_id.casefold() for quota_id in quota_ids)
+        daily = code == "quota_exceeded" or any(
+            "perday" in quota_id.casefold() for quota_id in quota_ids
         )
         if daily:
             reset_at = self._daily_reset_at()
