@@ -828,6 +828,46 @@ class TestPrivacyRouting:
 # ── Provider admission failures are per-provider ─────────────────────────
 
 
+class TestBuiltinReviewDate:
+    """The review date is an attestation, so it has to stay internally consistent."""
+
+    def test_the_qualification_reference_cites_the_review_date(self):
+        """These were separate literals once, so a bump left them disagreeing."""
+        fair = FAIR(gemini_api_key="k", confirmed_free_providers={"google_gemini_api"})
+        qualification = fair._registry.providers["google_gemini_api"].qualification
+        stamp = qualification.reviewed_at.date().isoformat()
+        for reference in (
+            qualification.reviewer_reference,
+            qualification.billing_reference,
+            qualification.terms_reference,
+            qualification.privacy_reference,
+            qualification.limits_reference,
+        ):
+            assert reference.startswith(f"builtin-provider-review-{stamp}:")
+
+    def test_the_review_date_is_not_in_the_future(self):
+        """A post-dated review fails qualification outright: it buys nothing."""
+        assert module._BUILTIN_PROVIDER_REVIEWED_AT <= datetime.now(UTC)
+
+    def test_the_review_date_is_current_enough_to_qualify(self):
+        """If this fails the built-in providers are unusable until it is re-verified."""
+        fair = FAIR(gemini_api_key="k", confirmed_free_providers={"google_gemini_api"})
+        assert "google_gemini_api" in fair._registry.adapters, fair.skipped
+
+    def test_a_future_dated_review_is_refused_rather_than_trusted(self, monkeypatch):
+        monkeypatch.setattr(
+            module, "_BUILTIN_PROVIDER_REVIEWED_AT", datetime.now(UTC) + timedelta(days=5)
+        )
+        fair = FAIR(
+            gemini_api_key="k",
+            confirmed_free_providers={"google_gemini_api"},
+            ollama_url="http://127.0.0.1:11434",
+            ollama_models=["llama3"],
+        )
+        assert "google_gemini_api" in fair.skipped
+        assert "google_gemini_api" not in fair._registry.adapters
+
+
 class TestExpiredProviderReview:
     """A stale built-in review must cost one provider, not the whole router."""
 
