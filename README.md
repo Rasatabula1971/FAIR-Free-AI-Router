@@ -1,16 +1,26 @@
 # FAIR — Free AI Router
 
-Embeddable Python module for quality-verified AI inference through free providers.
+Quality-verified AI inference through free providers, available as an embeddable Python
+module or an optional authenticated local HTTP service.
 Every answer is judged before it's accepted — arithmetic checks, code validation,
 JSON schema matching, citation verification, and cross-checking between independent models.
 
 ## Install
 
+Embedded-only:
+
 ```bash
 pip install -e .
 ```
 
-Requires Python 3.12+. Dependencies: `pydantic`, `httpx`, `jsonschema`, `PyYAML`.
+Central HTTP service:
+
+```bash
+pip install -e ".[service]"
+```
+
+Requires Python 3.12+. The service extra adds FastAPI and Uvicorn; embedded FAIR remains
+available without them.
 
 ## Windows test console
 
@@ -182,6 +192,80 @@ Official quota references used for this design:
 - Gemini rate limits: <https://ai.google.dev/gemini-api/docs/rate-limits>
 - Groq rate limits: <https://console.groq.com/docs/rate-limits>
 
+## Central FAIR service
+
+The service is additive: existing Python applications can keep using `from fair import FAIR`
+while applications are migrated one at a time to HTTP.
+
+The service defaults to `127.0.0.1:8000`, requires a separate FAIR client bearer key for
+every application, and keeps provider API keys inside the FAIR process. Client identity
+cannot be supplied in request JSON; it is derived from the bearer key and becomes the
+request `client_id`, including shared quota attribution.
+
+Example `.env` configuration:
+
+```text
+OPENROUTER_API_KEY=...
+GROQ_API_KEY=...
+
+FAIR_APPLICATION_ID=fair-service
+FAIR_SHARED_QUOTA_PATH=C:\FAIR Shared State\quota.sqlite3
+FAIR_SERVICE_CLIENTS={"corp":"replace-with-random-key","youtube-production":"replace-with-another-random-key"}
+FAIR_CONFIRMED_FREE_PROVIDERS=groq
+```
+
+Generate a client key with Python:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+On Windows, start the service with:
+
+```powershell
+.\START_FAIR_SERVICE.bat
+```
+
+or, after installing the service extra:
+
+```powershell
+fair-service
+```
+
+### Service endpoints
+
+- `GET /health` — local health only; no credential required
+- `GET /v1/models` — exposes the virtual OpenAI-style model `fair-router`
+- `POST /v1/chat/completions` — non-streaming OpenAI-style compatibility endpoint
+- `POST /v1/fair/solve` — native FAIR contract with validation, privacy and cross-check options
+- `GET /v1/fair/providers` — provider status without secrets
+- `GET /v1/fair/quota` — shared quota usage and per-application attribution
+
+Example native request:
+
+```powershell
+$headers = @{ Authorization = "Bearer YOUR_CORP_FAIR_CLIENT_KEY" }
+$body = @{
+    task = "What is 15*23?"
+    validation = @{
+        kind = "arithmetic"
+        expression = "15*23"
+    }
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/v1/fair/solve" -Headers $headers -ContentType "application/json" -Body $body
+```
+
+The OpenAI-compatible endpoint does **not** weaken FAIR's acceptance rule. Free-form model
+text that FAIR cannot verify returns HTTP 422 rather than being passed through as if it were
+trusted. Structured `response_format` requests can use FAIR's JSON Schema validation.
+Streaming is intentionally not supported in this first service version.
+
+One service process uses one centralized provider credential set. Application isolation is
+handled by FAIR client keys, so provider credentials no longer need to be copied into every
+application. Keep the service at one worker for now: quota is cross-process safe through
+SQLite, but performance history, cache and circuit-breaker state are intentionally centralized
+in the single service process rather than distributed across multiple Uvicorn workers.
 ## Validation contracts
 
 FAIR verifies AI responses before accepting them:
@@ -408,6 +492,8 @@ All validation logic remains pure functions. FAIR needs no server or database fo
 
 ```text
 FAIR(api_keys)                     admission gate -> fair.providers() / fair.skipped
+ ├─ embedded Python callers
+ ├─ optional authenticated HTTP service
  └─ EmbeddedRouter
      └─ solve(request)
          1. profile_task          required capabilities, task class, context, threshold
