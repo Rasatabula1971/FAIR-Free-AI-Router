@@ -410,7 +410,7 @@ class FAIR:
                     "pass confirmed_free_providers with this provider_id"
                 )
                 continue
-            extra = {}
+            extra: dict[str, object] = {}
             if provider_id == "cloudflare_workers_ai":
                 if not cloudflare_account_id:
                     self.skipped[provider_id] = "CLOUDFLARE_ACCOUNT_ID missing"
