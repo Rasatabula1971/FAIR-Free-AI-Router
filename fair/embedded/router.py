@@ -149,9 +149,8 @@ class EmbeddedRouter:
             disposition, error_type = "INFRA_FAILURE", "MODEL_UNAVAILABLE"
             error_detail = _failure_detail(error)
         except AccessDenied as error:
-            # 403 can be request-specific. Cool down the provider but do not
-            # permanently block the key or penalize its shared reliability.
-            self.quota.throttle(spec.provider_id)
+            # 403 can be request/model-specific. Do not let one application's
+            # denied request throttle this provider for every other client.
             disposition, error_type = "CAPABILITY_MISMATCH", "ACCESS_DENIED"
             error_detail = _failure_detail(error)
         except AuthenticationFailed as error:
