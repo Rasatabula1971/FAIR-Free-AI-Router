@@ -65,7 +65,7 @@ print(result.output)  # "345"
 | Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
 | Mistral | `MISTRAL_API_KEY` | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Free recurring (10k neurons/day, metered) | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
-| OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, no data collection) | `nemotron-3-ultra-550b-a55b`, `nex-n2.5-mini`, `north-mini-code` |
+| OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, 50 requests/day on a free account) | `nemotron-3-ultra-550b-a55b`, `nex-n2.5-mini`, `north-mini-code` |
 | Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
 | Z.ai | `ZAI_API_KEY` | Free dynamic (flash models) | `glm-4.5-flash`, `glm-4.7-flash` |
 | Ollama (local) | `OLLAMA_HOST` or `OLLAMA_URL` | Free local | auto-discovered from the daemon |
@@ -123,6 +123,64 @@ current Free plan is a starter usage-credit pool and cloud models have published
 prices, so it does not satisfy FAIR's recurring-zero-cost requirement. NVIDIA's hosted NIM
 preview API is also excluded because its hosted access is credit-based for new accounts.
 Local Ollama remains fully supported.
+
+## Shared quota across applications
+
+Separate API keys are useful for isolation, but they do **not** necessarily create
+separate free allowances. Gemini limits are project-scoped, Groq has organization-level
+ceilings, and OpenRouter's free plan is account-scoped. FAIR can therefore share one
+request ledger across independent applications while still keeping authentication,
+security blocks, throttles and circuit-breaker state local to each application/key.
+
+Point every FAIR-powered application at the same SQLite file and give each application
+a stable name:
+
+```python
+shared_quota = r"C:\FAIR Shared State\quota.sqlite3"
+
+corp = FAIR(
+    application_id="corp",
+    shared_quota_path=shared_quota,
+    openrouter_api_key="...",
+)
+
+video = FAIR(
+    application_id="youtube-production",
+    shared_quota_path=shared_quota,
+    openrouter_api_key="...",
+)
+```
+
+With the default mapping, both instances above use the same `openrouter_free` quota
+pool even if their API keys are different. If two applications genuinely use different
+provider accounts/projects, assign different pool IDs:
+
+```python
+fair = FAIR(
+    application_id="corp",
+    shared_quota_path=shared_quota,
+    quota_pool_ids={
+        "openrouter_free": "openrouter-account-a",
+        "groq": "groq-organization-a",
+    },
+)
+```
+
+Inspect the current ledger without exposing credentials:
+
+```python
+print(fair.quota_usage())
+```
+
+The report includes each pool's request count, remaining configured allowance, reset
+timestamp, and usage grouped by `application_id`. OpenRouter Free is conservatively
+configured at 50 requests/day, matching its current Free plan. The ledger is optional:
+without `shared_quota_path`, FAIR retains its original in-process quota behavior.
+
+Official quota references used for this design:
+- OpenRouter pricing: <https://openrouter.ai/pricing/>
+- Gemini rate limits: <https://ai.google.dev/gemini-api/docs/rate-limits>
+- Groq rate limits: <https://console.groq.com/docs/rate-limits>
 
 ## Validation contracts
 
@@ -285,6 +343,11 @@ FAIR(
     cache_enabled=True,           # in-memory LRU cache for deterministic tasks
     cross_check_required=False,   # require independent verification
     source_reviews="reviews.yaml", # operator-reviewed evidence snapshots (path or list)
+    application_id="corp",        # stable app identity for shared quota attribution
+    shared_quota_path=r"C:\FAIR Shared State\quota.sqlite3", # optional shared SQLite ledger
+    quota_pool_ids={              # optional account/project identity overrides
+        "openrouter_free": "openrouter-main",
+    },
     on_event=callback,            # optional (event_type, payload) callback
 )
 ```
@@ -341,7 +404,7 @@ run around every call, and both fail closed:
 - **Quality** decides an answer is verified (`fair/quality/engine.py`). A contract runs
   against the response; both the score and the verification state must pass.
 
-All validation logic is pure functions — no database, no server, no YAML config.
+All validation logic remains pure functions. FAIR needs no server or database for routing, but an optional SQLite quota ledger can coordinate account-level free limits across multiple application processes.
 
 ```text
 FAIR(api_keys)                     admission gate -> fair.providers() / fair.skipped
@@ -356,7 +419,8 @@ FAIR(api_keys)                     admission gate -> fair.providers() / fair.ski
                                   claims, source policy, optional independent cross-check
          6. accept or retry       two budgets: answered vs unanswered (see above)
 
-     MemoryQuotaGovernor   circuit breaker CLOSED -> OPEN -> HALF_OPEN, daily quota windows
+     MemoryQuotaGovernor   local key health + circuit breaker; optional shared request ledger
+     SharedQuotaLedger     SQLite atomic quota pools + per-application attribution
      MemoryPerformance     per (provider, model, task class) quality/reliability + drift
 ```
 
