@@ -816,6 +816,32 @@ class TestFAIRModule:
             )
 
     @pytest.mark.asyncio
+    async def test_application_id_is_default_quota_attribution(self, tmp_path):
+        fair = FAIR(
+            providers=[(_spec(request_limit=2), MockAdapter("a", text="345"))],
+            application_id="corp",
+            shared_quota_path=str(tmp_path / "quota.sqlite3"),
+        )
+        await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
+        pool = fair.quota_usage()["pools"][0]
+        assert pool["applications"] == {"corp": 1}
+
+    @pytest.mark.asyncio
+    async def test_explicit_client_id_overrides_quota_attribution(self, tmp_path):
+        fair = FAIR(
+            providers=[(_spec(request_limit=2), MockAdapter("a", text="345"))],
+            application_id="fair-service",
+            shared_quota_path=str(tmp_path / "quota.sqlite3"),
+        )
+        await fair.solve(
+            "15*23",
+            validation={"kind": "arithmetic", "expression": "15*23"},
+            client_id="youtube-production",
+        )
+        pool = fair.quota_usage()["pools"][0]
+        assert pool["applications"] == {"youtube-production": 1}
+
+    @pytest.mark.asyncio
     async def test_solve_with_mock(self):
         spec = _spec()
         adapter = MockAdapter("a", text="345")
