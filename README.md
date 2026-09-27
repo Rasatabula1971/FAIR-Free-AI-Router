@@ -65,14 +65,43 @@ print(result.output)  # "345"
 | Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
 | Mistral | `MISTRAL_API_KEY` | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Free recurring (10k neurons/day, metered) | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
-| OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, no data collection) | `gemma-4-26b`, `ling-3.0-flash-sante`, `north-mini-code`, `dots-3-note` |
+| OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, no data collection) | `gemma-4-26b`, `ling-3.0-flash-sante`†, `north-mini-code`† |
 | Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
 | Z.ai | `ZAI_API_KEY` | Free dynamic (flash models) | `glm-4.5-flash`, `glm-4.7-flash` |
 | Ollama (local) | `OLLAMA_HOST` or `OLLAMA_URL` | Free local | auto-discovered from the daemon |
 
+† These two models do not accept `response_format`, so they are not advertised as
+`structured_output` capable and are never selected for a task that needs a JSON schema.
+Capabilities are declared per model, not per provider.
+
 Pass API keys directly to the constructor, set env vars, or point at a dotenv file with
 `FAIR(env_file=".env")` (the process environment wins over the file). At least one provider
 is required.
+
+### How many providers actually come up
+
+A key alone does not register a provider. Supplying keys for all seven and nothing else
+gives you **two usable providers**, not seven:
+
+```python
+fair = FAIR(**all_seven_keys)          # no confirmed_free_providers
+len(fair.providers())                  # 2  -> openrouter_free, kilo_free
+len(fair.skipped)                      # 5  -> each with the reason
+
+fair = FAIR(**all_seven_keys, confirmed_free_providers={
+    "google_gemini_api", "groq", "mistral", "zai_free", "cloudflare_workers_ai",
+})
+len(fair.providers())                  # 7, nothing skipped
+```
+
+Only OpenRouter Free and Kilo Free are auto-confirmed, because their adapters prove zero
+cost on every request. The other five are recurring free-plan accounts whose API key could
+belong to a billable account, so FAIR will not use them until you assert otherwise.
+Local Ollama registers only when a daemon is reachable or `ollama_models` is passed.
+
+`fair.providers()` lists what registered; `fair.skipped` maps every configured-but-unused
+provider to why. Read both before concluding a provider is broken — a provider whose key
+is absent is skipped silently and appears in neither.
 
 FAIR does not treat possession of an API key as proof that a recurring provider account is
 still on a free tier. For providers such as Gemini, Groq, Mistral, Z.ai, and Cloudflare
@@ -81,8 +110,10 @@ Workers AI, explicitly attest the account is currently free-only with
 configuration cannot auto-bill or otherwise incur paid API usage; do not set it merely
 because the provider offers a free tier. OpenRouter Free and Kilo Free are auto-confirmed
 because their adapters enforce zero-priced `:free` models and reject non-zero observed cost at
-runtime. Built-in cloud-provider reviews are date-pinned and expire after 30 days;
-restarting FAIR does not renew them. An expired review fails closed until the provider
+runtime. Built-in cloud-provider reviews are date-pinned: the evidence expires 29 days
+after its review date, and qualification separately refuses any review older than 30 days.
+Restarting FAIR does not renew them, and post-dating the review date does not extend them
+— a review dated in the future fails qualification outright. An expired review fails closed until the provider
 definition is deliberately re-verified and updated. Providers whose key is present but
 cannot be safely registered are listed in `fair.skipped` with the reason.
 
@@ -194,6 +225,38 @@ result = await fair.solve(
 - **`ESCALATION_REQUIRED`** — no model produced a verified answer
 - **`FAILED`** — infrastructure failure (validator error, all providers down)
 
+An answer is accepted only when it is both scored at or above the level's threshold **and**
+carries a verification state from a deterministic contract. A high score alone is never
+enough: an unverified answer escalates.
+
+A `BillingViolation` is the one outcome that does not come back as a status. It stops the
+router (`fair.stopped = True`), blocks the provider, and raises out of `solve()`, so a
+caller that must survive it has to catch it:
+
+```python
+from fair.providers.base import BillingViolation
+
+try:
+    result = await fair.solve("...")
+except BillingViolation:
+    # A provider reported a non-zero or unreadable cost. Dispatch has stopped.
+    ...
+```
+
+## How many models get tried
+
+Two independent budgets bound a single `solve()`, and the distinction matters:
+
+- **`max_attempts`** (default 3) counts *answered* attempts — ones the quality gate
+  actually judged, whether it accepted or rejected them.
+- **`max_unanswered_attempts`** (default 6) separately bounds models that never answered:
+  down, throttled, timed out, quota-exhausted.
+
+A provider that timed out said nothing about the task, so it does not consume the answer
+budget. Counting them together meant a few outages ended the search while healthy models
+sat untried, reported as though every model had been asked. Every (provider, model) pair is
+tried at most once per solve either way.
+
 ## Constructor options
 
 ```python
@@ -267,17 +330,38 @@ Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `
 
 ## Architecture
 
-All quality validation logic runs as pure functions — no database, no server, no YAML config.
+FAIR is a router with a verifier on its accept path. Nothing is returned because a model
+produced it — it is returned because a deterministic check passed. Two independent gates
+run around every call, and both fail closed:
+
+- **Admission** decides a provider is free (`fair/governor/policy.py`, `qualification.py`).
+  Zero cost, no paid subscription, no credit purchase, no auto-billing, and a per-model
+  qualification with a review date inside its window. Re-checked at registration, at
+  selection, and again on a cache hit.
+- **Quality** decides an answer is verified (`fair/quality/engine.py`). A contract runs
+  against the response; both the score and the verification state must pass.
+
+All validation logic is pure functions — no database, no server, no YAML config.
 
 ```text
-FAIR(api_keys)
+FAIR(api_keys)                     admission gate -> fair.providers() / fair.skipped
  └─ EmbeddedRouter
-     ├─ MemorySelector      (weighted scoring: quality × 0.65 + quota × 0.20 + reliability × 0.15)
-     ├─ MemoryQuotaGovernor  (circuit breaker: CLOSED → OPEN → HALF_OPEN)
-     ├─ MemoryPerformance    (quality/reliability tracking from observed attempts)
-     ├─ MemoryCache          (LRU with TTL for arithmetic/reference tasks)
-     └─ Quality Engine       (arithmetic, code validator, JSON, consensus, grounding)
+     └─ solve(request)
+         1. profile_task          required capabilities, task class, context, threshold
+         2. MemoryCache.get       arithmetic/reference only; re-validates before returning
+         3. MemorySelector        admission + quota + privacy_class + capabilities + window,
+                                  then quality x 0.65 + quota x 0.20 + reliability x 0.15
+         4. adapter.complete      via CredentialedAdapter (credential-reflection guard)
+         5. Quality Engine        arithmetic, bounded code interpreter, JSON, grounding,
+                                  claims, source policy, optional independent cross-check
+         6. accept or retry       two budgets: answered vs unanswered (see above)
+
+     MemoryQuotaGovernor   circuit breaker CLOSED -> OPEN -> HALF_OPEN, daily quota windows
+     MemoryPerformance     per (provider, model, task class) quality/reliability + drift
 ```
+
+A cache hit is not trusted on its own: `MemoryCache.get` re-runs the validator against the
+stored text and re-checks provider admission, and drops the entry if either now fails.
 
 ## Development
 
