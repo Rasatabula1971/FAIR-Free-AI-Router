@@ -12,7 +12,6 @@ from fair.providers.base import (
     AccessDenied,
     AuthenticationFailed,
     BillingViolation,
-    ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
 )
