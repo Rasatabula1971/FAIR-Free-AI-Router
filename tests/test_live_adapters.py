@@ -603,6 +603,71 @@ class TestZai:
         assert [r.method for r in seen] == ["POST"]
         assert json.loads(seen[0].content)["thinking"] == {"type": "disabled"}
 
+    async def test_true_rate_limit_uses_retry_after(self):
+        transport, _ = _transport(
+            {
+                ("POST", "/chat/completions"): (
+                    429,
+                    {"error": {"code": 1302, "message": "rate limit reached"}},
+                    {"retry-after": "17"},
+                ),
+            }
+        )
+        adapter = ZaiFreeAdapter(
+            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(RateLimited) as error:
+            await adapter.complete(_request(self.MODEL))
+        assert error.value.retry_after == 17
+
+    async def test_provider_overload_is_not_misclassified_as_quota(self):
+        transport, _ = _transport(
+            {
+                ("POST", "/chat/completions"): (
+                    429,
+                    {"error": {"code": "1305", "message": "temporarily overloaded"}},
+                ),
+            }
+        )
+        adapter = ZaiFreeAdapter(
+            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(ProviderUnavailable, match="PROVIDER_TEMPORARILY_OVERLOADED"):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_insufficient_balance_on_free_model_fails_closed(self):
+        transport, _ = _transport(
+            {
+                ("POST", "/chat/completions"): (
+                    429,
+                    {"error": {"code": 1113, "message": "insufficient balance"}},
+                ),
+            }
+        )
+        adapter = ZaiFreeAdapter(
+            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(BillingViolation, match="FREE_MODEL_ACCESS_NOT_CONFIRMED"):
+            await adapter.complete(_request(self.MODEL))
+
+    def test_paid_flash_model_is_refused(self):
+        with pytest.raises(AuthenticationFailed):
+            ZaiFreeAdapter(
+                _spec("zai_free", "FREE_DYNAMIC", "glm-5.3-flash"),
+                _settings(),
+                credential=SecretStr("k"),
+                transport=httpx.MockTransport(lambda r: httpx.Response(500)),
+            )
+
     def test_non_flash_model_is_refused(self):
         with pytest.raises(AuthenticationFailed):
             ZaiFreeAdapter(
