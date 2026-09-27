@@ -627,6 +627,59 @@ class TestZai:
             await adapter.complete(_request(self.MODEL))
         assert error.value.retry_after == 17
 
+    async def test_usage_limit_uses_explicit_reset_timestamp(self):
+        now = datetime(2026, 9, 27, tzinfo=UTC).timestamp()
+        reset_at = datetime(2026, 9, 28, 3, tzinfo=UTC).timestamp()
+        transport, _ = _transport(
+            {
+                ("POST", "/chat/completions"): (
+                    429,
+                    {
+                        "error": {
+                            "code": 1308,
+                            "message": "usage limit reached",
+                            "next_flush_time": "2026-09-28T03:00:00Z",
+                        }
+                    },
+                ),
+            }
+        )
+        adapter = ZaiFreeAdapter(
+            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+            clock=lambda: now,
+        )
+        with pytest.raises(QuotaExceeded, match="USAGE_LIMIT_EXHAUSTED") as error:
+            await adapter.complete(_request(self.MODEL))
+        assert error.value.reset_at == reset_at
+        quota = await adapter.quota()
+        assert quota.quota_remaining_estimate == 0
+        assert quota.reset_at == reset_at
+
+    async def test_weekly_or_monthly_limit_without_reset_still_exhausts(self):
+        transport, _ = _transport(
+            {
+                ("POST", "/chat/completions"): (
+                    429,
+                    {"error": {"code": "1310", "message": "weekly/monthly limit exhausted"}},
+                ),
+            }
+        )
+        adapter = ZaiFreeAdapter(
+            _spec("zai_free", "FREE_DYNAMIC", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(QuotaExceeded, match="USAGE_LIMIT_EXHAUSTED") as error:
+            await adapter.complete(_request(self.MODEL))
+        assert error.value.reset_at is None
+        quota = await adapter.quota()
+        assert quota.quota_remaining_estimate == 0
+        assert quota.reset_at is None
+
     async def test_provider_overload_is_not_misclassified_as_quota(self):
         transport, _ = _transport(
             {
