@@ -34,7 +34,9 @@ def compare(request, first, second, both_validated):
                 == canonical(comparable_claims(second.text)),
                 "EXACT_VALUE",
             )
-        if kind in {"reference_json", "grounded_json"}:
+        if kind in {"reference_json", "grounded_json"} or (
+            kind is None and request.expected_schema is not None and both_validated
+        ):
             return (
                 json.dumps(json_document(first.text), sort_keys=True)
                 == json.dumps(json_document(second.text), sort_keys=True),
