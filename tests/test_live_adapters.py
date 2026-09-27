@@ -459,7 +459,9 @@ class TestMistral:
         assert reset.day == 1
         assert reset.hour == 0 and reset.minute == 0 and reset.second == 0
         assert reset.timestamp() > now
-        admin_request = next(request for request in seen if "/admin/spend-limit" in str(request.url))
+        admin_request = next(
+            request for request in seen if "/admin/spend-limit" in str(request.url)
+        )
         assert admin_request.headers["x-api-key"] == "admin-k"
         quota = await adapter.quota()
         assert quota.quota_remaining_estimate == 0
