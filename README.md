@@ -46,9 +46,10 @@ tests similarly use only the two providers selected for that test.
 OpenRouter Free and Kilo Free retain FAIR's runtime zero-cost checks. Providers whose
 API keys may belong to paid/billable accounts still require an explicit free-only
 account confirmation for the current console session. Kilo tests also expose a
-secret-safe billing diagnostic state such as `ZERO`, `COST_FIELD_MISSING`,
-`USAGE_MISSING`, or `NONZERO_OR_INVALID`; FAIR still fails closed unless a zero
-cost is actually observed.
+secret-safe billing diagnostic state such as `ZERO`, `CATALOG_ZERO_PRICE_FALLBACK`,
+`COST_FIELD_MISSING`, `USAGE_MISSING`, or `NONZERO_OR_INVALID`. Kilo accepts the
+fallback only when the exact response model is still a `:free` model in FAIR's fresh
+live zero-priced catalog; any other missing/unknown cost state fails closed.
 
 ## Quick start
 
@@ -211,6 +212,7 @@ GROQ_API_KEY=...
 FAIR_APPLICATION_ID=fair-service
 FAIR_SHARED_QUOTA_PATH=C:\FAIR Shared State\quota.sqlite3
 FAIR_SERVICE_CLIENTS={"corp":"replace-with-random-key","youtube-production":"replace-with-another-random-key"}
+FAIR_SERVICE_ADMIN_KEY=replace-with-separate-admin-key
 FAIR_CONFIRMED_FREE_PROVIDERS=groq
 ```
 
@@ -240,6 +242,7 @@ fair-service
 - `POST /v1/fair/solve` — native FAIR contract with validation, privacy and cross-check options
 - `GET /v1/fair/providers` — provider status without secrets
 - `GET /v1/fair/quota` — shared quota usage and per-application attribution
+- `POST /v1/fair/admin/providers/{provider_id}/resume` — optional admin-key-only provider recovery
 
 Example native request:
 
