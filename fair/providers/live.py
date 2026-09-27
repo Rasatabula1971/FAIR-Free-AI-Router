@@ -685,8 +685,12 @@ class GeminiAdapter(TextAdapter):
             )
             raise QuotaExceeded("DAILY_QUOTA_EXHAUSTED", reset_at=reset_at)
 
-        if code in {"rate_limit_exceeded", "too_many_requests"} or quota_ids:
-            retry_after = self._retry_delay_from_details(error)
+        retry_after = self._retry_delay_from_details(error)
+        if (
+            code in {"rate_limit_exceeded", "too_many_requests"}
+            or quota_ids
+            or retry_after is not None
+        ):
             if retry_after is None:
                 retry_after = retry_seconds(headers.get("retry-after"), self.clock())
             raise RateLimited("RATE_LIMITED", retry_after=retry_after)
