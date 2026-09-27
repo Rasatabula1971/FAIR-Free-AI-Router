@@ -694,12 +694,12 @@ class TestEmbeddedRouter:
         original_reserve = router.quota.reserve
         lost_once = False
 
-        def reserve(spec):
+        def reserve(spec, application_id=None):
             nonlocal lost_once
             if spec.provider_id == "b" and not lost_once:
                 lost_once = True
                 return False
-            return original_reserve(spec)
+            return original_reserve(spec, application_id)
 
         router.quota.reserve = reserve
         result = await router.solve(
