@@ -92,6 +92,8 @@ def parse_client_keys(raw: str | None) -> dict[str, str]:
             raise ValueError("FAIR_SERVICE_CLIENTS contains an invalid client id")
         if not isinstance(secret, str) or len(secret) < 16:
             raise ValueError("Every FAIR service client key must be at least 16 characters")
+        if secret.startswith("replace-with"):
+            raise ValueError("FAIR_SERVICE_CLIENTS still contains a placeholder client key")
         if secret in seen_secrets:
             raise ValueError("FAIR service client keys must be unique")
         seen_secrets.add(secret)
@@ -123,16 +125,30 @@ def _client_resolver(client_keys: dict[str, str]):
     async def resolve_client(authorization: str | None = Header(default=None)) -> str:
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Bearer client key required")
-        token = authorization[7:]
+        token = authorization[7:].encode("utf-8", "surrogateescape")
         matched = None
         for client_id, secret in client_keys.items():
-            if hmac.compare_digest(token, secret):
+            if hmac.compare_digest(token, secret.encode("utf-8")):
                 matched = client_id
         if matched is None:
             raise HTTPException(status_code=401, detail="Invalid FAIR client key")
         return matched
 
     return resolve_client
+
+
+def _admin_resolver(admin_key: str | None):
+    async def resolve_admin(authorization: str | None = Header(default=None)) -> bool:
+        if not admin_key:
+            raise HTTPException(status_code=404, detail="Admin API disabled")
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Bearer admin key required")
+        token = authorization[7:].encode("utf-8", "surrogateescape")
+        if not hmac.compare_digest(token, admin_key.encode("utf-8")):
+            raise HTTPException(status_code=401, detail="Invalid FAIR admin key")
+        return True
+
+    return resolve_admin
 
 
 def _chat_task(messages: list[ChatMessage]) -> str:
@@ -167,9 +183,16 @@ def _service_error(status_code: int, error_type: str, result) -> JSONResponse:
     )
 
 
-def create_app(fair: FAIR, client_keys: dict[str, str]) -> FastAPI:
+def create_app(
+    fair: FAIR, client_keys: dict[str, str], *, admin_key: str | None = None
+) -> FastAPI:
     client_keys = parse_client_keys(json.dumps(client_keys))
+    if admin_key is not None and (
+        len(admin_key) < 24 or admin_key.startswith("replace-with")
+    ):
+        raise ValueError("FAIR_SERVICE_ADMIN_KEY must be a non-placeholder key of 24+ characters")
     resolve_client = _client_resolver(client_keys)
+    resolve_admin = _admin_resolver(admin_key)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -186,17 +209,26 @@ def create_app(fair: FAIR, client_keys: dict[str, str]) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        listed = await fair.providers_async()
+        admissible = sum(provider["status"] != "REVIEW_EXPIRED" for provider in listed)
         payload = {
-            "status": "stopped" if fair.stopped else "ok",
-            "providers": len(fair.providers()),
+            "status": (
+                "stopped"
+                if fair.stopped
+                else "no_admissible_providers"
+                if not admissible
+                else "ok"
+            ),
+            "providers": len(listed),
+            "admissible_providers": admissible,
         }
-        if fair.stopped:
+        if fair.stopped or not admissible:
             return JSONResponse(status_code=503, content=payload)
         return payload
 
     @app.get("/v1/models")
     async def models(_client_id: str = Depends(resolve_client)):
-        providers = fair.providers()
+        providers = await fair.providers_async()
         return {
             "object": "list",
             "data": [
@@ -212,11 +244,18 @@ def create_app(fair: FAIR, client_keys: dict[str, str]) -> FastAPI:
 
     @app.get("/v1/fair/providers")
     async def providers(_client_id: str = Depends(resolve_client)):
-        return {"providers": fair.providers(), "skipped": fair.skipped}
+        return {"providers": await fair.providers_async(), "skipped": fair.skipped}
 
     @app.get("/v1/fair/quota")
     async def quota(_client_id: str = Depends(resolve_client)):
-        return fair.quota_usage()
+        return await fair.quota_usage_async()
+
+    @app.post("/v1/fair/admin/providers/{provider_id}/resume")
+    async def resume_provider(provider_id: str, _admin: bool = Depends(resolve_admin)):
+        try:
+            return fair.resume_provider(provider_id)
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail="Unknown provider") from error
 
     @app.post("/v1/fair/solve")
     async def solve(payload: FairSolvePayload, client_id: str = Depends(resolve_client)):
@@ -332,6 +371,7 @@ def create_app_from_env() -> FastAPI:
         env_file = ".env"
     env = _combined_env(env_file)
     clients = parse_client_keys(env.get("FAIR_SERVICE_CLIENTS"))
+    admin_key = env.get("FAIR_SERVICE_ADMIN_KEY") or None
     confirmed = {
         item.strip()
         for item in env.get("FAIR_CONFIRMED_FREE_PROVIDERS", "").split(",")
@@ -345,4 +385,4 @@ def create_app_from_env() -> FastAPI:
         shared_quota_path=env.get("FAIR_SHARED_QUOTA_PATH"),
         quota_pool_ids=quota_pool_ids,
     )
-    return create_app(fair, clients)
+    return create_app(fair, clients, admin_key=admin_key)
