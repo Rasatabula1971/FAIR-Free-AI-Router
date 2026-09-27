@@ -103,7 +103,7 @@ class ProviderSpec(DTO):
     # When FAIR counts requests locally it must also know when that count
     # clears, or the ceiling becomes permanent for the life of the process.
     # A provider that reports its own reset window does not need this.
-    request_limit_window: Literal["DAILY_UTC", "DAILY_PACIFIC"] | None = None
+    request_limit_window: Literal["HOURLY", "DAILY_UTC", "DAILY_PACIFIC"] | None = None
     qualification: ProviderQualification | None = None
 
     @model_validator(mode="after")
