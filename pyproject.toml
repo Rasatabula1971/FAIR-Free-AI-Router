@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fair-free-ai-router"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embeddable, free-only AI routing with quality validation"
 requires-python = ">=3.12"
 dependencies = [
