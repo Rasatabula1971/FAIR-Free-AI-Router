@@ -86,8 +86,7 @@ class TestConfigurationHardening:
     def test_dotenv_supports_export_and_inline_comments(self, tmp_path):
         path = tmp_path / ".env"
         path.write_text(
-            "export GROQ_API_KEY=abc123 # local note\n"
-            "OPENROUTER_API_KEY='quoted # value'\n",
+            "export GROQ_API_KEY=abc123 # local note\nOPENROUTER_API_KEY='quoted # value'\n",
             encoding="utf-8",
         )
         values = module._read_env_file(path)
@@ -707,7 +706,9 @@ class TestEmbeddedRouter:
     @pytest.mark.asyncio
     async def test_request_not_supported_does_not_damage_provider_performance(self):
         router = _router(
-            entries=[(_spec(), MockAdapter("a", error=RequestNotSupported("OUTPUT_BUDGET_INVALID")))]
+            entries=[
+                (_spec(), MockAdapter("a", error=RequestNotSupported("OUTPUT_BUDGET_INVALID")))
+            ]
         )
         result = await router.solve(_request(task="anything"))
         assert result.attempts[0].disposition == "CAPABILITY_MISMATCH"
@@ -829,7 +830,7 @@ class TestEmbeddedRouter:
         spec_b = _spec("b", models=[{"model_id": "m2", "context_window": 32768}])
         router = _router(
             entries=[
-                (spec_a, MockAdapter("a", text='```json\n{\"answer\": 345}\n```')),
+                (spec_a, MockAdapter("a", text='```json\n{"answer": 345}\n```')),
                 (spec_b, MockAdapter("b", text='{"answer":345}')),
             ]
         )
