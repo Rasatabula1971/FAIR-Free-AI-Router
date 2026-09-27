@@ -118,13 +118,18 @@ def _skip_reason(error):
 # differ from the full text set.
 _NO_STRUCTURED_OUTPUT = frozenset(TEXT_CAPABILITIES) - {"structured_output"}
 
+# TextAdapter and OllamaLocalAdapter refuse max_output_tokens above this
+# before dispatch. Declaring the cap lets the selector skip those routes.
+_TEXT_ADAPTER_MAX_OUTPUT = 4096
 
-def _text_models(*entries):
+
+def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT):
     """Each entry is (model_id, context_window) or (model_id, context_window, capabilities)."""
     return [
         ModelDescriptor(
             model_id=entry[0],
             context_window=entry[1],
+            max_output_tokens=max_output_tokens,
             capabilities=set(entry[2]) if len(entry) > 2 else set(TEXT_CAPABILITIES),
         )
         for entry in entries
@@ -152,7 +157,11 @@ _CLOUD_PROVIDERS = {
         # model and tier, and a 429 still exhausts the provider on its own.
         "request_limit": 1500,
         "request_limit_window": "DAILY_PACIFIC",
-        "models": _text_models(("gemini-3.5-flash-lite", 1048576), ("gemini-3.6-flash", 1048576)),
+        "models": _text_models(
+            ("gemini-3.5-flash-lite", 1048576),
+            ("gemini-3.6-flash", 1048576),
+            max_output_tokens=None,
+        ),
     },
     "groq": {
         "kwarg": "groq_api_key",
@@ -405,7 +414,10 @@ class FAIR:
         if not ollama_url and env.get("OLLAMA_ENABLED"):
             ollama_url = "http://127.0.0.1:11434"
         if ollama_url:
-            self._register_ollama(_loopback(ollama_url), ollama_models, live_settings)
+            try:
+                self._register_ollama(_loopback(ollama_url), ollama_models, live_settings)
+            except (ValueError, AdmissionDenied, AuthenticationFailed):
+                self.skipped["ollama_local"] = "Ollama requires a literal loopback HTTP endpoint"
 
         if providers:
             for spec, adapter in providers:
@@ -491,6 +503,8 @@ class FAIR:
         self._registry.register(spec, adapter)
 
     def _register_ollama(self, url, model_ids, settings):
+        # Validate before mutating the shared settings used by cloud adapters.
+        LiveSettings(ollama_url=url)
         if model_ids:
             discovered = [(model_id, _LOCAL_CONTEXT_CAP) for model_id in model_ids]
         else:
