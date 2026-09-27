@@ -12,10 +12,12 @@ from fair.embedded.performance import MemoryPerformanceRegistry
 from fair.embedded.quota import MemoryQuotaGovernor, SharedQuotaLedger
 from fair.embedded.router import EmbeddedRouter
 from fair.providers.base import (
+    AccessDenied,
     AuthenticationFailed,
     BillingViolation,
     MalformedResponse,
     ProviderUnavailable,
+    RequestNotSupported,
 )
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
@@ -183,6 +185,28 @@ class TestMemoryQuota:
         gov.throttle(spec.provider_id, retry_after=5)
         assert gov.effective_status(spec) == "THROTTLED"
 
+    def test_provider_success_does_not_erase_retry_after_throttle(self):
+        now = [1000.0]
+        gov = MemoryQuotaGovernor(
+            RoutingSettings(cooldown_seconds=10),
+            clock=lambda: now[0],
+        )
+        spec = _spec(request_limit=100)
+        gov.throttle(spec.provider_id, retry_after=30)
+        gov.success(spec.provider_id)
+        assert gov.effective_status(spec) == "THROTTLED"
+        now[0] = 1031.0
+        assert gov.effective_status(spec) == "ACTIVE"
+
+    def test_exhaust_without_reset_recovers_instead_of_sticking_forever(self):
+        now = [1000.0]
+        gov = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        spec = _spec()
+        gov.exhaust(spec)
+        assert not gov.available(spec)
+        now[0] = 4601.0
+        assert gov.available(spec)
+
     def test_reset_recovers(self):
         now = 1000.0
         gov = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now)
@@ -306,6 +330,33 @@ class TestSharedQuotaLedger:
         pool = ledger.report(["a"], 1001.0)[0]
         assert pool["used"] == 5
         assert pool["exhausted"] is False
+
+    def test_ledger_failure_fails_closed_instead_of_crashing(self):
+        import sqlite3
+
+        class BrokenLedger:
+            path = "broken.sqlite3"
+
+            def available(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+            def remaining(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+            def report(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+        spec = _spec(request_limit=5)
+        gov = MemoryQuotaGovernor(
+            RoutingSettings(),
+            shared_ledger=BrokenLedger(),
+            application_id="corp",
+        )
+        assert gov.available(spec) is False
+        assert gov.remaining(spec) == 0
+        report = gov.usage_report([spec])
+        assert report["ledger_available"] is False
+        assert report["pools"] == []
 
     def test_invalid_application_identity_fails_closed(self, tmp_path):
         with pytest.raises(ValueError, match="application id"):
@@ -619,11 +670,53 @@ class TestEmbeddedRouter:
         assert result.attempts[0].quality.validator_results["schema"] == "FAIL"
 
     @pytest.mark.asyncio
-    async def test_billing_violation_stops_system(self):
-        router = _router(entries=[(_spec(), MockAdapter("a", error=BillingViolation()))])
-        with pytest.raises(BillingViolation):
-            await router.solve(_request(task="anything"))
-        assert router.stopped
+    async def test_billing_violation_blocks_only_the_offending_provider(self):
+        router = _router(
+            entries=[
+                (_spec("a"), MockAdapter("a", error=BillingViolation())),
+                (_spec("b"), MockAdapter("b", text="345")),
+            ]
+        )
+        result = await router.solve(
+            _request(
+                task="15*23",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.provider_id == "b"
+        assert router.stopped is False
+        assert router.quota.state("a").security_blocked is True
+        assert router.quota.state("b").security_blocked is False
+
+    @pytest.mark.asyncio
+    async def test_request_not_supported_does_not_damage_provider_performance(self):
+        router = _router(
+            entries=[(_spec(), MockAdapter("a", error=RequestNotSupported("OUTPUT_BUDGET_INVALID")))]
+        )
+        result = await router.solve(_request(task="anything"))
+        assert result.attempts[0].disposition == "CAPABILITY_MISMATCH"
+        assert result.attempts[0].error_type == "REQUEST_NOT_SUPPORTED_BY_ROUTE"
+        assert router.performance._stats == {}
+
+    @pytest.mark.asyncio
+    async def test_access_denied_is_not_treated_as_bad_credentials(self):
+        router = _router(
+            entries=[
+                (_spec("a"), MockAdapter("a", error=AccessDenied("PROVIDER_ACCESS_DENIED"))),
+                (_spec("b"), MockAdapter("b", text="345")),
+            ],
+            cooldown_seconds=1,
+        )
+        result = await router.solve(
+            _request(
+                task="15*23",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert router.quota.state("a").security_blocked is False
+        assert router.quota.effective_status(_spec("a")) == "THROTTLED"
 
     @pytest.mark.asyncio
     async def test_on_event_callback(self):
@@ -691,17 +784,17 @@ class TestEmbeddedRouter:
             max_verification_attempts=2,
         )
 
-        original_reserve = router.quota.reserve
+        original_reserve = router.quota.reserve_async
         lost_once = False
 
-        def reserve(spec, application_id=None):
+        async def reserve(spec, application_id=None):
             nonlocal lost_once
             if spec.provider_id == "b" and not lost_once:
                 lost_once = True
                 return False
-            return original_reserve(spec, application_id)
+            return await original_reserve(spec, application_id)
 
-        router.quota.reserve = reserve
+        router.quota.reserve_async = reserve
         result = await router.solve(
             _request(
                 task="15*23",
@@ -714,6 +807,30 @@ class TestEmbeddedRouter:
         assert result.cross_check.state == "PASSED"
         assert adapter_b.calls == 0
         assert adapter_c.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_cross_check_accepts_equivalent_fenced_json_documents(self):
+        spec_a = _spec("a", models=[{"model_id": "m1", "context_window": 32768}])
+        spec_b = _spec("b", models=[{"model_id": "m2", "context_window": 32768}])
+        router = _router(
+            entries=[
+                (spec_a, MockAdapter("a", text='\`\`\`json\n{"answer": 345}\n\`\`\`')),
+                (spec_b, MockAdapter("b", text='{"answer":345}')),
+            ]
+        )
+        result = await router.solve(
+            _request(
+                task="return JSON",
+                expected_schema={
+                    "type": "object",
+                    "properties": {"answer": {"type": "integer"}},
+                    "required": ["answer"],
+                },
+                cross_check_required=True,
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.cross_check.state == "PASSED"
 
     @pytest.mark.asyncio
     async def test_cross_check_disagreement(self):
