@@ -12,7 +12,7 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from fair import FAIR
 from fair.embedded.module import _read_env_file
@@ -238,6 +238,11 @@ def create_app(fair: FAIR, client_keys: dict[str, str]) -> FastAPI:
                 priority=payload.priority,
                 cache_mode=payload.cache_mode,
             )
+        except ValidationError:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "FAILED", "reason_code": "INVALID_FAIR_REQUEST"},
+            )
         except BillingViolation:
             return JSONResponse(
                 status_code=503,
@@ -270,6 +275,17 @@ def create_app(fair: FAIR, client_keys: dict[str, str]) -> FastAPI:
                 client_id=client_id,
                 cache_mode=options.cache_mode,
             )
+        except ValidationError:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "message": "INVALID_FAIR_REQUEST",
+                        "type": "fair_invalid_request",
+                        "code": "INVALID_FAIR_REQUEST",
+                    }
+                },
+            )
         except BillingViolation:
             return JSONResponse(
                 status_code=503,
@@ -297,7 +313,7 @@ def create_app(fair: FAIR, client_keys: dict[str, str]) -> FastAPI:
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": None,
             "fair": {
                 "request_id": result.request_id,
                 "provider_id": result.provider_id,
