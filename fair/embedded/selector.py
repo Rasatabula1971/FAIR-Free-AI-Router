@@ -32,6 +32,11 @@ class MemorySelector:
                     continue
                 if profile.context_tokens_estimate > model.context_window:
                     continue
+                if (
+                    model.max_output_tokens is not None
+                    and request.max_output_tokens > model.max_output_tokens
+                ):
+                    continue
                 if eligible is not None and not eligible(spec, model):
                     continue
                 quality, reliability = self.performance.scores(
