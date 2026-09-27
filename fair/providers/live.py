@@ -460,9 +460,25 @@ class KiloFreeAdapter(TextAdapter):
             self._cost_observation = "NONZERO_OR_INVALID"
             raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
-        # Unknown cost is not zero cost. A zero-priced catalog entry is necessary
-        # for admission but does not substitute for a zero-cost observation on the
-        # actual completion response.
+        # Kilo's current Gateway contract explicitly exposes ':free' models as
+        # free. Some non-streaming responses omit cost_microdollars even though
+        # usage is present, so accept only an exact fresh catalog proof for the
+        # exact response model: ':free' suffix plus zero catalog pricing.
+        response_model = data.get("model")
+        fresh_catalog = (
+            self._model_cache is not None
+            and 0 <= self.clock() - self._model_cache_at < self._catalog_ttl
+        )
+        catalog_ids = {model.model_id for model in (self._model_cache or [])}
+        if (
+            fresh_catalog
+            and isinstance(response_model, str)
+            and response_model.endswith(":free")
+            and response_model in catalog_ids
+        ):
+            self._cost_observation = "CATALOG_ZERO_PRICE_FALLBACK"
+            return
+
         self._cost_observation = "COST_FIELD_MISSING"
         raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
