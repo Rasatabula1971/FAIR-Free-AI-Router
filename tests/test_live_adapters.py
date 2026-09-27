@@ -385,9 +385,9 @@ class TestOpenRouter:
             model.model_id: model.capabilities
             for model in _CLOUD_PROVIDERS["openrouter_free"]["models"]
         }
-        assert "structured_output" not in capabilities["inclusionai/ling-3.0-flash-sante:free"]
+        assert "structured_output" not in capabilities["nvidia/nemotron-3-ultra-550b-a55b:free"]
         assert "structured_output" not in capabilities["cohere/north-mini-code:free"]
-        assert "structured_output" in capabilities["google/gemma-4-26b-a4b-it:free"]
+        assert "structured_output" in capabilities["nex-agi/nex-n2.5-mini:free"]
         # Every configured model still has to be routable for ordinary text work.
         assert all("reasoning" in caps for caps in capabilities.values())
 
