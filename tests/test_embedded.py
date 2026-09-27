@@ -299,6 +299,14 @@ class TestSharedQuotaLedger:
         assert not video.available(spec)
         assert video.remaining(spec) == 0
 
+    def test_zero_remaining_without_reset_is_not_persisted_forever(self, tmp_path):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        ledger.observe("a", 5, 0, None, 1000.0)
+        assert ledger.available("a", None, 1001.0)
+        pool = ledger.report(["a"], 1001.0)[0]
+        assert pool["used"] == 5
+        assert pool["exhausted"] is False
+
     def test_invalid_application_identity_fails_closed(self, tmp_path):
         with pytest.raises(ValueError, match="application id"):
             self._governor(tmp_path / "quota.sqlite3", "")
