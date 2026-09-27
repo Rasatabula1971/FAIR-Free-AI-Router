@@ -4,11 +4,12 @@ import copy
 import ipaddress
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from time import time
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import httpx
 from pydantic import Field, model_validator
@@ -620,6 +621,77 @@ class GeminiAdapter(TextAdapter):
     expected_access = "FREE_RECURRING"
     credential_header = "x-goog-api-key"
     credential_prefix = ""
+    inspect_error_body = True
+    _pacific = ZoneInfo("America/Los_Angeles")
+
+    def _daily_reset_at(self):
+        local = datetime.fromtimestamp(self.clock(), self._pacific)
+        tomorrow = local.date() + timedelta(days=1)
+        return datetime.combine(tomorrow, datetime.min.time(), tzinfo=self._pacific).timestamp()
+
+    @staticmethod
+    def _retry_delay_from_details(error):
+        details = error.get("details")
+        if not isinstance(details, list):
+            return None
+        for detail in details:
+            if (
+                isinstance(detail, dict)
+                and str(detail.get("@type", "")).endswith("RetryInfo")
+            ):
+                delay = duration(detail.get("retryDelay"))
+                if delay is not None:
+                    return delay
+        return None
+
+    @staticmethod
+    def _quota_ids(error):
+        ids = []
+        details = error.get("details")
+        if not isinstance(details, list):
+            return ids
+        for detail in details:
+            if (
+                not isinstance(detail, dict)
+                or not str(detail.get("@type", "")).endswith("QuotaFailure")
+            ):
+                continue
+            violations = detail.get("violations")
+            if not isinstance(violations, list):
+                continue
+            for violation in violations:
+                if isinstance(violation, dict) and isinstance(violation.get("quotaId"), str):
+                    ids.append(violation["quotaId"])
+        return ids
+
+    def _error_from_body(self, status, headers, data):
+        error = data.get("error")
+        if status != 429 or not isinstance(error, dict):
+            self._error(status, headers)
+            return
+
+        code = error.get("code")
+        quota_ids = self._quota_ids(error)
+        daily = (
+            code == "quota_exceeded"
+            or any("perday" in quota_id.casefold() for quota_id in quota_ids)
+        )
+        if daily:
+            reset_at = self._daily_reset_at()
+            self._quota = QuotaSnapshot(
+                provider_id=self.provider_id,
+                quota_remaining_estimate=0,
+                reset_at=reset_at,
+            )
+            raise QuotaExceeded("DAILY_QUOTA_EXHAUSTED", reset_at=reset_at)
+
+        if code in {"rate_limit_exceeded", "too_many_requests"} or quota_ids:
+            retry_after = self._retry_delay_from_details(error)
+            if retry_after is None:
+                retry_after = retry_seconds(headers.get("retry-after"), self.clock())
+            raise RateLimited("RATE_LIMITED", retry_after=retry_after)
+
+        self._error(status, headers)
 
     def _admit(self):
         super()._admit()
