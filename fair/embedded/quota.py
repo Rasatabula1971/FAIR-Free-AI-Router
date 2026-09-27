@@ -277,14 +277,14 @@ class MemoryQuotaGovernor:
             self.pool_id(spec.provider_id), spec.request_limit, self.clock()
         )
 
-    def reserve(self, spec):
+    def reserve(self, spec, application_id=None):
         state = self._state(spec.provider_id)
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
             return False
         if self.shared_ledger is not None:
             if not self.shared_ledger.reserve(
                 self.pool_id(spec.provider_id),
-                self.application_id,
+                application_id or self.application_id,
                 spec.request_limit,
                 spec.request_limit_window,
                 self.clock(),

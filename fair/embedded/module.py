@@ -32,7 +32,7 @@ from fair.providers.registry import Registry
 from fair.quality.source_reviews import SourceReviewRegistry
 from fair.quality.thresholds import DEFAULT_THRESHOLDS
 from fair.schemas.api import SolveRequest, SolveResponse
-from fair.schemas.domain import ModelDescriptor, PrivacyClass, ProviderSpec
+from fair.schemas.domain import Capability, ModelDescriptor, PrivacyClass, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
 from fair.security.credentials import CredentialConfigurationError
@@ -339,6 +339,7 @@ class FAIR:
         if env_file:
             env = _read_env_file(env_file) | env
         application_id = application_id or env.get("FAIR_APPLICATION_ID") or "embedded"
+        self._application_id = application_id
         shared_quota_path = shared_quota_path or env.get("FAIR_SHARED_QUOTA_PATH")
         given = {
             "gemini_api_key": gemini_api_key,
@@ -527,7 +528,7 @@ class FAIR:
         task_type: str | None = None,
         quality_level: str | None = None,
         privacy_class: PrivacyClass = "PUBLIC",
-        required_capabilities: set[str] | None = None,
+        required_capabilities: set[Capability] | None = None,
         freshness_required: bool = False,
         expected_schema: dict | None = None,
         validation: dict | None = None,
@@ -535,7 +536,7 @@ class FAIR:
         source_policy: dict | None = None,
         cross_check_required: bool | None = None,
         max_output_tokens: int = 1024,
-        client_id: str = "embedded",
+        client_id: str | None = None,
         priority: str = "P2",
         cache_mode: str = "default",
     ) -> SolveResponse:
@@ -555,7 +556,7 @@ class FAIR:
         """
         request = SolveRequest.model_validate(
             {
-                "client_id": client_id,
+                "client_id": client_id or self._application_id,
                 "task": task,
                 "task_type": task_type,
                 "quality_level": quality_level or self._quality_level,

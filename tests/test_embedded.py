@@ -694,12 +694,12 @@ class TestEmbeddedRouter:
         original_reserve = router.quota.reserve
         lost_once = False
 
-        def reserve(spec):
+        def reserve(spec, application_id=None):
             nonlocal lost_once
             if spec.provider_id == "b" and not lost_once:
                 lost_once = True
                 return False
-            return original_reserve(spec)
+            return original_reserve(spec, application_id)
 
         router.quota.reserve = reserve
         result = await router.solve(
@@ -814,6 +814,32 @@ class TestFAIRModule:
                 shared_quota_path=str(tmp_path / "quota.sqlite3"),
                 quota_pool_ids={"missing": "account"},
             )
+
+    @pytest.mark.asyncio
+    async def test_application_id_is_default_quota_attribution(self, tmp_path):
+        fair = FAIR(
+            providers=[(_spec(request_limit=2), MockAdapter("a", text="345"))],
+            application_id="corp",
+            shared_quota_path=str(tmp_path / "quota.sqlite3"),
+        )
+        await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
+        pool = fair.quota_usage()["pools"][0]
+        assert pool["applications"] == {"corp": 1}
+
+    @pytest.mark.asyncio
+    async def test_explicit_client_id_overrides_quota_attribution(self, tmp_path):
+        fair = FAIR(
+            providers=[(_spec(request_limit=2), MockAdapter("a", text="345"))],
+            application_id="fair-service",
+            shared_quota_path=str(tmp_path / "quota.sqlite3"),
+        )
+        await fair.solve(
+            "15*23",
+            validation={"kind": "arithmetic", "expression": "15*23"},
+            client_id="youtube-production",
+        )
+        pool = fair.quota_usage()["pools"][0]
+        assert pool["applications"] == {"youtube-production": 1}
 
     @pytest.mark.asyncio
     async def test_solve_with_mock(self):
