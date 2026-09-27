@@ -561,6 +561,8 @@ class TestCloudflare:
         )
 
     async def test_daily_free_allocation_error_exhausts_until_utc_reset(self):
+        now = datetime.now(UTC).timestamp()
+        expected_reset = (int(now // 86400) + 1) * 86400
         adapter, _ = self._adapter(
             {
                 ("GET", "/ai/models/search"): (200, self._catalog()),
@@ -572,15 +574,15 @@ class TestCloudflare:
                     },
                 ),
             },
-            clock=lambda: 1000.0,
+            clock=lambda: now,
         )
         with pytest.raises(QuotaExceeded) as raised:
             await adapter.complete(_request(self.MODEL))
-        assert raised.value.reset_at == 86400
+        assert raised.value.reset_at == expected_reset
         quota = await adapter.quota()
         assert quota.quota_limit == 10_000
         assert quota.quota_remaining_estimate == 0
-        assert quota.reset_at == 86400
+        assert quota.reset_at == expected_reset
 
     async def test_out_of_capacity_429_is_transient_not_daily_exhaustion(self):
         adapter, _ = self._adapter(
