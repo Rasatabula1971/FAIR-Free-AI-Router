@@ -613,6 +613,39 @@ class ZaiFreeAdapter(TextAdapter):
             return str(code)
         return None
 
+    def _reset_at_from_error(self, data):
+        """Use only explicit, machine-readable reset timestamps when Z.ai supplies one."""
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return None
+        candidates = [error.get("next_flush_time"), error.get("reset_at"), error.get("reset_time")]
+        message = error.get("message")
+        if isinstance(message, str):
+            candidates.extend(re.findall(r"\\b\\d{10}(?:\\.\\d+)?\\b", message))
+            candidates.extend(
+                re.findall(
+                    r"\\b\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:?\\d{2})\\b",
+                    message,
+                )
+            )
+        now = self.clock()
+        for value in candidates:
+            try:
+                reset_at = float(value)
+            except (TypeError, ValueError):
+                if not isinstance(value, str):
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    continue
+                reset_at = parsed.timestamp()
+            if now < reset_at <= now + 40 * SECONDS_IN_DAY:
+                return reset_at
+        return None
+
     def _error_from_body(self, status, headers, data):
         code = self._error_code(data)
         if status == 429 and code == "1302":
@@ -623,6 +656,17 @@ class ZaiFreeAdapter(TextAdapter):
                 "RATE_LIMITED",
                 retry_after=retry_seconds(headers.get("retry-after"), self.clock()),
             )
+        if status == 429 and code in {"1308", "1310"}:
+            # These are documented usage-limit exhaustion codes. When Z.ai gives
+            # a reset timestamp, propagate it; otherwise FAIR rechecks after its
+            # conservative exhaustion interval instead of hammering the provider.
+            reset_at = self._reset_at_from_error(data)
+            self._quota = QuotaSnapshot(
+                provider_id=self.provider_id,
+                quota_remaining_estimate=0,
+                reset_at=reset_at,
+            )
+            raise QuotaExceeded("USAGE_LIMIT_EXHAUSTED", reset_at=reset_at)
         if status == 429 and code == "1305":
             raise ProviderUnavailable("PROVIDER_TEMPORARILY_OVERLOADED")
         if status in {402, 429} and code == "1113":
