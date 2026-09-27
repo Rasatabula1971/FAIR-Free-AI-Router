@@ -8,7 +8,7 @@ import pytest
 from pydantic import SecretStr
 
 from fair.embedded.module import _CLOUD_PROVIDERS, FAIR, _loopback
-from fair.providers.base import AuthenticationFailed, BillingViolation, QuotaExceeded
+from fair.providers.base import AccessDenied, AuthenticationFailed, BillingViolation, QuotaExceeded
 from fair.providers.live import (
     CloudflareWorkersAiAdapter,
     GroqAdapter,
@@ -168,6 +168,11 @@ class TestKilo:
         assert adapter.safe_diagnostics() == {"cost_microdollars": "ZERO"}
         assert str(seen[-1].url) == "https://api.kilo.ai/api/gateway/chat/completions"
         assert "provider" not in json.loads(seen[-1].content)
+
+    async def test_http_403_is_access_denied_not_bad_credentials(self):
+        adapter, _ = self._adapter({("GET", "/models"): (403, {"error": {"code": 403}})})
+        with pytest.raises(AccessDenied):
+            await adapter.list_models()
 
     async def test_priced_model_is_dropped_from_catalog(self):
         catalog = {
