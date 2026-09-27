@@ -498,6 +498,11 @@ class MistralAdapter(TextAdapter):
     expected_provider = "mistral"
     expected_access = "FREE_RECURRING"
     context_field = "max_context_length"
+    admin_spend_limit_url = "https://api.mistral.ai/v1/admin/spend-limit"
+
+    def __init__(self, *args, admin_credential=None, **kwargs):
+        self._admin_credential = admin_credential
+        super().__init__(*args, **kwargs)
 
     def _observe(self, headers):
         try:
@@ -513,6 +518,64 @@ class MistralAdapter(TextAdapter):
             )
         except (ValueError, KeyError):
             return QuotaSnapshot(provider_id=self.provider_id)
+
+    def _next_month_reset_at(self):
+        now = datetime.fromtimestamp(self.clock(), UTC)
+        if now.month == 12:
+            reset = datetime(now.year + 1, 1, 1, tzinfo=UTC)
+        else:
+            reset = datetime(now.year, now.month + 1, 1, tzinfo=UTC)
+        return reset.timestamp()
+
+    async def _monthly_limit_reached(self):
+        if self._admin_credential is None:
+            return False
+        headers = {
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "x-api-key": self._admin_credential.get_secret_value(),
+        }
+        try:
+            async with self._client.stream(
+                "GET", self.admin_spend_limit_url, headers=headers
+            ) as response:
+                if response.status_code != 200:
+                    return False
+                if response.headers.get("content-encoding", "identity") != "identity":
+                    return False
+                chunks, size = [], 0
+                async for chunk in response.aiter_bytes():
+                    size += len(chunk)
+                    if size > 1_000_000:
+                        return False
+                    chunks.append(chunk)
+                data = strict_json(b"".join(chunks).decode("utf-8"))
+                if not isinstance(data, dict):
+                    return False
+        except (httpx.HTTPError, ValueError, UnicodeError, RecursionError):
+            return False
+        limits = data.get("limits")
+        completion = limits.get("completion") if isinstance(limits, dict) else None
+        return (
+            isinstance(completion, dict)
+            and completion.get("monthly_limit_reached") is True
+        )
+
+    async def complete(self, request):
+        try:
+            return await super().complete(request)
+        except (QuotaExceeded, RateLimited):
+            if await self._monthly_limit_reached():
+                reset_at = self._next_month_reset_at()
+                self._quota = QuotaSnapshot(
+                    provider_id=self.provider_id,
+                    quota_remaining_estimate=0,
+                    reset_at=reset_at,
+                )
+                raise QuotaExceeded(
+                    "MONTHLY_USAGE_LIMIT_REACHED", reset_at=reset_at
+                ) from None
+            raise
 
 
 class ZaiFreeAdapter(TextAdapter):
