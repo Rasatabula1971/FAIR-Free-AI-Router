@@ -142,7 +142,9 @@ class TestServiceEndpoints:
             "validation": {"kind": "arithmetic", "expression": "15*23"},
         }
         with TestClient(app) as client:
-            assert client.post("/v1/fair/solve", headers=_headers(), json=request).status_code == 200
+            assert (
+                client.post("/v1/fair/solve", headers=_headers(), json=request).status_code == 200
+            )
             assert (
                 client.post("/v1/fair/solve", headers=_headers(VIDEO_KEY), json=request).status_code
                 == 200
@@ -276,9 +278,9 @@ class TestServiceConfiguration:
     def test_app_factory_reads_service_settings_without_exposing_keys(self, monkeypatch, tmp_path):
         env_file = tmp_path / ".env"
         env_file.write_text(
-            "FAIR_SERVICE_CLIENTS='{\"corp\":\"corp-client-key-0123456789\"}'\n"
+            'FAIR_SERVICE_CLIENTS=\'{"corp":"corp-client-key-0123456789"}\'\n'
             "FAIR_CONFIRMED_FREE_PROVIDERS=groq\n"
-            "FAIR_QUOTA_POOL_IDS='{\"mock\":\"account-a\"}'\n",
+            'FAIR_QUOTA_POOL_IDS=\'{"mock":"account-a"}\'\n',
             encoding="utf-8",
         )
         captured = {}
