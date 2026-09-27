@@ -9,7 +9,7 @@ from fair import FAIR
 from fair.providers.mock import MockAdapter
 from fair.schemas.domain import ProviderSpec
 from fair.service import app as service
-from fair.service.__main__ import _port
+from fair.service.__main__ import _host, _port
 from fair.service.app import SERVICE_MODEL_ID, create_app, parse_client_keys
 
 CORP_KEY = "corp-client-key-0123456789"
@@ -350,6 +350,20 @@ class TestServiceConfiguration:
         assert app.title == "FAIR Free AI Router"
         assert captured["confirmed_free_providers"] == {"groq"}
         assert captured["quota_pool_ids"] == {"mock": "account-a"}
+
+    def test_service_host_is_loopback_only(self, monkeypatch):
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "localhost")
+        assert _host() == "127.0.0.1"
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "127.0.0.1")
+        assert _host() == "127.0.0.1"
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "::1")
+        assert _host() == "::1"
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "0.0.0.0")
+        with pytest.raises(SystemExit, match="loopback-only"):
+            _host()
+        monkeypatch.setenv("FAIR_SERVICE_HOST", "fair.internal")
+        with pytest.raises(SystemExit, match="literal loopback"):
+            _host()
 
     def test_port_parser(self, monkeypatch):
         monkeypatch.setenv("FAIR_SERVICE_PORT", "8123")
