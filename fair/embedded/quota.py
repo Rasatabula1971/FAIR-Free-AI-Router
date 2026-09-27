@@ -1,5 +1,7 @@
 """Quota governance with optional cross-process shared accounting."""
 
+import asyncio
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -8,6 +10,9 @@ from pathlib import Path
 from time import time
 from zoneinfo import ZoneInfo
 
+logger = logging.getLogger(__name__)
+
+_EXHAUSTION_RETRY_SECONDS = 3600
 _WINDOW_ZONES = {"DAILY_UTC": UTC, "DAILY_PACIFIC": ZoneInfo("America/Los_Angeles")}
 
 
@@ -200,6 +205,8 @@ class QuotaState:
     exhausted: bool = False
     security_blocked: bool = False
     blocked_until: float = 0
+    # Retry-After throttling is independent from circuit-breaker cooldown.
+    throttled_until: float = 0
     reset_at: float | None = None
     circuit_state: str = "CLOSED"
     probe_until: float = 0
@@ -250,13 +257,40 @@ class MemoryQuotaGovernor:
     def state(self, provider_id):
         return self._state(provider_id)
 
+    def _ledger(self, operation, *args, failed):
+        """Run a ledger operation fail-closed; never leak sqlite errors to callers."""
+        try:
+            return operation(*args)
+        except sqlite3.Error:
+            logger.warning("Shared quota ledger unavailable; treating pool as unavailable")
+            return failed
+
+    async def _ledger_async(self, operation, *args, failed):
+        """Move blocking sqlite work off the application event loop."""
+        return await asyncio.to_thread(self._ledger, operation, *args, failed=failed)
+
     def remaining(self, spec):
         if self.shared_ledger is not None:
-            return self.shared_ledger.remaining(
-                self.pool_id(spec.provider_id), spec.request_limit, self.clock()
+            return self._ledger(
+                self.shared_ledger.remaining,
+                self.pool_id(spec.provider_id),
+                spec.request_limit,
+                self.clock(),
+                failed=None if spec.request_limit is None else 0,
             )
         state = self._state(spec.provider_id)
         return None if spec.request_limit is None else max(0, spec.request_limit - state.used)
+
+    async def remaining_async(self, spec):
+        if self.shared_ledger is not None:
+            return await self._ledger_async(
+                self.shared_ledger.remaining,
+                self.pool_id(spec.provider_id),
+                spec.request_limit,
+                self.clock(),
+                failed=None if spec.request_limit is None else 0,
+            )
+        return self.remaining(spec)
 
     def _available_local(self, state, spec, *, include_limit=True):
         return (
@@ -264,6 +298,7 @@ class MemoryQuotaGovernor:
             and not state.security_blocked
             and state.circuit_state != "HALF_OPEN"
             and self.clock() >= state.blocked_until
+            and self.clock() >= state.throttled_until
             and (not include_limit or spec.request_limit is None or state.used < spec.request_limit)
         )
 
@@ -273,8 +308,26 @@ class MemoryQuotaGovernor:
             return False
         if self.shared_ledger is None:
             return True
-        return self.shared_ledger.available(
-            self.pool_id(spec.provider_id), spec.request_limit, self.clock()
+        return self._ledger(
+            self.shared_ledger.available,
+            self.pool_id(spec.provider_id),
+            spec.request_limit,
+            self.clock(),
+            failed=False,
+        )
+
+    async def available_async(self, spec):
+        state = self._state(spec.provider_id)
+        if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
+            return False
+        if self.shared_ledger is None:
+            return True
+        return await self._ledger_async(
+            self.shared_ledger.available,
+            self.pool_id(spec.provider_id),
+            spec.request_limit,
+            self.clock(),
+            failed=False,
         )
 
     def reserve(self, spec, application_id=None):
@@ -282,12 +335,43 @@ class MemoryQuotaGovernor:
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
             return False
         if self.shared_ledger is not None:
-            if not self.shared_ledger.reserve(
+            if not self._ledger(
+                self.shared_ledger.reserve,
                 self.pool_id(spec.provider_id),
                 application_id or self.application_id,
                 spec.request_limit,
                 spec.request_limit_window,
                 self.clock(),
+                failed=False,
+            ):
+                return False
+            state.used += 1
+        else:
+            state.used += 1
+            if (
+                state.reset_at is None
+                and spec.request_limit is not None
+                and spec.request_limit_window is not None
+            ):
+                state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
+        if state.circuit_state == "OPEN":
+            state.circuit_state = "HALF_OPEN"
+            state.probe_until = self.clock() + self.settings.timeout_seconds + 5
+        return True
+
+    async def reserve_async(self, spec, application_id=None):
+        state = self._state(spec.provider_id)
+        if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
+            return False
+        if self.shared_ledger is not None:
+            if not await self._ledger_async(
+                self.shared_ledger.reserve,
+                self.pool_id(spec.provider_id),
+                application_id or self.application_id,
+                spec.request_limit,
+                spec.request_limit_window,
+                self.clock(),
+                failed=False,
             ):
                 return False
             state.used += 1
@@ -320,8 +404,8 @@ class MemoryQuotaGovernor:
             and 0 < retry_after <= 86400
             else 0
         )
-        state.blocked_until = max(
-            state.blocked_until, self.clock() + max(self.settings.cooldown_seconds, delay)
+        state.throttled_until = max(
+            state.throttled_until, self.clock() + max(self.settings.cooldown_seconds, delay)
         )
 
     def observe(self, spec, observation):
@@ -336,18 +420,60 @@ class MemoryQuotaGovernor:
             state.used = max(state.used, spec.request_limit - min(remaining, spec.request_limit))
         if remaining == 0:
             state.exhausted = True
+            if state.reset_at is None:
+                state.reset_at = (
+                    next_window_reset(spec.request_limit_window, self.clock())
+                    if spec.request_limit_window is not None
+                    else self.clock() + _EXHAUSTION_RETRY_SECONDS
+                )
         if (
             observation.reset_at is not None
             and self.clock() < observation.reset_at <= self.clock() + 86400
         ):
             state.reset_at = observation.reset_at
         if self.shared_ledger is not None:
-            self.shared_ledger.observe(
+            self._ledger(
+                self.shared_ledger.observe,
                 self.pool_id(spec.provider_id),
                 observed_limit,
                 remaining,
-                observation.reset_at,
+                state.reset_at if remaining == 0 else observation.reset_at,
                 self.clock(),
+                failed=None,
+            )
+
+    async def observe_async(self, spec, observation):
+        if observation.provider_id != spec.provider_id:
+            raise ValueError("Quota observation identity mismatch")
+        remaining = observation.quota_remaining_estimate
+        observed_limit = observation.quota_limit
+        if remaining is None or observed_limit is None or remaining > observed_limit:
+            return
+        state = self._state(spec.provider_id)
+        if spec.request_limit is not None:
+            state.used = max(state.used, spec.request_limit - min(remaining, spec.request_limit))
+        if (
+            observation.reset_at is not None
+            and self.clock() < observation.reset_at <= self.clock() + 86400
+        ):
+            state.reset_at = observation.reset_at
+        if remaining == 0:
+            state.exhausted = True
+            if state.reset_at is None:
+                state.reset_at = (
+                    next_window_reset(spec.request_limit_window, self.clock())
+                    if spec.request_limit_window is not None
+                    else self.clock() + _EXHAUSTION_RETRY_SECONDS
+                )
+        if self.shared_ledger is not None:
+            await self._ledger_async(
+                self.shared_ledger.observe,
+                self.pool_id(spec.provider_id),
+                observed_limit,
+                remaining,
+                state.reset_at if remaining == 0 else observation.reset_at,
+                self.clock(),
+                failed=None,
             )
 
     def exhaust(self, provider, reset_at=None):
@@ -355,19 +481,63 @@ class MemoryQuotaGovernor:
         provider_id = spec.provider_id if spec is not None else provider
         if reset_at is not None and (not isfinite(reset_at) or reset_at <= self.clock()):
             reset_at = None
+        if reset_at is None:
+            window = spec.request_limit_window if spec is not None else None
+            reset_at = (
+                next_window_reset(window, self.clock())
+                if window is not None
+                else self.clock() + _EXHAUSTION_RETRY_SECONDS
+            )
         state = self._state(provider_id)
         state.exhausted = True
         state.reset_at = reset_at
         if state.circuit_state == "HALF_OPEN":
             self._open(state)
         if self.shared_ledger is not None and spec is not None:
-            shared_reset = reset_at
-            if shared_reset is None and spec.request_limit_window is not None:
-                shared_reset = next_window_reset(spec.request_limit_window, self.clock())
-            self.shared_ledger.exhaust(self.pool_id(provider_id), shared_reset, self.clock())
+            self._ledger(
+                self.shared_ledger.exhaust,
+                self.pool_id(provider_id),
+                reset_at,
+                self.clock(),
+                failed=None,
+            )
+
+    async def exhaust_async(self, provider, reset_at=None):
+        spec = provider if hasattr(provider, "provider_id") else None
+        provider_id = spec.provider_id if spec is not None else provider
+        if reset_at is not None and (not isfinite(reset_at) or reset_at <= self.clock()):
+            reset_at = None
+        if reset_at is None:
+            window = spec.request_limit_window if spec is not None else None
+            reset_at = (
+                next_window_reset(window, self.clock())
+                if window is not None
+                else self.clock() + _EXHAUSTION_RETRY_SECONDS
+            )
+        state = self._state(provider_id)
+        state.exhausted = True
+        state.reset_at = reset_at
+        if state.circuit_state == "HALF_OPEN":
+            self._open(state)
+        if self.shared_ledger is not None and spec is not None:
+            await self._ledger_async(
+                self.shared_ledger.exhaust,
+                self.pool_id(provider_id),
+                reset_at,
+                self.clock(),
+                failed=None,
+            )
 
     def block_security(self, provider_id):
         self._state(provider_id).security_blocked = True
+
+    def unblock_security(self, provider_id):
+        state = self._state(provider_id)
+        state.security_blocked = False
+        state.failures = []
+        state.circuit_state = "CLOSED"
+        state.blocked_until = 0
+        state.throttled_until = 0
 
     def failure(self, provider_id):
         state = self._state(provider_id)
@@ -391,13 +561,23 @@ class MemoryQuotaGovernor:
     def effective_status(self, spec):
         if spec.status not in {"ACTIVE", "QUOTA_PRESSURE"}:
             return spec.status
+        from fair.governor.policy import AdmissionDenied, admit_provider
+
+        try:
+            admit_provider(spec)
+        except AdmissionDenied:
+            return "REVIEW_EXPIRED"
         state = self._state(spec.provider_id)
         if state.security_blocked:
             return "SECURITY_BLOCKED"
         if state.exhausted:
             return "QUOTA_EXHAUSTED"
-        if self.shared_ledger is not None and not self.shared_ledger.available(
-            self.pool_id(spec.provider_id), spec.request_limit, self.clock()
+        if self.shared_ledger is not None and not self._ledger(
+            self.shared_ledger.available,
+            self.pool_id(spec.provider_id),
+            spec.request_limit,
+            self.clock(),
+            failed=False,
         ):
             return "QUOTA_EXHAUSTED"
         if self.shared_ledger is None and (
@@ -406,7 +586,39 @@ class MemoryQuotaGovernor:
             return "QUOTA_EXHAUSTED"
         if state.circuit_state != "CLOSED":
             return "OUTAGE"
-        if self.clock() < state.blocked_until:
+        if self.clock() < max(state.blocked_until, state.throttled_until):
+            return "THROTTLED"
+        return spec.status
+
+    async def effective_status_async(self, spec):
+        if spec.status not in {"ACTIVE", "QUOTA_PRESSURE"}:
+            return spec.status
+        from fair.governor.policy import AdmissionDenied, admit_provider
+
+        try:
+            admit_provider(spec)
+        except AdmissionDenied:
+            return "REVIEW_EXPIRED"
+        state = self._state(spec.provider_id)
+        if state.security_blocked:
+            return "SECURITY_BLOCKED"
+        if state.exhausted:
+            return "QUOTA_EXHAUSTED"
+        if self.shared_ledger is not None and not await self._ledger_async(
+            self.shared_ledger.available,
+            self.pool_id(spec.provider_id),
+            spec.request_limit,
+            self.clock(),
+            failed=False,
+        ):
+            return "QUOTA_EXHAUSTED"
+        if self.shared_ledger is None and (
+            spec.request_limit is not None and state.used >= spec.request_limit
+        ):
+            return "QUOTA_EXHAUSTED"
+        if state.circuit_state != "CLOSED":
+            return "OUTAGE"
+        if self.clock() < max(state.blocked_until, state.throttled_until):
             return "THROTTLED"
         return spec.status
 
@@ -420,7 +632,12 @@ class MemoryQuotaGovernor:
                 "provider_pools": provider_pools,
                 "pools": [],
             }
-        pools = self.shared_ledger.report(provider_pools.values(), self.clock())
+        pools = self._ledger(
+            self.shared_ledger.report,
+            provider_pools.values(),
+            self.clock(),
+            failed=[],
+        )
         limits = {}
         for spec in specs:
             pool_id = provider_pools[spec.provider_id]
@@ -435,5 +652,40 @@ class MemoryQuotaGovernor:
             "application_id": self.application_id,
             "ledger_path": self.shared_ledger.path,
             "provider_pools": provider_pools,
+            "ledger_available": bool(pools) or not provider_pools,
+            "pools": pools,
+        }
+
+    async def usage_report_async(self, specs):
+        specs = list(specs)
+        provider_pools = {spec.provider_id: self.pool_id(spec.provider_id) for spec in specs}
+        if self.shared_ledger is None:
+            return {
+                "shared": False,
+                "application_id": self.application_id,
+                "provider_pools": provider_pools,
+                "pools": [],
+            }
+        pools = await self._ledger_async(
+            self.shared_ledger.report,
+            provider_pools.values(),
+            self.clock(),
+            failed=[],
+        )
+        limits = {}
+        for spec in specs:
+            pool_id = provider_pools[spec.provider_id]
+            if spec.request_limit is not None:
+                limits[pool_id] = min(limits.get(pool_id, spec.request_limit), spec.request_limit)
+        for pool in pools:
+            limit = limits.get(pool["pool_id"])
+            pool["request_limit"] = limit
+            pool["remaining"] = None if limit is None else max(0, limit - pool["used"])
+        return {
+            "shared": True,
+            "application_id": self.application_id,
+            "ledger_path": self.shared_ledger.path,
+            "provider_pools": provider_pools,
+            "ledger_available": bool(pools) or not provider_pools,
             "pools": pools,
         }
