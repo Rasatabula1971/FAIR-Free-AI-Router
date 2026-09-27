@@ -332,36 +332,22 @@ Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `
 
 FAIR is a router with a verifier on its accept path. Nothing is returned because a model
 produced it — it is returned because a deterministic check passed. Two independent gates
-run around every call, and both fail closed:
+run around every call and both fail closed: **admission** decides a provider is free,
+**quality** decides an answer is verified.
 
-- **Admission** decides a provider is free (`fair/governor/policy.py`, `qualification.py`).
-  Zero cost, no paid subscription, no credit purchase, no auto-billing, and a per-model
-  qualification with a review date inside its window. Re-checked at registration, at
-  selection, and again on a cache hit.
-- **Quality** decides an answer is verified (`fair/quality/engine.py`). A contract runs
-  against the response; both the score and the verification state must pass.
+```text
+FAIR(api_keys)                  admission gate -> fair.providers() / fair.skipped
+ └─ EmbeddedRouter
+     └─ solve(request)
+         profile -> cache -> select -> dispatch -> verify -> accept or retry
+```
 
 All validation logic is pure functions — no database, no server, no YAML config.
 
-```text
-FAIR(api_keys)                     admission gate -> fair.providers() / fair.skipped
- └─ EmbeddedRouter
-     └─ solve(request)
-         1. profile_task          required capabilities, task class, context, threshold
-         2. MemoryCache.get       arithmetic/reference only; re-validates before returning
-         3. MemorySelector        admission + quota + privacy_class + capabilities + window,
-                                  then quality x 0.65 + quota x 0.20 + reliability x 0.15
-         4. adapter.complete      via CredentialedAdapter (credential-reflection guard)
-         5. Quality Engine        arithmetic, bounded code interpreter, JSON, grounding,
-                                  claims, source policy, optional independent cross-check
-         6. accept or retry       two budgets: answered vs unanswered (see above)
-
-     MemoryQuotaGovernor   circuit breaker CLOSED -> OPEN -> HALF_OPEN, daily quota windows
-     MemoryPerformance     per (provider, model, task class) quality/reliability + drift
-```
-
-A cache hit is not trusted on its own: `MemoryCache.get` re-runs the validator against the
-stored text and re-checks provider admission, and drops the entry if either now fails.
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the design: what each gate checks and when
+it is re-checked, the full request lifecycle, the selector and performance scoring math,
+the circuit breaker and quota windows, the verification-state allowlist, the credential
+boundary, and the invariants a change must not break.
 
 ## Development
 
