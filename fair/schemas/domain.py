@@ -76,6 +76,9 @@ class DTO(BaseModel):
 class ModelDescriptor(DTO):
     model_id: str
     context_window: int = Field(gt=0)
+    # Largest max_output_tokens the adapter will send for this model.
+    # None means no static local cap; the live adapter may still enforce one.
+    max_output_tokens: int | None = Field(default=None, gt=0)
     capabilities: set[Capability] = Field(default_factory=set)
     active: bool = True
     independence_group: str | None = Field(default=None, min_length=1, max_length=128)
