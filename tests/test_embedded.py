@@ -83,6 +83,21 @@ def _router(entries=None, on_event=None, **settings_kw):
 
 
 class TestConfigurationHardening:
+    def test_dotenv_supports_export_and_inline_comments(self, tmp_path):
+        path = tmp_path / ".env"
+        path.write_text(
+            "export GROQ_API_KEY=abc123 # local note\n"
+            "OPENROUTER_API_KEY='quoted # value'\n",
+            encoding="utf-8",
+        )
+        values = module._read_env_file(path)
+        assert values["GROQ_API_KEY"] == "abc123"
+        assert values["OPENROUTER_API_KEY"] == "quoted # value"
+
+    def test_bare_ollama_host_is_normalized_to_loopback_http(self):
+        assert module._loopback("127.0.0.1:11434") == "http://127.0.0.1:11434"
+        assert module._loopback("localhost:11434") == "http://127.0.0.1:11434"
+
     def test_selector_weights_must_sum_to_one(self):
         with pytest.raises(ValueError, match="Selector weights must sum to 1.0"):
             RoutingSettings(
@@ -814,7 +829,7 @@ class TestEmbeddedRouter:
         spec_b = _spec("b", models=[{"model_id": "m2", "context_window": 32768}])
         router = _router(
             entries=[
-                (spec_a, MockAdapter("a", text='\`\`\`json\n{"answer": 345}\n\`\`\`')),
+                (spec_a, MockAdapter("a", text='```json\n{\"answer\": 345}\n```')),
                 (spec_b, MockAdapter("b", text='{"answer":345}')),
             ]
         )
