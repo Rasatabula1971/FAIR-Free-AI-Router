@@ -870,10 +870,7 @@ class TestBuiltinReviewDate:
 
 class TestOpenRouterReviewedModels:
     def test_openrouter_free_models_match_reviewed_catalog_and_capabilities(self):
-        models = {
-            model.model_id: model
-            for model in _CLOUD_PROVIDERS["openrouter_free"]["models"]
-        }
+        models = {model.model_id: model for model in _CLOUD_PROVIDERS["openrouter_free"]["models"]}
         assert set(models) == {
             "nvidia/nemotron-3-ultra-550b-a55b:free",
             "nex-agi/nex-n2.5-mini:free",
@@ -883,9 +880,9 @@ class TestOpenRouterReviewedModels:
         assert models["nex-agi/nex-n2.5-mini:free"].context_window == 262_144
         assert models["cohere/north-mini-code:free"].context_window == 256_000
 
-        assert "structured_output" not in models[
-            "nvidia/nemotron-3-ultra-550b-a55b:free"
-        ].capabilities
+        assert (
+            "structured_output" not in models["nvidia/nemotron-3-ultra-550b-a55b:free"].capabilities
+        )
         assert "structured_output" in models["nex-agi/nex-n2.5-mini:free"].capabilities
         assert "structured_output" not in models["cohere/north-mini-code:free"].capabilities
         assert all(model_id.endswith(":free") for model_id in models)
