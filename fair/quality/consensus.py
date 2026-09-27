@@ -4,7 +4,7 @@ import json
 
 from fair.quality.arithmetic import numeric_answer
 from fair.quality.claims import canonical, comparable_claims
-from fair.quality.json_data import strict_json
+from fair.quality.json_data import json_document
 
 
 def independent(primary, candidate):
@@ -36,8 +36,8 @@ def compare(request, first, second, both_validated):
             )
         if kind in {"reference_json", "grounded_json"}:
             return (
-                json.dumps(strict_json(first.text), sort_keys=True)
-                == json.dumps(strict_json(second.text), sort_keys=True),
+                json.dumps(json_document(first.text), sort_keys=True)
+                == json.dumps(json_document(second.text), sort_keys=True),
                 "EXACT_VALUE",
             )
         if kind == "python_function" and both_validated:
