@@ -153,11 +153,9 @@ _CLOUD_PROVIDERS = {
         "env": "GEMINI_API_KEY",
         "adapter": GeminiAdapter,
         "access_class": "FREE_RECURRING",
-        # Gemini returns no rate-limit headers, so this local ceiling is the
-        # only request guard FAIR has. It is a conservative floor, not a claim
-        # about the account's real allowance: Google's per-day limit varies by
-        # model and tier, and a 429 still exhausts the provider on its own.
-        "request_limit": 1500,
+        # Gemini limits vary by project/model and Google directs operators to
+        # AI Studio for the active values. Do not guess a local numeric ceiling.
+        # The window remains useful when a daily QuotaFailure is observed.
         "request_limit_window": "DAILY_PACIFIC",
         "models": _text_models(
             ("gemini-3.5-flash-lite", 1048576),

@@ -8,12 +8,18 @@ than return text.
 """
 
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
-from fair.providers.base import AuthenticationFailed, MalformedResponse
+from fair.providers.base import (
+    AuthenticationFailed,
+    MalformedResponse,
+    QuotaExceeded,
+    RateLimited,
+)
 from fair.providers.live import GeminiAdapter, LiveSettings, OllamaLocalAdapter
 from fair.schemas.domain import NormalizedModelRequest, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
@@ -72,7 +78,6 @@ def _gemini_spec(model_id=GEMINI_MODEL, revision=None, **overrides):
         programmatic_access=True,
         production_eligibility=True,
         terms_last_verified=reviewed,
-        request_limit=1500,
         request_limit_window="DAILY_PACIFIC",
         models=[
             {
@@ -200,6 +205,94 @@ class TestGemini:
         await adapter.complete(_request(GEMINI_MODEL))
         assert seen[-1].headers["x-goog-api-key"] == "k"
         assert "authorization" not in seen[-1].headers
+
+    async def test_daily_quota_failure_exhausts_until_midnight_pacific(self):
+        now = datetime.now(UTC).timestamp()
+        adapter, _ = self._adapter(
+            {
+                ("GET", f"/models/{GEMINI_MODEL}"): (200, _metadata()),
+                ("POST", ":generateContent"): (
+                    429,
+                    {
+                        "error": {
+                            "code": 429,
+                            "status": "RESOURCE_EXHAUSTED",
+                            "details": [
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                                    "violations": [
+                                        {
+                                            "quotaId": (
+                                                "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+                                            )
+                                        }
+                                    ],
+                                },
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                    "retryDelay": "45s",
+                                },
+                            ],
+                        }
+                    },
+                ),
+            }
+        )
+        adapter.clock = lambda: now
+        with pytest.raises(QuotaExceeded) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert raised.value.reset_at is not None
+        reset = datetime.fromtimestamp(raised.value.reset_at, ZoneInfo("America/Los_Angeles"))
+        assert reset.hour == 0 and reset.minute == 0 and reset.second == 0
+        assert reset.timestamp() > now
+
+    async def test_minute_quota_failure_is_transient_and_uses_retry_info(self):
+        adapter, _ = self._adapter(
+            {
+                ("GET", f"/models/{GEMINI_MODEL}"): (200, _metadata()),
+                ("POST", ":generateContent"): (
+                    429,
+                    {
+                        "error": {
+                            "code": 429,
+                            "status": "RESOURCE_EXHAUSTED",
+                            "details": [
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                                    "violations": [
+                                        {
+                                            "quotaId": (
+                                                "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+                                            )
+                                        }
+                                    ],
+                                },
+                                {
+                                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                    "retryDelay": "12.5s",
+                                },
+                            ],
+                        }
+                    },
+                ),
+            }
+        )
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert raised.value.retry_after == 12.5
+
+    async def test_modern_quota_exceeded_code_is_treated_as_daily(self):
+        adapter, _ = self._adapter(
+            {
+                ("GET", f"/models/{GEMINI_MODEL}"): (200, _metadata()),
+                ("POST", ":generateContent"): (
+                    429,
+                    {"error": {"code": "quota_exceeded", "message": "daily quota"}},
+                ),
+            }
+        )
+        with pytest.raises(QuotaExceeded):
+            await adapter.complete(_request(GEMINI_MODEL))
 
     async def test_a_truncated_answer_reports_length(self):
         adapter, _ = self._adapter(
