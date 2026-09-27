@@ -9,7 +9,7 @@ from fair.config import RoutingSettings
 from fair.embedded import FAIR, module
 from fair.embedded.module import _CLOUD_PROVIDERS
 from fair.embedded.performance import MemoryPerformanceRegistry
-from fair.embedded.quota import MemoryQuotaGovernor
+from fair.embedded.quota import MemoryQuotaGovernor, SharedQuotaLedger
 from fair.embedded.router import EmbeddedRouter
 from fair.providers.base import (
     AuthenticationFailed,
@@ -192,6 +192,124 @@ class TestMemoryQuota:
         now = 1011.0
         assert gov.available(spec)
         assert gov.remaining(spec) == 100
+
+
+# ── SharedQuotaLedger ────────────────────────────────────────────────────
+
+
+class TestSharedQuotaLedger:
+    def _governor(self, path, application_id, *, clock=None, quota_pool_ids=None):
+        kwargs = {}
+        if clock is not None:
+            kwargs["clock"] = clock
+        return MemoryQuotaGovernor(
+            RoutingSettings(),
+            shared_ledger=SharedQuotaLedger(path),
+            application_id=application_id,
+            quota_pool_ids=quota_pool_ids,
+            **kwargs,
+        )
+
+    def test_two_apps_share_one_account_limit(self, tmp_path):
+        path = tmp_path / "quota.sqlite3"
+        spec = _spec(request_limit=2)
+        corp = self._governor(path, "corp")
+        video = self._governor(path, "video")
+
+        assert corp.reserve(spec)
+        assert video.reserve(spec)
+        assert not corp.reserve(spec)
+        assert corp.remaining(spec) == 0
+        assert video.remaining(spec) == 0
+
+        report = corp.usage_report([spec])
+        assert report["shared"] is True
+        assert report["application_id"] == "corp"
+        assert report["provider_pools"] == {"a": "a"}
+        assert report["pools"][0]["used"] == 2
+        assert report["pools"][0]["remaining"] == 0
+        assert report["pools"][0]["applications"] == {"corp": 1, "video": 1}
+
+    def test_separate_account_pool_ids_do_not_share_allowance(self, tmp_path):
+        path = tmp_path / "quota.sqlite3"
+        spec = _spec(request_limit=1)
+        account_one = self._governor(path, "corp", quota_pool_ids={"a": "account-one"})
+        account_two = self._governor(path, "video", quota_pool_ids={"a": "account-two"})
+
+        assert account_one.reserve(spec)
+        assert not account_one.reserve(spec)
+        assert account_two.reserve(spec)
+        assert account_one.pool_id("a") == "account-one"
+        assert account_two.pool_id("a") == "account-two"
+
+    def test_security_block_is_local_to_the_key_not_shared(self, tmp_path):
+        path = tmp_path / "quota.sqlite3"
+        spec = _spec(request_limit=5)
+        corp = self._governor(path, "corp")
+        video = self._governor(path, "video")
+
+        corp.block_security("a")
+        assert not corp.available(spec)
+        assert video.available(spec)
+
+    def test_shared_reset_clears_usage_for_all_apps(self, tmp_path):
+        path = tmp_path / "quota.sqlite3"
+        now = [datetime(2026, 9, 27, 12, tzinfo=UTC).timestamp()]
+        spec = _spec(request_limit=2, request_limit_window="DAILY_UTC")
+        corp = self._governor(path, "corp", clock=lambda: now[0])
+        video = self._governor(path, "video", clock=lambda: now[0])
+
+        assert corp.reserve(spec)
+        now[0] += 2 * 86400
+        assert video.available(spec)
+        assert video.remaining(spec) == 2
+        pool = video.usage_report([spec])["pools"][0]
+        assert pool["used"] == 0
+        assert pool["applications"] == {}
+
+    def test_known_exhaustion_propagates_across_apps(self, tmp_path):
+        path = tmp_path / "quota.sqlite3"
+        now = [1000.0]
+        spec = _spec(request_limit=5)
+        corp = self._governor(path, "corp", clock=lambda: now[0])
+        video = self._governor(path, "video", clock=lambda: now[0])
+
+        corp.exhaust(spec, reset_at=1100.0)
+        assert not video.available(spec)
+        assert video.effective_status(spec) == "QUOTA_EXHAUSTED"
+        now[0] = 1101.0
+        assert video.available(spec)
+
+    def test_provider_observation_updates_the_shared_pool(self, tmp_path):
+        path = tmp_path / "quota.sqlite3"
+        now = [1000.0]
+        spec = _spec(request_limit=5)
+        corp = self._governor(path, "corp", clock=lambda: now[0])
+        video = self._governor(path, "video", clock=lambda: now[0])
+
+        corp.observe(
+            spec,
+            QuotaSnapshot(
+                provider_id="a",
+                quota_limit=5,
+                quota_remaining_estimate=0,
+                reset_at=1100.0,
+            ),
+        )
+        assert not video.available(spec)
+        assert video.remaining(spec) == 0
+
+    def test_zero_remaining_without_reset_is_not_persisted_forever(self, tmp_path):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        ledger.observe("a", 5, 0, None, 1000.0)
+        assert ledger.available("a", None, 1001.0)
+        pool = ledger.report(["a"], 1001.0)[0]
+        assert pool["used"] == 5
+        assert pool["exhausted"] is False
+
+    def test_invalid_application_identity_fails_closed(self, tmp_path):
+        with pytest.raises(ValueError, match="application id"):
+            self._governor(tmp_path / "quota.sqlite3", "")
 
 
 # ── MemoryPerformanceRegistry ────────────────────────────────────────────
@@ -675,6 +793,28 @@ class TestFAIRModule:
         assert len(fair.providers()) == 1
         assert fair.providers()[0]["provider_id"] == "a"
 
+    def test_shared_quota_configuration_is_exposed(self, tmp_path):
+        spec = _spec(request_limit=2)
+        fair = FAIR(
+            providers=[(spec, MockAdapter("a"))],
+            application_id="corp",
+            shared_quota_path=str(tmp_path / "quota.sqlite3"),
+        )
+        provider = fair.providers()[0]
+        assert provider["quota_pool_id"] == "a"
+        assert provider["quota_remaining"] == 2
+        usage = fair.quota_usage()
+        assert usage["shared"] is True
+        assert usage["application_id"] == "corp"
+
+    def test_unknown_quota_pool_provider_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="Unknown quota_pool_ids provider"):
+            FAIR(
+                providers=[(_spec(), MockAdapter("a"))],
+                shared_quota_path=str(tmp_path / "quota.sqlite3"),
+                quota_pool_ids={"missing": "account"},
+            )
+
     @pytest.mark.asyncio
     async def test_solve_with_mock(self):
         spec = _spec()
@@ -886,6 +1026,11 @@ class TestOpenRouterReviewedModels:
         assert "structured_output" in models["nex-agi/nex-n2.5-mini:free"].capabilities
         assert "structured_output" not in models["cohere/north-mini-code:free"].capabilities
         assert all(model_id.endswith(":free") for model_id in models)
+
+    def test_openrouter_free_account_daily_limit_is_locally_guarded(self):
+        provider = _CLOUD_PROVIDERS["openrouter_free"]
+        assert provider["request_limit"] == 50
+        assert provider["request_limit_window"] == "DAILY_UTC"
 
 
 class TestExpiredProviderReview:

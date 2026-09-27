@@ -12,6 +12,7 @@ import httpx
 from pydantic import SecretStr
 
 from fair.config import RoutingSettings
+from fair.embedded.quota import SharedQuotaLedger
 from fair.embedded.router import EmbeddedRouter
 from fair.governor.policy import AdmissionDenied
 from fair.providers.base import AuthenticationFailed, ProviderAdapter
@@ -170,6 +171,11 @@ _CLOUD_PROVIDERS = {
         "env": "OPENROUTER_API_KEY",
         "adapter": OpenRouterFreeAdapter,
         "access_class": "FREE_DYNAMIC",
+        # OpenRouter's free account currently allows 50 requests/day. FAIR
+        # counts attempts locally too so several apps can share that allowance
+        # when they point at one SharedQuotaLedger.
+        "request_limit": 50,
+        "request_limit_window": "DAILY_UTC",
         "models": _text_models(
             # Reviewed against OpenRouter on 2026-09-27. Nemotron 3 Ultra is
             # the primary long-context reasoning/agent model but its free
@@ -318,6 +324,9 @@ class FAIR:
         cache_max_entries: int = 1000,
         cross_check_required: bool = False,
         source_reviews: list[dict] | str | None = None,
+        application_id: str | None = None,
+        shared_quota_path: str | None = None,
+        quota_pool_ids: dict[str, str] | None = None,
         on_event: Callable[[str, dict], None] | None = None,
     ):
         self._registry = Registry()
@@ -329,6 +338,8 @@ class FAIR:
         env = dict(os.environ)
         if env_file:
             env = _read_env_file(env_file) | env
+        application_id = application_id or env.get("FAIR_APPLICATION_ID") or "embedded"
+        shared_quota_path = shared_quota_path or env.get("FAIR_SHARED_QUOTA_PATH")
         given = {
             "gemini_api_key": gemini_api_key,
             "groq_api_key": groq_api_key,
@@ -399,6 +410,13 @@ class FAIR:
             for spec, adapter in providers:
                 self._registry.register(spec, adapter)
 
+        quota_pool_ids = dict(quota_pool_ids or {})
+        unknown_quota_pools = set(quota_pool_ids) - set(self._registry.providers)
+        if unknown_quota_pools:
+            names = ", ".join(sorted(unknown_quota_pools))
+            raise ValueError(f"Unknown quota_pool_ids provider(s): {names}")
+        quota_ledger = SharedQuotaLedger(shared_quota_path) if shared_quota_path else None
+
         if not self._registry.adapters:
             raise ValueError(
                 "FAIR requires at least one safely eligible provider. "
@@ -431,6 +449,9 @@ class FAIR:
             dict(DEFAULT_THRESHOLDS),
             on_event=on_event,
             source_reviews=reviews,
+            quota_ledger=quota_ledger,
+            application_id=application_id,
+            quota_pool_ids=quota_pool_ids,
         )
 
     def _register_cloud(self, provider_id, entry, api_key, settings, extra):
@@ -570,9 +591,15 @@ class FAIR:
                 "status": self._router.quota.effective_status(p),
                 "access_class": p.access_class,
                 "models": [m.model_id for m in p.models],
+                "quota_pool_id": self._router.quota.pool_id(p.provider_id),
+                "quota_remaining": self._router.quota.remaining(p),
             }
             for p in self._registry.providers.values()
         ]
+
+    def quota_usage(self) -> dict:
+        """Return secret-free shared quota usage grouped by application."""
+        return self._router.quota.usage_report(self._registry.providers.values())
 
     def clear_cache(self, client_id: str = "embedded") -> dict:
         return self._router.cache.clear(client_id)

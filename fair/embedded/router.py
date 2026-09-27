@@ -1,4 +1,4 @@
-"""In-memory router — same solve flow as fair.router.orchestrator, zero SQL."""
+"""Embedded FAIR router with optional shared quota accounting."""
 
 import asyncio
 from time import monotonic
@@ -42,14 +42,30 @@ def _failure_detail(error):
 
 
 class EmbeddedRouter:
-    def __init__(self, registry, settings, thresholds, *, on_event=None, source_reviews=None):
+    def __init__(
+        self,
+        registry,
+        settings,
+        thresholds,
+        *,
+        on_event=None,
+        source_reviews=None,
+        quota_ledger=None,
+        application_id="embedded",
+        quota_pool_ids=None,
+    ):
         self.registry = registry
         self.settings = settings
         self.thresholds = validate_thresholds(thresholds)
         self.on_event = on_event
         self.source_reviews = source_reviews
         self.stopped = False
-        self.quota = MemoryQuotaGovernor(settings)
+        self.quota = MemoryQuotaGovernor(
+            settings,
+            shared_ledger=quota_ledger,
+            application_id=application_id,
+            quota_pool_ids=quota_pool_ids,
+        )
         self.performance = MemoryPerformanceRegistry(settings)
         self.selector = MemorySelector(registry, self.quota, settings, self.performance)
         self.cache = MemoryCache(self)
@@ -117,7 +133,7 @@ class EmbeddedRouter:
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
             error_detail = _failure_detail(error)
         except QuotaExceeded as error:
-            self.quota.exhaust(spec.provider_id, reset_at=error.reset_at)
+            self.quota.exhaust(spec, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
             error_detail = _failure_detail(error)
         except RateLimited as error:
