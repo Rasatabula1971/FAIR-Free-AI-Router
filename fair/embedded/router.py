@@ -91,7 +91,7 @@ class EmbeddedRouter:
     async def _attempt(self, request_id, request, profile, route, number, role):
         score, spec, model = route
         remaining = self.quota.remaining(spec)
-        if not self.quota.reserve(spec):
+        if not self.quota.reserve(spec, request.client_id):
             return None, None, False
         start = monotonic()
         quality = response = error_type = error_detail = None
