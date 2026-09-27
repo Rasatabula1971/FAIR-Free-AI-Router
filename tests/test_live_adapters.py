@@ -8,7 +8,13 @@ import pytest
 from pydantic import SecretStr
 
 from fair.embedded.module import _CLOUD_PROVIDERS, FAIR, _loopback
-from fair.providers.base import AccessDenied, AuthenticationFailed, BillingViolation, QuotaExceeded
+from fair.providers.base import (
+    AccessDenied,
+    AuthenticationFailed,
+    BillingViolation,
+    QuotaExceeded,
+    RateLimited,
+)
 from fair.providers.live import (
     CloudflareWorkersAiAdapter,
     GroqAdapter,
@@ -530,19 +536,22 @@ class TestCloudflare:
         )
         return adapter, seen
 
-    async def test_catalog_and_neuron_metering(self):
+    async def test_completion_does_not_require_undocumented_neuron_usage(self):
         adapter, seen = self._adapter(
             {
                 ("GET", "/ai/models/search"): (200, self._catalog()),
                 ("POST", "/chat/completions"): (
                     200,
-                    _completion(self.MODEL, usage={"neurons": 2.5}),
+                    _completion(
+                        self.MODEL,
+                        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    ),
                 ),
             }
         )
         response = await adapter.complete(_request(self.MODEL))
-        assert response.quota.quota_limit == 10_000
-        assert response.quota.quota_remaining_estimate == 9_997
+        assert response.quota.quota_limit is None
+        assert response.quota.quota_remaining_estimate is None
         assert str(seen[0].url).startswith(
             f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/ai/models/search"
         )
@@ -551,33 +560,47 @@ class TestCloudflare:
             == f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT}/ai/v1/chat/completions"
         )
 
-    async def test_missing_neurons_is_a_billing_violation(self):
+    async def test_daily_free_allocation_error_exhausts_until_utc_reset(self):
+        now = datetime.now(UTC).timestamp()
+        expected_reset = (int(now // 86400) + 1) * 86400
         adapter, _ = self._adapter(
             {
                 ("GET", "/ai/models/search"): (200, self._catalog()),
                 ("POST", "/chat/completions"): (
-                    200,
-                    _completion(self.MODEL, usage={"prompt_tokens": 1}),
+                    429,
+                    {
+                        "success": False,
+                        "errors": [{"code": 3036, "message": "daily allocation spent"}],
+                    },
                 ),
-            }
+            },
+            clock=lambda: now,
         )
-        with pytest.raises(BillingViolation):
+        with pytest.raises(QuotaExceeded) as raised:
             await adapter.complete(_request(self.MODEL))
+        assert raised.value.reset_at == expected_reset
+        quota = await adapter.quota()
+        assert quota.quota_limit == 10_000
+        assert quota.quota_remaining_estimate == 0
+        assert quota.reset_at == expected_reset
 
-    async def test_daily_allocation_stops_dispatch(self):
-        adapter, seen = self._adapter(
+    async def test_out_of_capacity_429_is_transient_not_daily_exhaustion(self):
+        adapter, _ = self._adapter(
             {
                 ("GET", "/ai/models/search"): (200, self._catalog()),
                 ("POST", "/chat/completions"): (
-                    200,
-                    _completion(self.MODEL, usage={"neurons": 10_000}),
+                    429,
+                    {
+                        "success": False,
+                        "errors": [{"code": 3040, "message": "capacity exceeded"}],
+                    },
                 ),
             }
         )
-        await adapter.complete(_request(self.MODEL))
-        with pytest.raises(QuotaExceeded):
+        with pytest.raises(RateLimited):
             await adapter.complete(_request(self.MODEL))
-        assert sum(r.method == "POST" for r in seen) == 1
+        quota = await adapter.quota()
+        assert quota.quota_remaining_estimate is None
 
     async def test_small_context_model_is_dropped(self):
         adapter, _ = self._adapter(

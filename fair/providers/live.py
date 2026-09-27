@@ -134,6 +134,7 @@ class TextAdapter:
     extra_payload: dict[str, object] = {}
     credential_header = "Authorization"
     credential_prefix = "Bearer "
+    inspect_error_body = False
 
     _catalog_ttl = 60
 
@@ -217,6 +218,10 @@ class TextAdapter:
             # (503)", "bad request (400)" and "gone (404)" in the attempt log.
             raise ProviderUnavailable(f"HTTP_{status}")
 
+    def _error_from_body(self, status, headers, data):
+        """Provider-specific structured error hook; must raise for non-200 responses."""
+        self._error(status, headers)
+
     async def _json(self, method, path, payload=None):
         self._admit()
         headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
@@ -227,7 +232,8 @@ class TextAdapter:
         url = path if path.startswith("https://") else self.base_url + path
         try:
             async with self._client.stream(method, url, headers=headers, json=payload) as response:
-                self._error(response.status_code, response.headers)
+                if response.status_code != 200 and not self.inspect_error_body:
+                    self._error(response.status_code, response.headers)
                 if response.headers.get("content-encoding", "identity") != "identity":
                     raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
                 chunks, size = [], 0
@@ -239,6 +245,9 @@ class TextAdapter:
                 value = strict_json(b"".join(chunks).decode("utf-8"))
                 if not isinstance(value, dict):
                     raise ValueError()
+                if response.status_code != 200:
+                    self._error_from_body(response.status_code, response.headers, value)
+                    raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                 if "error" in value or value.get("success") is False:
                     error = value.get("error")
                     self._error(
@@ -535,14 +544,20 @@ class OllamaCloudAdapter(TextAdapter):
 
 
 class CloudflareWorkersAiAdapter(TextAdapter):
-    """Workers AI is free only inside the daily neuron allocation, which the adapter meters itself."""
+    """Workers AI on an operator-confirmed Workers Free account.
+
+    Cloudflare does not document per-response neuron usage on the OpenAI-compatible
+    endpoint. Free-plan safety therefore relies on Cloudflare's documented hard
+    10,000-neuron/day allocation: code 3036 means the allocation is exhausted and
+    further free-plan requests fail until 00:00 UTC.
+    """
 
     expected_provider = "cloudflare_workers_ai"
     expected_access = "FREE_RECURRING"
     catalog_key = "result"
     catalog_id_key = "name"
     context_field = "context_window"
-    daily_neurons = 10_000
+    inspect_error_body = True
 
     def __init__(self, spec, settings, account_id, **kwargs):
         if not isinstance(account_id, str) or not re.fullmatch(r"[0-9a-f]{32}", account_id):
@@ -552,8 +567,6 @@ class CloudflareWorkersAiAdapter(TextAdapter):
             f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
             "/ai/models/search?task=Text%20Generation&per_page=100"
         )
-        self._neurons_used = 0.0
-        self._neuron_day = None
         super().__init__(spec, settings, **kwargs)
 
     def _catalog_context(self, entry):
@@ -568,34 +581,37 @@ class CloudflareWorkersAiAdapter(TextAdapter):
                     return None
         return None
 
-    def _day(self):
-        return int(self.clock() // SECONDS_IN_DAY)
-
     def _reset_at(self):
-        return (self._day() + 1) * SECONDS_IN_DAY
+        return (int(self.clock() // SECONDS_IN_DAY) + 1) * SECONDS_IN_DAY
 
-    def _observe(self, headers):
-        if self._neuron_day != self._day():
-            self._neuron_day, self._neurons_used = self._day(), 0.0
-        remaining = max(self.daily_neurons - self._neurons_used, 0)
-        return QuotaSnapshot(
-            provider_id=self.provider_id,
-            quota_limit=self.daily_neurons,
-            quota_remaining_estimate=int(remaining),
-            reset_at=self._reset_at(),
-        )
+    @staticmethod
+    def _cloudflare_error_code(data):
+        error = data.get("error")
+        if isinstance(error, dict) and type(error.get("code")) is int:
+            return error["code"]
+        errors = data.get("errors")
+        if isinstance(errors, list):
+            for item in errors:
+                if isinstance(item, dict) and type(item.get("code")) is int:
+                    return item["code"]
+        return None
 
-    async def _before_completion(self, payload):
-        if self._observe({}).quota_remaining_estimate <= 0:
+    def _error_from_body(self, status, headers, data):
+        code = self._cloudflare_error_code(data)
+        if status == 429 and code == 3036:
+            self._quota = QuotaSnapshot(
+                provider_id=self.provider_id,
+                quota_limit=10_000,
+                quota_remaining_estimate=0,
+                reset_at=self._reset_at(),
+            )
             raise QuotaExceeded("DAILY_NEURON_ALLOCATION_SPENT", reset_at=self._reset_at())
-
-    def _after_completion(self, data):
-        usage = data.get("usage")
-        neurons = usage.get("neurons") if isinstance(usage, dict) else None
-        if isinstance(neurons, bool) or not isinstance(neurons, (int, float)) or neurons < 0:
-            raise BillingViolation("NEURON_USAGE_NOT_REPORTED")
-        self._neurons_used += neurons
-        self._quota = self._observe({})
+        if status == 429 and code == 3040:
+            raise RateLimited(
+                "RATE_LIMITED",
+                retry_after=retry_seconds(headers.get("retry-after"), self.clock()),
+            )
+        self._error(status, headers)
 
 
 class GeminiAdapter(TextAdapter):

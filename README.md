@@ -75,7 +75,7 @@ print(result.output)  # "345"
 | Google Gemini | `GEMINI_API_KEY` | Free recurring | `gemini-3.5-flash-lite`, `gemini-3.6-flash` |
 | Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
 | Mistral | `MISTRAL_API_KEY` | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
-| Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Free recurring (10k neurons/day, metered) | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
+| Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Workers Free only; Cloudflare hard-stops at 10k neurons/day | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
 | OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, `data_collection=deny`, 50 requests/day on a free account) | `nemotron-3-ultra-550b-a55b`†, `nex-n2.5-mini`, `north-mini-code`† |
 | Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
 | Z.ai | `ZAI_API_KEY` | Free dynamic (flash models) | `glm-4.5-flash`, `glm-4.7-flash` |
@@ -119,7 +119,12 @@ still on a free tier. For providers such as Gemini, Groq, Mistral, Z.ai, and Clo
 Workers AI, explicitly attest the account is currently free-only with
 `confirmed_free_providers={...}`. This is an operator assertion that the account/provider
 configuration cannot auto-bill or otherwise incur paid API usage; do not set it merely
-because the provider offers a free tier. OpenRouter Free and Kilo Free are auto-confirmed
+because the provider offers a free tier. For Cloudflare specifically, only attest
+`cloudflare_workers_ai` when the account is on **Workers Free**. Cloudflare documents that
+Workers Free stops further inference at the 10,000-neuron daily allocation (error 3036);
+FAIR treats that error as quota exhaustion until 00:00 UTC. It does not infer neuron usage
+from the OpenAI-compatible response because Cloudflare does not document a per-response
+neuron field there. OpenRouter Free and Kilo Free are auto-confirmed
 because their adapters enforce zero-priced `:free` models and reject non-zero observed cost at
 runtime. Built-in cloud-provider reviews are date-pinned: the evidence expires 29 days
 after its review date, and qualification separately refuses any review older than 30 days.
