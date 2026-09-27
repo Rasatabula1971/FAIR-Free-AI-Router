@@ -118,8 +118,9 @@ For Mistral, `MISTRAL_ADMIN_API_KEY` is optional but recommended. Mistral's norm
 inference API reports ordinary rate limits, while its Admin API exposes whether the
 Organization's monthly completion limit has been reached. When the admin key is configured,
 FAIR checks that status after a Mistral quota/rate-limit failure; a confirmed monthly limit
-parks Mistral until the first day of the next month instead of retrying it every few minutes.
-Without the admin key, FAIR never guesses that a generic 429 is monthly exhaustion.
+uses the Admin API billing-period `end_date` as the reset time. If that exact period end is
+temporarily unavailable, FAIR waits six hours and checks again rather than guessing a month
+boundary. Without the admin key, FAIR never guesses that a generic 429 is monthly exhaustion.
 
 FAIR does not treat possession of an API key as proof that a recurring provider account is
 still on a free tier. For providers such as Gemini, Groq, Mistral, Z.ai, and Cloudflare
