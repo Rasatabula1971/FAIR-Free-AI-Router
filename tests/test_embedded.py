@@ -910,8 +910,26 @@ class TestEmbeddedRouter:
 
     @pytest.mark.asyncio
     async def test_cross_check_accepts_equivalent_fenced_json_documents(self):
-        spec_a = _spec("a", models=[{"model_id": "m1", "context_window": 32768}])
-        spec_b = _spec("b", models=[{"model_id": "m2", "context_window": 32768}])
+        spec_a = _spec(
+            "a",
+            models=[
+                {
+                    "model_id": "m1",
+                    "context_window": 32768,
+                    "capabilities": {"structured_output"},
+                }
+            ],
+        )
+        spec_b = _spec(
+            "b",
+            models=[
+                {
+                    "model_id": "m2",
+                    "context_window": 32768,
+                    "capabilities": {"structured_output"},
+                }
+            ],
+        )
         router = _router(
             entries=[
                 (spec_a, MockAdapter("a", text='```json\n{"answer": 345}\n```')),
