@@ -334,6 +334,7 @@ class MemoryQuotaGovernor:
         state = self._state(spec.provider_id)
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
             return False
+        probing = self._claim_probe(state)
         if self.shared_ledger is not None:
             if not self._ledger(
                 self.shared_ledger.reserve,
@@ -344,6 +345,8 @@ class MemoryQuotaGovernor:
                 self.clock(),
                 failed=False,
             ):
+                if probing:
+                    self._release_probe(state)
                 return False
             state.used += 1
         else:
@@ -354,15 +357,15 @@ class MemoryQuotaGovernor:
                 and spec.request_limit_window is not None
             ):
                 state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
-        if state.circuit_state == "OPEN":
-            state.circuit_state = "HALF_OPEN"
-            state.probe_until = self.clock() + self.settings.timeout_seconds + 5
         return True
 
     async def reserve_async(self, spec, application_id=None):
         state = self._state(spec.provider_id)
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
             return False
+        # Claim the half-open slot before awaiting SQLite. Otherwise several
+        # concurrent coroutines can all observe OPEN and dispatch probe calls.
+        probing = self._claim_probe(state)
         if self.shared_ledger is not None:
             if not await self._ledger_async(
                 self.shared_ledger.reserve,
@@ -373,6 +376,8 @@ class MemoryQuotaGovernor:
                 self.clock(),
                 failed=False,
             ):
+                if probing:
+                    self._release_probe(state)
                 return False
             state.used += 1
         else:
@@ -383,10 +388,19 @@ class MemoryQuotaGovernor:
                 and spec.request_limit_window is not None
             ):
                 state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
-        if state.circuit_state == "OPEN":
-            state.circuit_state = "HALF_OPEN"
-            state.probe_until = self.clock() + self.settings.timeout_seconds + 5
         return True
+
+    def _claim_probe(self, state):
+        if state.circuit_state != "OPEN":
+            return False
+        state.circuit_state = "HALF_OPEN"
+        state.probe_until = self.clock() + self.settings.timeout_seconds + 5
+        return True
+
+    def _release_probe(self, state):
+        if state.circuit_state == "HALF_OPEN":
+            state.circuit_state = "OPEN"
+            state.probe_until = 0
 
     def _open(self, state):
         state.circuit_state = "OPEN"
