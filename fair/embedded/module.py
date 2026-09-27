@@ -32,7 +32,7 @@ from fair.providers.registry import Registry
 from fair.quality.source_reviews import SourceReviewRegistry
 from fair.quality.thresholds import DEFAULT_THRESHOLDS
 from fair.schemas.api import SolveRequest, SolveResponse
-from fair.schemas.domain import ModelDescriptor, PrivacyClass, ProviderSpec
+from fair.schemas.domain import Capability, ModelDescriptor, PrivacyClass, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
 from fair.security.credentials import CredentialConfigurationError
@@ -528,7 +528,7 @@ class FAIR:
         task_type: str | None = None,
         quality_level: str | None = None,
         privacy_class: PrivacyClass = "PUBLIC",
-        required_capabilities: set[str] | None = None,
+        required_capabilities: set[Capability] | None = None,
         freshness_required: bool = False,
         expected_schema: dict | None = None,
         validation: dict | None = None,
