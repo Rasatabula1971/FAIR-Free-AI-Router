@@ -191,6 +191,8 @@ def create_app(
         len(admin_key) < 24 or admin_key.startswith("replace-with")
     ):
         raise ValueError("FAIR_SERVICE_ADMIN_KEY must be a non-placeholder key of 24+ characters")
+    if admin_key is not None and admin_key in client_keys.values():
+        raise ValueError("FAIR_SERVICE_ADMIN_KEY must be distinct from every client key")
     resolve_client = _client_resolver(client_keys)
     resolve_admin = _admin_resolver(admin_key)
 
@@ -211,18 +213,24 @@ def create_app(
     async def health():
         listed = await fair.providers_async()
         admissible = sum(provider["status"] != "REVIEW_EXPIRED" for provider in listed)
+        routable = sum(
+            provider["status"] in {"ACTIVE", "QUOTA_PRESSURE"} for provider in listed
+        )
         payload = {
             "status": (
                 "stopped"
                 if fair.stopped
                 else "no_admissible_providers"
                 if not admissible
+                else "no_routable_providers"
+                if not routable
                 else "ok"
             ),
             "providers": len(listed),
             "admissible_providers": admissible,
+            "routable_providers": routable,
         }
-        if fair.stopped or not admissible:
+        if fair.stopped or not routable:
             return JSONResponse(status_code=503, content=payload)
         return payload
 
@@ -253,7 +261,7 @@ def create_app(
     @app.post("/v1/fair/admin/providers/{provider_id}/resume")
     async def resume_provider(provider_id: str, _admin: bool = Depends(resolve_admin)):
         try:
-            return fair.resume_provider(provider_id)
+            return await fair.resume_provider_async(provider_id)
         except ValueError as error:
             raise HTTPException(status_code=404, detail="Unknown provider") from error
 
