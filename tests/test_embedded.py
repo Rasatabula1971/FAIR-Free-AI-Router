@@ -372,6 +372,90 @@ class TestSharedQuotaLedger:
         assert report["ledger_available"] is False
         assert report["pools"] == []
 
+    @pytest.mark.asyncio
+    async def test_async_shared_ledger_paths_are_nonblocking_and_consistent(self, tmp_path):
+        now = [1000.0]
+        spec = _spec(request_limit=2)
+        gov = MemoryQuotaGovernor(
+            RoutingSettings(),
+            clock=lambda: now[0],
+            shared_ledger=SharedQuotaLedger(tmp_path / "quota.sqlite3"),
+            application_id="corp",
+        )
+
+        assert await gov.available_async(spec)
+        assert await gov.remaining_async(spec) == 2
+        assert await gov.reserve_async(spec, "corp")
+        assert await gov.remaining_async(spec) == 1
+
+        await gov.observe_async(
+            spec,
+            QuotaSnapshot(
+                provider_id="a",
+                quota_limit=2,
+                quota_remaining_estimate=1,
+                reset_at=1100.0,
+            ),
+        )
+        assert await gov.effective_status_async(spec) == "ACTIVE"
+
+        report = await gov.usage_report_async([spec])
+        assert report["ledger_available"] is True
+        assert report["pools"][0]["applications"] == {"corp": 1}
+
+        await gov.exhaust_async(spec, reset_at=1100.0)
+        assert await gov.effective_status_async(spec) == "QUOTA_EXHAUSTED"
+        now[0] = 1101.0
+        assert await gov.available_async(spec)
+
+    @pytest.mark.asyncio
+    async def test_async_locked_ledger_fails_closed_without_exception(self):
+        import sqlite3
+
+        class BrokenLedger:
+            path = "broken.sqlite3"
+
+            def available(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+            def remaining(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+            def reserve(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+            def observe(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+            def exhaust(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+            def report(self, *args):
+                raise sqlite3.OperationalError("database is locked")
+
+        spec = _spec(request_limit=5)
+        gov = MemoryQuotaGovernor(
+            RoutingSettings(),
+            shared_ledger=BrokenLedger(),
+            application_id="corp",
+        )
+
+        assert await gov.available_async(spec) is False
+        assert await gov.remaining_async(spec) == 0
+        assert await gov.reserve_async(spec, "corp") is False
+        await gov.observe_async(
+            spec,
+            QuotaSnapshot(
+                provider_id="a",
+                quota_limit=5,
+                quota_remaining_estimate=4,
+            ),
+        )
+        await gov.exhaust_async(spec, reset_at=1100.0)
+        report = await gov.usage_report_async([spec])
+        assert report["ledger_available"] is False
+        assert report["pools"] == []
+
     def test_invalid_application_identity_fails_closed(self, tmp_path):
         with pytest.raises(ValueError, match="application id"):
             self._governor(tmp_path / "quota.sqlite3", "")
