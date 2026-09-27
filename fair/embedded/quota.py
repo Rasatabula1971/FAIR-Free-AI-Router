@@ -259,11 +259,7 @@ class MemoryQuotaGovernor:
             and not state.security_blocked
             and state.circuit_state != "HALF_OPEN"
             and self.clock() >= state.blocked_until
-            and (
-                not include_limit
-                or spec.request_limit is None
-                or state.used < spec.request_limit
-            )
+            and (not include_limit or spec.request_limit is None or state.used < spec.request_limit)
         )
 
     def available(self, spec):
@@ -363,9 +359,7 @@ class MemoryQuotaGovernor:
             shared_reset = reset_at
             if shared_reset is None and spec.request_limit_window is not None:
                 shared_reset = next_window_reset(spec.request_limit_window, self.clock())
-            self.shared_ledger.exhaust(
-                self.pool_id(provider_id), shared_reset, self.clock()
-            )
+            self.shared_ledger.exhaust(self.pool_id(provider_id), shared_reset, self.clock())
 
     def block_security(self, provider_id):
         self._state(provider_id).security_blocked = True
