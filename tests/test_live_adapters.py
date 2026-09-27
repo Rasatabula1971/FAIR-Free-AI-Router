@@ -605,13 +605,16 @@ class TestZai:
         assert json.loads(seen[0].content)["thinking"] == {"type": "disabled"}
 
     async def test_true_rate_limit_uses_retry_after(self):
+        def rate_limited(_request):
+            return httpx.Response(
+                429,
+                json={"error": {"code": 1302, "message": "rate limit reached"}},
+                headers={"retry-after": "17"},
+            )
+
         transport, _ = _transport(
             {
-                ("POST", "/chat/completions"): (
-                    429,
-                    {"error": {"code": 1302, "message": "rate limit reached"}},
-                    {"retry-after": "17"},
-                ),
+                ("POST", "/chat/completions"): rate_limited,
             }
         )
         adapter = ZaiFreeAdapter(
