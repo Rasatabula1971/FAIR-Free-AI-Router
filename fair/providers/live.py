@@ -16,12 +16,15 @@ from pydantic import Field, model_validator
 from fair.constants import SECONDS_IN_DAY
 from fair.governor.policy import admit_provider
 from fair.providers.base import (
+    AccessDenied,
     AuthenticationFailed,
     BillingViolation,
     MalformedResponse,
+    ModelUnavailable,
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
+    RequestNotSupported,
 )
 from fair.quality.json_data import strict_json
 from fair.schemas.domain import DTO, NormalizedModelResponse, ProviderHealth, QuotaSnapshot
@@ -194,7 +197,9 @@ class TextAdapter:
         return QuotaSnapshot(provider_id=self.provider_id)
 
     def _error(self, status, headers):
-        if status in {401, 403} or 300 <= status < 400:
+        if status == 403:
+            raise AccessDenied("PROVIDER_ACCESS_DENIED")
+        if status == 401 or 300 <= status < 400:
             raise AuthenticationFailed("PROVIDER_AUTHENTICATION_OR_REDIRECT_BLOCKED")
         if status == 402:
             raise QuotaExceeded("FREE_ACCESS_UNAVAILABLE")
@@ -325,11 +330,11 @@ class TextAdapter:
         models = await self.list_models()
         model = next((item for item in models if item.model_id == request.model_id), None)
         if model is None:
-            raise AuthenticationFailed("REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED")
+            raise ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED")
         if not 1 <= request.max_output_tokens <= 4096:
-            raise MalformedResponse("OUTPUT_BUDGET_INVALID")
+            raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         if len(request.task.encode()) + request.max_output_tokens > model.context_window:
-            raise MalformedResponse("CONTEXT_BUDGET_EXCEEDED")
+            raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         payload = {
             "model": model.model_id,
             "messages": [{"role": "user", "content": request.task}],
@@ -348,7 +353,7 @@ class TextAdapter:
             }
         await self._before_completion(payload)
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
-            raise MalformedResponse("CONTEXT_BUDGET_EXCEEDED")
+            raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/chat/completions", payload)
         self._after_completion(data)
         try:
@@ -455,25 +460,9 @@ class KiloFreeAdapter(TextAdapter):
             self._cost_observation = "NONZERO_OR_INVALID"
             raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
-        # Kilo documents ':free' models as zero-cost, but some live non-streaming
-        # responses omit cost_microdollars even though usage is present. Fall back
-        # only to the fresh catalog proof already obtained immediately before the
-        # request: exact response model, explicit ':free' suffix, and zero pricing.
-        response_model = data.get("model")
-        fresh_catalog = (
-            self._model_cache is not None
-            and 0 <= self.clock() - self._model_cache_at < self._catalog_ttl
-        )
-        catalog_ids = {model.model_id for model in (self._model_cache or [])}
-        if (
-            fresh_catalog
-            and isinstance(response_model, str)
-            and response_model.endswith(":free")
-            and response_model in catalog_ids
-        ):
-            self._cost_observation = "CATALOG_ZERO_PRICE_FALLBACK"
-            return
-
+        # Unknown cost is not zero cost. A zero-priced catalog entry is necessary
+        # for admission but does not substitute for a zero-cost observation on the
+        # actual completion response.
         self._cost_observation = "COST_FIELD_MISSING"
         raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
@@ -637,9 +626,9 @@ class GeminiAdapter(TextAdapter):
             (m for m in self.spec.models if m.active and m.model_id == request.model_id), None
         )
         if model is None:
-            raise AuthenticationFailed("REVIEWED_GEMINI_MODEL_REQUIRED")
+            raise ModelUnavailable("REVIEWED_GEMINI_MODEL_REQUIRED")
         if not 1 <= request.max_output_tokens <= self.settings.gemini_max_output_tokens:
-            raise MalformedResponse("OUTPUT_BUDGET_INVALID")
+            raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         payload = {
             "contents": [{"role": "user", "parts": [{"text": request.task}]}],
             "generationConfig": {
@@ -654,12 +643,12 @@ class GeminiAdapter(TextAdapter):
         # Gemini publishes separate input and output limits; the output allowance does not
         # consume the configured input capacity. Byte counting remains conservative.
         if len(json.dumps(payload).encode()) > model.context_window:
-            raise MalformedResponse("CONTEXT_BUDGET_EXCEEDED")
+            raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         metadata = await self._metadata(model)
         if metadata is None:
-            raise AuthenticationFailed("REVIEWED_GEMINI_MODEL_UNAVAILABLE_OR_CHANGED")
+            raise ModelUnavailable("REVIEWED_GEMINI_MODEL_UNAVAILABLE_OR_CHANGED")
         if request.max_output_tokens > metadata["outputTokenLimit"]:
-            raise MalformedResponse("OUTPUT_BUDGET_EXCEEDS_MODEL_LIMIT")
+            raise RequestNotSupported("OUTPUT_BUDGET_EXCEEDS_MODEL_LIMIT")
         data = await self._json("POST", "/models/" + model.model_id + ":generateContent", payload)
         try:
             candidates = data["candidates"]
@@ -753,7 +742,7 @@ class OllamaLocalAdapter(TextAdapter):
             (item for item in await self.list_models() if item.model_id == request.model_id), None
         )
         if model is None:
-            raise AuthenticationFailed("LOCAL_REVIEWED_MODEL_REQUIRED")
+            raise ModelUnavailable("LOCAL_REVIEWED_MODEL_REQUIRED")
         info = await self._json("POST", "/api/show", {"model": model.model_id})
         if (
             info.get("remote_model")
@@ -773,7 +762,7 @@ class OllamaLocalAdapter(TextAdapter):
             not 1 <= request.max_output_tokens <= 4096
             or len(request.task.encode()) + request.max_output_tokens > model.context_window
         ):
-            raise MalformedResponse("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
+            raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
         payload = {
             "model": model.model_id,
             "stream": False,
@@ -784,7 +773,7 @@ class OllamaLocalAdapter(TextAdapter):
         if request.expected_json_schema is not None:
             payload["format"] = request.expected_json_schema
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
-            raise MalformedResponse("CONTEXT_BUDGET_EXCEEDED")
+            raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/api/chat", payload)
         try:
             message = data["message"]
