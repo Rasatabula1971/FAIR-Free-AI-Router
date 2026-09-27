@@ -74,7 +74,7 @@ print(result.output)  # "345"
 | ---------- | --------- | ------------- | -------- |
 | Google Gemini | `GEMINI_API_KEY` | Free recurring | `gemini-3.5-flash-lite`, `gemini-3.6-flash` |
 | Groq | `GROQ_API_KEY` | Free recurring | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
-| Mistral | `MISTRAL_API_KEY` | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
+| Mistral | `MISTRAL_API_KEY` (+ optional `MISTRAL_ADMIN_API_KEY`) | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Workers Free only; Cloudflare hard-stops at 10k neurons/day | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
 | OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, `data_collection=deny`, 50 requests/day on a free account) | `nemotron-3-ultra-550b-a55b`†, `nex-n2.5-mini`, `north-mini-code`† |
 | Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
@@ -113,6 +113,14 @@ Local Ollama registers only when a daemon is reachable or `ollama_models` is pas
 `fair.providers()` lists what registered; `fair.skipped` maps every configured-but-unused
 provider to why. Read both before concluding a provider is broken — a provider whose key
 is absent is skipped silently and appears in neither.
+
+For Mistral, `MISTRAL_ADMIN_API_KEY` is optional but recommended. Mistral's normal
+inference API reports ordinary rate limits, while its Admin API exposes whether the
+Organization's monthly completion limit has been reached. When the admin key is configured,
+FAIR checks that status after a Mistral quota/rate-limit failure; a confirmed monthly limit
+uses the Admin API billing-period `end_date` as the reset time. If that exact period end is
+temporarily unavailable, FAIR waits six hours and checks again rather than guessing a month
+boundary. Without the admin key, FAIR never guesses that a generic 429 is monthly exhaustion.
 
 FAIR does not treat possession of an API key as proof that a recurring provider account is
 still on a free tier. For providers such as Gemini, Groq, Mistral, Z.ai, and Cloudflare

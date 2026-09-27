@@ -423,6 +423,135 @@ class TestMistral:
         )
         assert await adapter.list_models() == []
 
+    async def test_monthly_limit_reached_uses_admin_billing_period_end(self):
+        now = datetime.now(UTC)
+        period_end = now + timedelta(days=7)
+        adapter_routes = {
+            ("GET", "/models"): (
+                200,
+                {"data": [{"id": self.MODEL, "max_context_length": 262144}]},
+            ),
+            ("POST", "/chat/completions"): (
+                429,
+                {"object": "error", "type": "rate_limit_error", "message": "limit"},
+            ),
+            ("GET", "/admin/spend-limit"): (
+                200,
+                {
+                    "limits": {
+                        "completion": {"monthly_limit_reached": True},
+                        "currency": "USD",
+                    }
+                },
+            ),
+            ("GET", "/admin/usage"): (
+                200,
+                {"end_date": period_end.isoformat().replace("+00:00", "Z")},
+            ),
+        }
+        transport, seen = _transport(adapter_routes)
+        adapter = MistralAdapter(
+            _spec("mistral", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            admin_credential=SecretStr("admin-k"),
+            transport=transport,
+            clock=lambda: now.timestamp(),
+        )
+        with pytest.raises(QuotaExceeded, match="MONTHLY_USAGE_LIMIT_REACHED") as error:
+            await adapter.complete(_request(self.MODEL))
+        assert error.value.reset_at == pytest.approx(period_end.timestamp())
+        admin_request = next(
+            request for request in seen if "/admin/spend-limit" in str(request.url)
+        )
+        assert admin_request.headers["x-api-key"] == "admin-k"
+        usage_request = next(request for request in seen if "/admin/usage" in str(request.url))
+        assert usage_request.headers["x-api-key"] == "admin-k"
+        quota = await adapter.quota()
+        assert quota.quota_remaining_estimate == 0
+        assert quota.reset_at == error.value.reset_at
+
+    async def test_monthly_limit_without_period_end_uses_six_hour_recheck(self):
+        now = datetime.now(UTC).timestamp()
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "max_context_length": 262144}]},
+                ),
+                ("POST", "/chat/completions"): (
+                    429,
+                    {"object": "error", "type": "rate_limit_error", "message": "limit"},
+                ),
+                ("GET", "/admin/spend-limit"): (
+                    200,
+                    {"limits": {"completion": {"monthly_limit_reached": True}}},
+                ),
+                ("GET", "/admin/usage"): (500, {"object": "error"}),
+            }
+        )
+        adapter = MistralAdapter(
+            _spec("mistral", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            admin_credential=SecretStr("admin-k"),
+            transport=transport,
+            clock=lambda: now,
+        )
+        with pytest.raises(QuotaExceeded) as error:
+            await adapter.complete(_request(self.MODEL))
+        assert error.value.reset_at == pytest.approx(now + 6 * 60 * 60)
+
+    async def test_monthly_admin_false_preserves_transient_rate_limit(self):
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "max_context_length": 262144}]},
+                ),
+                ("POST", "/chat/completions"): (
+                    429,
+                    {"object": "error", "type": "rate_limit_error", "message": "limit"},
+                ),
+                ("GET", "/admin/spend-limit"): (
+                    200,
+                    {"limits": {"completion": {"monthly_limit_reached": False}}},
+                ),
+            }
+        )
+        adapter = MistralAdapter(
+            _spec("mistral", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            admin_credential=SecretStr("admin-k"),
+            transport=transport,
+        )
+        with pytest.raises(RateLimited):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_missing_admin_key_never_guesses_monthly_exhaustion(self):
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "max_context_length": 262144}]},
+                ),
+                ("POST", "/chat/completions"): (
+                    429,
+                    {"object": "error", "type": "rate_limit_error", "message": "limit"},
+                ),
+            }
+        )
+        adapter = MistralAdapter(
+            _spec("mistral", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(RateLimited):
+            await adapter.complete(_request(self.MODEL))
+        assert not any("/admin/spend-limit" in str(request.url) for request in seen)
+
     async def test_per_minute_quota_headers_exhaust(self):
         def chat(request):
             return httpx.Response(

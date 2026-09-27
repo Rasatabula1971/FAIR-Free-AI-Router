@@ -322,6 +322,7 @@ class FAIR:
         groq_api_key: str | None = None,
         openrouter_api_key: str | None = None,
         mistral_api_key: str | None = None,
+        mistral_admin_api_key: str | None = None,
         kilo_api_key: str | None = None,
         zai_api_key: str | None = None,
         nvidia_api_key: str | None = None,
@@ -375,6 +376,7 @@ class FAIR:
             "cloudflare_api_token": cloudflare_api_token,
         }
         cloudflare_account_id = cloudflare_account_id or env.get("CLOUDFLARE_ACCOUNT_ID")
+        mistral_admin_key = mistral_admin_api_key or env.get("MISTRAL_ADMIN_API_KEY")
         ollama_cloud_key = ollama_cloud_api_key or env.get("OLLAMA_CLOUD_API_KEY")
         if ollama_cloud_key and ollama_cloud_key.strip():
             self.skipped["ollama_cloud"] = (
@@ -408,12 +410,14 @@ class FAIR:
                     "pass confirmed_free_providers with this provider_id"
                 )
                 continue
-            extra = {}
+            extra: dict[str, object] = {}
             if provider_id == "cloudflare_workers_ai":
                 if not cloudflare_account_id:
                     self.skipped[provider_id] = "CLOUDFLARE_ACCOUNT_ID missing"
                     continue
                 extra["account_id"] = cloudflare_account_id
+            if provider_id == "mistral" and mistral_admin_key and mistral_admin_key.strip():
+                extra["admin_credential"] = SecretStr(mistral_admin_key.strip())
             try:
                 self._register_cloud(provider_id, entry, key.strip(), live_settings, extra)
             except (AdmissionDenied, AuthenticationFailed, CredentialConfigurationError) as error:
