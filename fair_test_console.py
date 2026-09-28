@@ -720,13 +720,10 @@ def main() -> int:
                 asyncio.run(show_live_providers())
                 _pause()
             elif choice == "8":
-                reset_confirmations()
-                _pause()
-            elif choice == "9":
                 print("Exiting FAIR Test Console.")
                 return 0
             else:
-                print("Please choose a number from 1 to 9.")
+                print("Please choose a number from 1 to 8.")
         except KeyboardInterrupt:
             print("\nCancelled. Returning to menu.")
 
