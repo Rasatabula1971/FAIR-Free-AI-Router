@@ -35,17 +35,18 @@ test tools if needed, and then opens an interactive menu:
 5. Test a live cross-check using exactly two selected providers
 6. Run the full pytest suite
 7. Show provider configuration and FAIR eligibility
-8. Clear this-session free-account confirmations
-9. Exit
+8. Exit
 
 Live tests read the existing `.env` file. API keys and raw provider responses are never
 printed by the console. A one-provider test constructs FAIR with only that selected
 provider, so a Gemini test cannot silently route through Kilo or OpenRouter. Cross-check
 tests similarly use only the two providers selected for that test.
 
-OpenRouter Free and Kilo Free retain FAIR's runtime zero-cost checks. Providers whose
-API keys may belong to paid/billable accounts still require an explicit free-only
-account confirmation for the current console session. Kilo tests also expose a
+OpenRouter Free and Kilo Free retain FAIR's runtime zero-cost checks. Recurring
+free-plan providers use the persistent `FAIR_CONFIRMED_FREE_PROVIDERS` value from
+`.env`; the console does not ask for repeated Y/N confirmations. A configured
+recurring provider missing from that list is skipped/fail-closed and the sweep
+continues automatically. Kilo tests also expose a
 secret-safe billing diagnostic state such as `ZERO`, `CATALOG_ZERO_PRICE_FALLBACK`,
 `COST_FIELD_MISSING`, `USAGE_MISSING`, or `NONZERO_OR_INVALID`. Kilo accepts the
 fallback only when the exact response model is still a `:free` model in FAIR's fresh
@@ -90,49 +91,43 @@ is required.
 
 ### How many providers actually come up
 
-A key alone does not register a provider. Supplying keys for all seven and nothing else
-gives you **two usable providers**, not seven:
+A key alone does not register a recurring provider. Supplying keys for all six cloud
+providers and nothing else gives you **two usable providers**:
 
 ```python
-fair = FAIR(**all_seven_keys)          # no confirmed_free_providers
-len(fair.providers())                  # 2  -> openrouter_free, kilo_free
-len(fair.skipped)                      # 5  -> each with the reason
+fair = FAIR(**all_six_cloud_keys)       # no confirmed_free_providers
+len(fair.providers())                   # 2 -> openrouter_free, kilo_free
+len(fair.skipped)                       # 4 -> recurring providers need confirmation
 
-fair = FAIR(**all_seven_keys, confirmed_free_providers={
+fair = FAIR(**all_six_cloud_keys, confirmed_free_providers={
     "google_gemini_api", "groq", "mistral", "cloudflare_workers_ai",
 })
-len(fair.providers())                  # 7, nothing skipped
+len(fair.providers())                   # 6, nothing skipped
 ```
 
 Only OpenRouter Free and Kilo Free are auto-confirmed, because their adapters prove zero
-cost on every request. The other five are recurring free-plan accounts whose API key could
-belong to a billable account, so FAIR will not use them until you assert otherwise.
+cost at runtime. The other four cloud providers are recurring free-plan accounts whose API
+key could belong to a billable account, so FAIR will not use them until the operator
+explicitly confirms them. The Windows test console reads that persistent confirmation from
+`FAIR_CONFIRMED_FREE_PROVIDERS` in `.env`.
 Local Ollama registers only when a daemon is reachable or `ollama_models` is passed.
 
 `fair.providers()` lists what registered; `fair.skipped` maps every configured-but-unused
 provider to why. Read both before concluding a provider is broken — a provider whose key
 is absent is skipped silently and appears in neither.
 
-For Mistral, `MISTRAL_ADMIN_API_KEY` is optional but recommended. Mistral's normal
-inference API reports ordinary rate limits, while its Admin API exposes whether the
-Organization's monthly completion limit has been reached. When the admin key is configured,
+For Mistral, `MISTRAL_ADMIN_API_KEY` is optional and only available to accounts with
+access to Mistral's Admin API (currently an Enterprise capability). Normal Free-mode users
+should leave it blank. Mistral's inference API still reports ordinary rate limits. When an
+eligible admin key is configured,
 FAIR checks that status after a Mistral quota/rate-limit failure; a confirmed monthly limit
 uses the Admin API billing-period `end_date` as the reset time. If that exact period end is
 temporarily unavailable, FAIR waits six hours and checks again rather than guessing a month
 boundary. Without the admin key, FAIR never guesses that a generic 429 is monthly exhaustion.
 
-For Z.ai, FAIR only admits the text models Z.ai currently lists at zero price:
-`glm-4.7-flash` and `glm-4.5-flash`. A model ending in `-flash` is not automatically
-free; for example, newer Flash models may be paid. Z.ai publishes account/model-specific
-rate limits in its console rather than one universal reset window. FAIR therefore treats
-Z.ai rate-limit code 1302 as temporary, honors `Retry-After` when supplied, and otherwise
-uses its normal cooldown before rechecking. Z.ai overload code 1305 is treated as provider
-availability, not quota. If a zero-priced model returns insufficient-balance code 1113,
-FAIR blocks Z.ai rather than risking paid fallback.
-
 FAIR does not treat possession of an API key as proof that a recurring provider account is
-still on a free tier. For providers such as Gemini, Groq, Mistral, Z.ai, and Cloudflare
-Workers AI, explicitly attest the account is currently free-only with
+still on a free tier. For providers such as Gemini, Groq, Mistral, and Cloudflare Workers AI,
+explicitly attest the account is currently free-only with
 `confirmed_free_providers={...}`. This is an operator assertion that the account/provider
 configuration cannot auto-bill or otherwise incur paid API usage; do not set it merely
 because the provider offers a free tier. For Cloudflare specifically, only attest
