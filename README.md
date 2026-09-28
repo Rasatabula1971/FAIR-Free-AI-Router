@@ -77,7 +77,7 @@ print(result.output)  # "345"
 | Mistral | `MISTRAL_API_KEY` (+ optional `MISTRAL_ADMIN_API_KEY`) | Free recurring | `ministral-8b-latest`, `ministral-3b-latest` |
 | Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` | Workers Free only; Cloudflare hard-stops at 10k neurons/day | `llama-3.3-70b`, `gpt-oss-20b`, `llama-4-scout` |
 | OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, `data_collection=deny`, 50 requests/day on a free account) | `nemotron-3-ultra-550b-a55b`†, `nex-n2.5-mini`, `north-mini-code`† |
-| Kilo | `KILO_API_KEY` | Free dynamic (`:free`, $0 priced) | `nemotron-3-super-120b`, `nex-n2.5-pro`, `laguna-s-2.1` |
+| Kilo | `KILO_API_KEY` | Free dynamic (`:free`, live $0 pricing; NVIDIA trial routes excluded) | `minimax-m3`, `minimax-m2.7`, `laguna-s-2.1` |
 | Ollama (local) | `OLLAMA_HOST` or `OLLAMA_URL` | Free local | auto-discovered from the daemon |
 
 † Nemotron 3 Ultra and North Mini Code do not accept `response_format`, so they are not
