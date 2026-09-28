@@ -217,9 +217,12 @@ _CLOUD_PROVIDERS = {
         # anonymous, to 200 requests/hour per public IP.
         "request_limit": 200,
         "request_limit_window": "HOURLY",
+        # Only recurring/dynamic zero-cost Kilo routes are reviewed here.
+        # NVIDIA's Kilo free endpoints are explicitly trial-only and therefore
+        # do not satisfy FAIR's perpetual-free policy.
         "models": _text_models(
-            ("nvidia/nemotron-3-super-120b-a12b:free", 262144),
-            ("nex-agi/nex-n2.5-pro:free", 262144),
+            ("minimax/minimax-m3:free", 1048576),
+            ("minimax/minimax-m2.7:free", 196608),
             ("poolside/laguna-s-2.1:free", 262144),
         ),
     },
