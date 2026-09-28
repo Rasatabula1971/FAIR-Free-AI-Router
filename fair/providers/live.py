@@ -450,10 +450,12 @@ class KiloFreeAdapter(TextAdapter):
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
 
-    _explicitly_temporary_ids = frozenset({
-        "poolside/laguna-s-2.1:free",
-        "stepfun/step-3.7-flash:free",
-    })
+    _explicitly_temporary_ids = frozenset(
+        {
+            "poolside/laguna-s-2.1:free",
+            "stepfun/step-3.7-flash:free",
+        }
+    )
 
     def _admit(self):
         super()._admit()
