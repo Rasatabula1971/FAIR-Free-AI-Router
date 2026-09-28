@@ -61,10 +61,29 @@ async def test_selected_live_fair_isolates_requested_provider(monkeypatch):
         await fair.close()
 
 
-def test_reset_confirmations():
+def test_persistent_free_provider_confirmation_comes_from_env(monkeypatch):
     console = _load_console()
-    console._session_confirmed.update({"groq", "google_gemini_api"})
+    values = {
+        "GROQ_API_KEY": "test-key",
+        "FAIR_CONFIRMED_FREE_PROVIDERS": "groq,google_gemini_api",
+    }
+    monkeypatch.setattr(console, "_env_value", lambda name: values.get(name))
 
-    console.reset_confirmations()
+    assert console._provider_is_confirmed(console.LIVE_PROVIDERS["4"])
+    assert console._confirmed_free_accounts() == {"groq", "google_gemini_api"}
 
-    assert console._session_confirmed == set()
+
+def test_unconfirmed_recurring_provider_fails_closed_without_prompt(monkeypatch):
+    console = _load_console()
+    values = {"GROQ_API_KEY": "test-key"}
+    monkeypatch.setattr(console, "_env_value", lambda name: values.get(name))
+
+    with pytest.raises(PermissionError, match="FAIR_CONFIRMED_FREE_PROVIDERS"):
+        console._selected_live_fair({"groq"})
+
+
+def test_zai_is_not_in_live_console_provider_matrix():
+    console = _load_console()
+    assert "zai_free" not in {
+        str(entry["provider_id"]) for entry in console.LIVE_PROVIDERS.values()
+    }
