@@ -450,6 +450,23 @@ class KiloFreeAdapter(TextAdapter):
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
 
+    _explicitly_temporary_ids = frozenset({
+        "poolside/laguna-s-2.1:free",
+        "stepfun/step-3.7-flash:free",
+    })
+
+    def _admit(self):
+        super()._admit()
+        for model in self.spec.models:
+            model_id = model.model_id.casefold()
+            if (
+                model_id.startswith("nvidia/")
+                or model_id.startswith("inclusionai/ling-3.0-flash")
+                or "preview" in model_id
+                or model_id in self._explicitly_temporary_ids
+            ):
+                raise AuthenticationFailed("KILO_TRIAL_OR_PROMOTIONAL_MODEL_NOT_ALLOWED")
+
     def __init__(self, *args, **kwargs):
         self._cost_observation = "NOT_OBSERVED"
         super().__init__(*args, **kwargs)
