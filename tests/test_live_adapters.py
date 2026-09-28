@@ -130,7 +130,7 @@ def _transport(routes):
 
 
 class TestKilo:
-    MODEL = "minimax/minimax-m2.7:free"
+    MODEL = "qwen/qwen3.8-27b:free"
 
     def _adapter(self, routes):
         transport, seen = _transport(routes)
@@ -174,6 +174,28 @@ class TestKilo:
         assert adapter.safe_diagnostics() == {"cost_microdollars": "ZERO"}
         assert str(seen[-1].url) == "https://api.kilo.ai/api/gateway/chat/completions"
         assert "provider" not in json.loads(seen[-1].content)
+
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "poolside/laguna-s-2.1:free",
+            "stepfun/step-3.7-flash:free",
+            "dots-studio/dots-3-note-preview:free",
+            "inclusionai/ling-3.0-flash-sante:free",
+        ],
+    )
+    def test_trial_preview_or_promotional_models_fail_admission(self, model_id):
+        with pytest.raises(
+            AuthenticationFailed,
+            match="KILO_TRIAL_OR_PROMOTIONAL_MODEL_NOT_ALLOWED",
+        ):
+            KiloFreeAdapter(
+                _spec("kilo_free", "FREE_DYNAMIC", model_id),
+                _settings(),
+                credential=SecretStr("k"),
+                transport=httpx.MockTransport(lambda r: httpx.Response(500)),
+            )
 
     async def test_http_403_is_access_denied_not_bad_credentials(self):
         adapter, _ = self._adapter({("GET", "/models"): (403, {"error": {"code": 403}})})
