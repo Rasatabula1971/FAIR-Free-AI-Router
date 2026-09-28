@@ -1,8 +1,8 @@
 """Interactive Windows-friendly smoke tests for FAIR.
 
 The console never prints API keys or raw provider responses. Live provider tests
-can isolate one provider at a time, and recurring/free-plan providers require an
-explicit per-session operator confirmation before FAIR enables them.
+can isolate one provider at a time. Recurring/free-plan providers use the persistent
+FAIR_CONFIRMED_FREE_PROVIDERS setting from .env instead of prompting on every run.
 """
 
 from __future__ import annotations
@@ -63,20 +63,13 @@ LIVE_PROVIDERS = {
         "confirmation_required": True,
     },
     "6": {
-        "provider_id": "zai_free",
-        "label": "Z.ai",
-        "env": "ZAI_API_KEY",
-        "kwarg": "zai_api_key",
-        "confirmation_required": True,
-    },
-    "7": {
         "provider_id": "cloudflare_workers_ai",
         "label": "Cloudflare Workers AI",
         "env": "CLOUDFLARE_API_TOKEN",
         "kwarg": "cloudflare_api_token",
         "confirmation_required": True,
     },
-    "8": {
+    "7": {
         "provider_id": "ollama_local",
         "label": "Ollama Local",
         "env": None,
@@ -84,8 +77,6 @@ LIVE_PROVIDERS = {
         "confirmation_required": False,
     },
 }
-
-_session_confirmed: set[str] = set()
 
 
 def _dotenv_values() -> dict[str, str]:
@@ -149,37 +140,26 @@ def _entry_for_provider(provider_id: str) -> dict[str, object]:
     raise ValueError("Unknown provider")
 
 
-def _confirm_provider(entry: dict[str, object]) -> bool:
-    provider_id = str(entry["provider_id"])
+def _confirmed_provider_ids() -> set[str]:
+    """Persistent operator confirmations from process env or .env."""
+    value = _env_value("FAIR_CONFIRMED_FREE_PROVIDERS") or ""
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def _provider_is_confirmed(entry: dict[str, object]) -> bool:
     if not bool(entry["confirmation_required"]):
         return True
-    if provider_id in _session_confirmed:
-        return True
-
-    label = str(entry["label"])
-    print()
-    print(f"{label} requires explicit free-only account confirmation.")
-    print("Only answer Y if you have verified that this account/configuration")
-    print("cannot auto-bill or otherwise incur paid API usage.")
-    answer = input(f"Confirm {label} for THIS SESSION? [y/N]: ").strip().casefold()
-    if answer in {"y", "yes"}:
-        _session_confirmed.add(provider_id)
-        return True
-    return False
+    return str(entry["provider_id"]) in _confirmed_provider_ids()
 
 
-def _confirm_free_accounts() -> set[str]:
-    """Offer confirmation for each configured provider that still needs it."""
-    for entry in LIVE_PROVIDERS.values():
-        configured, _ = _provider_status(entry)
-        provider_id = str(entry["provider_id"])
-        if (
-            configured
-            and bool(entry["confirmation_required"])
-            and provider_id not in _session_confirmed
-        ):
-            _confirm_provider(entry)
-    return set(_session_confirmed)
+def _confirmed_free_accounts() -> set[str]:
+    """Return only known recurring providers explicitly confirmed in .env."""
+    known = {
+        str(entry["provider_id"])
+        for entry in LIVE_PROVIDERS.values()
+        if bool(entry["confirmation_required"])
+    }
+    return _confirmed_provider_ids() & known
 
 
 def _provider_spec(provider_id: str, model_id: str) -> ProviderSpec:
@@ -243,8 +223,10 @@ def _selected_live_fair(provider_ids: set[str]) -> FAIR:
         configured, reason = _provider_status(entry)
         if not configured:
             raise ValueError(f"{entry['label']}: {reason}")
-        if not _confirm_provider(entry):
-            raise PermissionError(f"{entry['label']} was not confirmed for free-only use")
+        if not _provider_is_confirmed(entry):
+            raise PermissionError(
+                f"{entry['label']} is not listed in FAIR_CONFIRMED_FREE_PROVIDERS"
+            )
 
         if bool(entry["confirmation_required"]):
             confirmed.add(provider_id)
@@ -277,7 +259,7 @@ def _selected_live_fair(provider_ids: set[str]) -> FAIR:
 
 def _all_live_fair() -> FAIR:
     kwargs: dict[str, object] = {
-        "confirmed_free_providers": _confirm_free_accounts(),
+        "confirmed_free_providers": _confirmed_free_accounts(),
         "cache_enabled": False,
     }
     if ENV_FILE.exists():
@@ -378,9 +360,9 @@ def _show_provider_configuration() -> None:
         provider_id = str(entry["provider_id"])
         if bool(entry["confirmation_required"]):
             confirmation = (
-                "confirmed this session"
-                if provider_id in _session_confirmed
-                else "confirmation required"
+                "confirmed in FAIR_CONFIRMED_FREE_PROVIDERS"
+                if _provider_is_confirmed(entry)
+                else "NOT confirmed in FAIR_CONFIRMED_FREE_PROVIDERS"
             )
         else:
             confirmation = "runtime/local safety check"
@@ -510,6 +492,16 @@ async def live_provider_sweep() -> bool:
             results.append((label, "SKIP", reason))
             continue
 
+        if bool(entry["confirmation_required"]) and not _provider_is_confirmed(entry):
+            results.append(
+                (
+                    label,
+                    "SKIP",
+                    "not listed in FAIR_CONFIRMED_FREE_PROVIDERS",
+                )
+            )
+            continue
+
         attempted += 1
         passed = await _run_selected_live_provider(provider_id)
         if passed:
@@ -617,8 +609,8 @@ def full_test_suite() -> bool:
 async def show_live_providers() -> bool:
     _show_provider_configuration()
     print()
-    print("To calculate FAIR eligibility, recurring/free-plan accounts may need")
-    print("confirmation for this session.")
+    print("Recurring/free-plan account approval is read from")
+    print("FAIR_CONFIRMED_FREE_PROVIDERS in .env; no per-run prompt is used.")
     try:
         async with _all_live_fair() as fair:
             _print_live_inventory(fair)
@@ -628,11 +620,6 @@ async def show_live_providers() -> bool:
         print(f"Provider inventory stopped safely: {type(error).__name__}")
         print("No API key or upstream exception text was printed.")
         return False
-
-
-def reset_confirmations() -> None:
-    _session_confirmed.clear()
-    print("Session confirmations cleared.")
 
 
 def _pause() -> None:
@@ -653,8 +640,7 @@ def _header() -> None:
     print("5. Test live cross-check (choose TWO providers)")
     print("6. Run full pytest suite")
     print("7. Show provider configuration / eligibility")
-    print("8. Clear this-session free-account confirmations")
-    print("9. Exit")
+    print("8. Exit")
     print()
 
 
@@ -710,7 +696,7 @@ def main() -> int:
 
     while True:
         _header()
-        choice = input("Choose 1-9: ").strip()
+        choice = input("Choose 1-8: ").strip()
         try:
             if choice == "1":
                 asyncio.run(quick_offline_test())
