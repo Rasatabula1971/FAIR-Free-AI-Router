@@ -130,7 +130,7 @@ def _transport(routes):
 
 
 class TestKilo:
-    MODEL = "nex-agi/nex-n2.5-pro:free"
+    MODEL = "minimax/minimax-m2.7:free"
 
     def _adapter(self, routes):
         transport, seen = _transport(routes)
@@ -744,6 +744,12 @@ class TestModuleWiring:
         )
         assert {p["provider_id"] for p in fair.providers()} == set(_CLOUD_PROVIDERS)
         assert fair.skipped == {}
+
+    def test_kilo_reviewed_models_exclude_nvidia_trial_routes(self):
+        models = _CLOUD_PROVIDERS["kilo_free"]["models"]
+        assert models
+        assert all(model.model_id.endswith(":free") for model in models)
+        assert all(not model.model_id.startswith("nvidia/") for model in models)
 
     def test_recurring_provider_requires_explicit_free_account_confirmation(self, monkeypatch):
         for entry in _CLOUD_PROVIDERS.values():
