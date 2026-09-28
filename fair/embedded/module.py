@@ -217,13 +217,15 @@ _CLOUD_PROVIDERS = {
         # anonymous, to 200 requests/hour per public IP.
         "request_limit": 200,
         "request_limit_window": "HOURLY",
-        # Only recurring/dynamic zero-cost Kilo routes are reviewed here.
-        # NVIDIA's Kilo free endpoints are explicitly trial-only and therefore
-        # do not satisfy FAIR's perpetual-free policy.
+        # Reviewed against Kilo's live /models catalog on 2026-09-27.
+        # These are current non-NVIDIA zero-priced routes. Kilo model
+        # availability is dynamic, so the adapter still re-checks the live
+        # catalog and exact $0 pricing before every model can be used.
         "models": _text_models(
-            ("minimax/minimax-m3:free", 1048576),
-            ("minimax/minimax-m2.7:free", 196608),
-            ("poolside/laguna-s-2.1:free", 262144),
+            ("qwen/qwen3.8-27b:free", 262144, _NO_STRUCTURED_OUTPUT),
+            ("thinkingmachines/inkling-small:free", 1048576, _NO_STRUCTURED_OUTPUT),
+            ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
+            ("liquid/lfm-2.5-2.6b:free", 65536, _NO_STRUCTURED_OUTPUT),
         ),
     },
     "cloudflare_workers_ai": {
