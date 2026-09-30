@@ -22,7 +22,7 @@ from fair.providers.base import (
 )
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
-from fair.quality.thresholds import validate_thresholds
+from fair.quality.thresholds import DEFAULT_THRESHOLDS, validate_thresholds
 from fair.schemas.api import SolveRequest
 from fair.schemas.domain import ProviderSpec, QuotaSnapshot
 from fair.security.adapter import CredentialedAdapter
@@ -1831,3 +1831,56 @@ class TestIndependenceGroups:
                     )
         # A group with one member would be doing nothing; each names a real duplicate.
         assert all(len(members) > 1 for members in groups.values()), groups
+
+
+class TestContextIsEstimatedInTokens:
+    """A prompt was counted in bytes, and the output budget shares the same window,
+    so raising budgets to 32768 hid models whose context was ample."""
+
+    def _estimate(self, chars, tokens, **kwargs):
+        from fair.classifier.task_profiler import profile_task
+
+        request = _request(task="x" * chars, max_output_tokens=tokens, **kwargs)
+        return profile_task(request, dict(DEFAULT_THRESHOLDS)).context_tokens_estimate
+
+    def test_a_prompt_is_no_longer_counted_as_one_token_per_byte(self):
+        from fair.constants import BYTES_PER_TOKEN
+
+        estimate = self._estimate(60_000, 1024)
+        assert estimate < 60_000 / (BYTES_PER_TOKEN - 1) + 1024 + 600
+
+    def test_a_request_a_window_can_hold_is_no_longer_excluded(self):
+        """98,000 characters with a 32768 budget needs ~57k tokens; it was refused."""
+        assert self._estimate(98_000, 32768) < 131_072
+
+    def test_a_request_that_genuinely_does_not_fit_is_still_excluded(self):
+        assert self._estimate(100_000, 32768) > 64_000
+
+    def test_the_output_budget_still_counts_against_the_window(self):
+        assert self._estimate(1_000, 32768) - self._estimate(1_000, 1024) == 32768 - 1024
+
+    def test_a_schema_counts_too_because_the_provider_is_sent_it(self):
+        schema = {"type": "object", "properties": {f"f{i}": {"type": "string"} for i in range(200)}}
+        assert self._estimate(1_000, 1024, expected_schema=schema) > self._estimate(1_000, 1024)
+
+    def test_the_selector_and_the_adapter_agree_about_what_fits(self):
+        """They estimated separately before, so one could route what the other refused."""
+        from fair.classifier.task_profiler import model_task, profile_task
+        from fair.constants import estimated_tokens
+
+        request = _request(task="x" * 50_000, max_output_tokens=8192)
+        profile = profile_task(request, dict(DEFAULT_THRESHOLDS))
+        adapter_view = estimated_tokens(model_task(request)) + request.max_output_tokens
+        # The profile carries the caller's margin on top; neither may be the smaller.
+        assert profile.context_tokens_estimate >= adapter_view
+
+    async def test_a_large_prompt_still_reaches_a_model_with_room(self):
+        router = _router(entries=[(_spec(), MockAdapter("a", text='{"items": [1]}'))])
+        result = await router.solve(
+            _request(
+                task="x" * 20_000,
+                max_output_tokens=2048,
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ACCEPTED"

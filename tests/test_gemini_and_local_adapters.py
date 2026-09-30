@@ -15,6 +15,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from fair.constants import BYTES_PER_TOKEN, estimated_tokens
 from fair.providers.base import (
     AuthenticationFailed,
     MalformedResponse,
@@ -411,9 +412,28 @@ class TestGemini:
             await adapter.complete(_request(GEMINI_MODEL, max_output_tokens=64))
 
     async def test_a_task_larger_than_the_context_window_is_refused(self):
+        """Sized through the estimator the guard uses, not through a byte count."""
         adapter, _ = self._adapter({})
+        oversized = "x" * (CONTEXT * BYTES_PER_TOKEN + 4096)
+        assert estimated_tokens(oversized) > CONTEXT
         with pytest.raises(MalformedResponse, match="CONTEXT_BUDGET_EXCEEDED"):
-            await adapter.complete(_request(GEMINI_MODEL, task="x" * (CONTEXT + 1)))
+            await adapter.complete(_request(GEMINI_MODEL, task=oversized))
+
+    async def test_a_task_the_window_can_hold_is_not_refused(self):
+        """A prompt was counted in bytes, so one a model could hold was turned away."""
+        transport, _ = _transport(
+            {
+                ("GET", GEMINI_MODEL): (200, _metadata()),
+                ("POST", ":generateContent"): (200, _generation()),
+            }
+        )
+        adapter = GeminiAdapter(
+            _gemini_spec(), _settings(), credential=SecretStr("k"), transport=transport
+        )
+        # Half the window in tokens; under the old byte count this was over it.
+        comfortable = "x" * (CONTEXT * BYTES_PER_TOKEN // 2)
+        assert estimated_tokens(comfortable) < CONTEXT
+        assert (await adapter.complete(_request(GEMINI_MODEL, task=comfortable))).text == "pong"
 
     @pytest.mark.parametrize(
         "body",
@@ -626,8 +646,10 @@ class TestOllamaLocal:
         adapter, _ = self._adapter(
             {("GET", "/api/tags"): (200, _tags()), ("POST", "/api/show"): (200, _show())}
         )
+        oversized = "x" * (CONTEXT * BYTES_PER_TOKEN)
+        assert estimated_tokens(oversized) > CONTEXT
         with pytest.raises(MalformedResponse, match="CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED"):
-            await adapter.complete(_request(LOCAL_MODEL, task="x" * CONTEXT))
+            await adapter.complete(_request(LOCAL_MODEL, task=oversized))
 
     @pytest.mark.parametrize(
         "overrides",
