@@ -1884,3 +1884,71 @@ class TestContextIsEstimatedInTokens:
             )
         )
         assert result.status == "ACCEPTED"
+
+
+class _MovableClock:
+    """A clock the test advances by hand, so a cooldown elapses without waiting."""
+
+    def __init__(self, now=1_000_000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+class TestQuotaUnderConcurrency:
+    """The reservation path is safe because nothing awaits between the check and the
+    increment. That is a property of the code's shape, not of its intent, so a future
+    await slipped in there would break the guarantee silently. These pin it."""
+
+    def _spec(self, **kw):
+        return _spec("p", **kw)
+
+    async def _granted(self, governor, spec, concurrency):
+        return sum(
+            await asyncio.gather(*(governor.reserve_async(spec) for _ in range(concurrency)))
+        )
+
+    @pytest.mark.parametrize(("limit", "concurrency"), [(1, 50), (5, 200), (10, 400)])
+    async def test_concurrent_reservations_never_exceed_a_local_limit(self, limit, concurrency):
+        governor = MemoryQuotaGovernor(RoutingSettings())
+        spec = self._spec(request_limit=limit, request_limit_window="DAILY_UTC")
+        assert await self._granted(governor, spec, concurrency) == limit
+
+    async def test_a_yielding_event_loop_cannot_interleave_a_reservation(self):
+        """If a check and its increment ever straddle an await, this is what finds it."""
+
+        async def churn():
+            for _ in range(2000):
+                await asyncio.sleep(0)
+
+        governor = MemoryQuotaGovernor(RoutingSettings())
+        spec = self._spec(request_limit=10, request_limit_window="DAILY_UTC")
+        granted, _ = await asyncio.gather(self._granted(governor, spec, 400), churn())
+        assert granted == 10
+
+    async def test_only_one_probe_is_dispatched_into_an_open_circuit(self):
+        """Several coroutines observing OPEN at once must not all probe the provider."""
+        settings = RoutingSettings(circuit_failures=2, cooldown_seconds=60)
+        clock = _MovableClock()
+        governor = MemoryQuotaGovernor(settings, clock=clock)
+        spec = self._spec()
+        for _ in range(settings.circuit_failures):
+            governor.failure("p")
+        assert governor._state("p").circuit_state == "OPEN"
+        clock.now += settings.cooldown_seconds + 1
+        assert await self._granted(governor, spec, 200) == 1
+
+    async def test_a_released_probe_leaves_the_circuit_open_not_closed(self):
+        settings = RoutingSettings(circuit_failures=2, cooldown_seconds=60)
+        clock = _MovableClock()
+        governor = MemoryQuotaGovernor(settings, clock=clock)
+        spec = self._spec()
+        for _ in range(settings.circuit_failures):
+            governor.failure("p")
+        clock.now += settings.cooldown_seconds + 1
+        assert await governor.reserve_async(spec) is True
+        state = governor._state("p")
+        assert state.circuit_state == "HALF_OPEN"
+        governor._release_probe(state)
+        assert state.circuit_state == "OPEN"
