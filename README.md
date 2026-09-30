@@ -404,6 +404,52 @@ observation arrives on a stream is unverified against the live APIs; a wrong ans
 there would refuse every completion rather than merely slow one down. Flip the flag
 once a live check confirms it.
 
+### Measuring what a provider actually accepts
+
+Several values here can only be known by asking: the output ceiling a free endpoint
+enforces, whether a schema survives its structured-output parser, whether a cost
+observation arrives on a stream, how fast a route really is. The probe asks, using
+the registered adapters so every admission, zero-cost and credential check applies
+exactly as it does in routing. It never calls `solve()` — the quality gate would
+spend extra requests and confound the measurement.
+
+Requests are the scarce resource (OpenRouter Free allows 50 a day), so the catalog
+pass costs none, every other pass costs one request per model, and the run stops at
+`--max-requests` whatever is left. Always start with a dry run:
+
+```bash
+python -m fair.tools.probe --dry-run --all          # what it would send, and how many
+python -m fair.tools.probe                          # catalog only, zero completions
+python -m fair.tools.probe --limits --output-tokens 8192
+python -m fair.tools.probe --schema request.json --streaming
+python -m fair.tools.probe --providers groq --models openai/gpt-oss-120b --limits
+```
+
+It writes a JSON report and prints what a reviewer could defend putting in a
+descriptor:
+
+```json
+{
+  "output_tokens": {
+    "groq/openai/gpt-oss-120b": {"accepted_at_least": 8192, "descriptor_says": 4096},
+    "mistral/ministral-8b-latest": {"refused_at": 8192, "refusal": "OUTPUT_BUDGET_INVALID"}
+  },
+  "suggested_output_tokens_per_second": 34,
+  "cost_observed_on_stream": {"openrouter_free/...": true}
+}
+```
+
+An accepted budget is a **floor**, not a ceiling: it says the endpoint took that
+many tokens, not that it would refuse one more. A refusal is the upper bound. Both
+are named for what they are, because reporting either as "the limit" is the
+overclaim that put an unconfirmed 262144 in the registry to begin with.
+
+The probe turns provider diagnostics on for its own run, so a refusal shows the
+provider's message rather than a bare `HTTP_400`. `cost_observed_on_stream` answers
+the one question holding `openrouter_free` and `kilo_free` on the buffered path: it
+sets `supports_streaming` on the adapter instance for a single request, restores it
+afterwards, and reports whether the zero-cost proof still arrived.
+
 ### Published output limits
 
 Where a provider publishes its own completion-token ceiling in the live catalog,
