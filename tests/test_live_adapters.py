@@ -15,6 +15,7 @@ from fair.providers.base import (
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
+    RequestNotSupported,
 )
 from fair.providers.live import (
     CloudflareWorkersAiAdapter,
@@ -1147,3 +1148,257 @@ class TestProviderErrorDiagnostics:
             "cost_microdollars": "NOT_OBSERVED",
             "last_provider_error": {"status": "HTTP_400", "provider_message": "bad"},
         }
+
+
+# ── Catalog: negative caching, drop reasons, published limits ────────────
+
+
+class _Clock:
+    """A clock the test moves by hand; adapters admit themselves against real time."""
+
+    def __init__(self):
+        self.now = datetime.now(UTC).timestamp()
+
+    def __call__(self):
+        return self.now
+
+
+class TestCatalogFailureIsCached:
+    """One unreachable catalog cost three consecutive 25-second read timeouts."""
+
+    MODEL = "ministral-8b-latest"
+
+    def _adapter(self, clock, response=None):
+        def handler(request):
+            calls.append(request)
+            if response is not None:
+                return response
+            raise httpx.ConnectTimeout("timeout")
+
+        calls: list = []
+        adapter = MistralAdapter(
+            _spec("mistral", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=httpx.MockTransport(handler),
+            clock=clock,
+        )
+        return adapter, calls
+
+    async def test_a_failed_catalog_is_fetched_once_not_once_per_model(self):
+        clock = _Clock()
+        adapter, calls = self._adapter(clock)
+        for _ in range(3):
+            with pytest.raises(ProviderUnavailable, match="PROVIDER_TRANSPORT_FAILED"):
+                await adapter.list_models()
+        assert len(calls) == 1
+
+    async def test_the_cached_failure_reports_what_the_first_one_did(self):
+        clock = _Clock()
+        adapter, _ = self._adapter(clock)
+        with pytest.raises(ProviderUnavailable) as first:
+            await adapter.list_models()
+        with pytest.raises(ProviderUnavailable) as cached:
+            await adapter.list_models()
+        assert str(cached.value) == str(first.value)
+
+    async def test_the_catalog_is_retried_once_the_failure_goes_stale(self):
+        clock = _Clock()
+        adapter, calls = self._adapter(clock)
+        with pytest.raises(ProviderUnavailable):
+            await adapter.list_models()
+        clock.now += adapter._catalog_error_ttl + 1
+        with pytest.raises(ProviderUnavailable):
+            await adapter.list_models()
+        assert len(calls) == 2
+
+    async def test_a_recovered_catalog_clears_the_failure(self):
+        clock = _Clock()
+        state = {"fail": True}
+
+        def handler(request):
+            if state["fail"]:
+                raise httpx.ConnectTimeout("timeout")
+            return httpx.Response(
+                200, json={"data": [{"id": self.MODEL, "max_context_length": 262144}]}
+            )
+
+        adapter = MistralAdapter(
+            _spec("mistral", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=httpx.MockTransport(handler),
+            clock=clock,
+        )
+        with pytest.raises(ProviderUnavailable):
+            await adapter.list_models()
+        state["fail"] = False
+        clock.now += adapter._catalog_error_ttl + 1
+        assert [m.model_id for m in await adapter.list_models()] == [self.MODEL]
+        assert adapter._catalog_error is None
+
+
+class TestCatalogDropReasons:
+    """REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED covered five different causes."""
+
+    MODEL = "google/gemma-4-26b-a4b-it:free"
+
+    async def _drops(self, entries):
+        transport, _ = _transport({("GET", "/models"): (200, {"data": entries})})
+        adapter = OpenRouterFreeAdapter(
+            _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL, context=262144),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        assert await adapter.list_models() == []
+        return adapter
+
+    async def test_a_model_missing_from_the_catalog_says_so(self):
+        adapter = await self._drops([{"id": "someone/else:free"}])
+        assert adapter.safe_diagnostics()["catalog_drops"] == {self.MODEL: "ABSENT_FROM_CATALOG"}
+
+    async def test_a_model_that_lost_its_zero_price_says_so(self):
+        adapter = await self._drops(
+            [
+                {
+                    "id": self.MODEL,
+                    "context_length": 262144,
+                    "pricing": {"prompt": "0.1", "completion": "0.2"},
+                }
+            ]
+        )
+        assert adapter.safe_diagnostics()["catalog_drops"] == {self.MODEL: "NOT_ZERO_PRICED"}
+
+    async def test_a_model_whose_context_shrank_names_the_reviewed_value(self):
+        adapter = await self._drops(
+            [
+                {
+                    "id": self.MODEL,
+                    "context_length": 131072,
+                    "pricing": {"prompt": "0", "completion": "0"},
+                }
+            ]
+        )
+        assert adapter.safe_diagnostics()["catalog_drops"] == {
+            self.MODEL: "CATALOG_CONTEXT_BELOW_REVIEWED_262144"
+        }
+
+    async def test_a_model_switched_off_upstream_says_so(self):
+        adapter = await self._drops(
+            [
+                {
+                    "id": self.MODEL,
+                    "context_length": 262144,
+                    "active": False,
+                    "pricing": {"prompt": "0", "completion": "0"},
+                }
+            ]
+        )
+        assert adapter.safe_diagnostics()["catalog_drops"] == {self.MODEL: "INACTIVE_IN_CATALOG"}
+
+    async def test_a_catalog_reporting_no_context_says_so(self):
+        adapter = await self._drops(
+            [{"id": self.MODEL, "pricing": {"prompt": "0", "completion": "0"}}]
+        )
+        assert adapter.safe_diagnostics()["catalog_drops"] == {self.MODEL: "CONTEXT_NOT_REPORTED"}
+
+    async def test_a_routable_model_records_no_drop(self):
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": self.MODEL,
+                                "context_length": 262144,
+                                "pricing": {"prompt": "0", "completion": "0"},
+                            }
+                        ]
+                    },
+                )
+            }
+        )
+        adapter = OpenRouterFreeAdapter(
+            _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL, context=262144),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        assert len(await adapter.list_models()) == 1
+        assert "catalog_drops" not in adapter.safe_diagnostics()
+
+
+class TestPublishedOutputLimit:
+    """A live catalog is current; a reviewed descriptor is a claim from the day it was written."""
+
+    MODEL = "google/gemma-4-26b-a4b-it:free"
+
+    async def _limit(self, top_provider, reviewed=4096):
+        entry = {
+            "id": self.MODEL,
+            "context_length": 262144,
+            "pricing": {"prompt": "0", "completion": "0"},
+        }
+        if top_provider is not None:
+            entry["top_provider"] = top_provider
+        transport, _ = _transport({("GET", "/models"): (200, {"data": [entry]})})
+        spec = _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL, context=262144)
+        spec.models[0].max_output_tokens = reviewed
+        adapter = OpenRouterFreeAdapter(
+            spec, _settings(), credential=SecretStr("k"), transport=transport
+        )
+        models = await adapter.list_models()
+        return models[0].max_output_tokens
+
+    async def test_a_smaller_published_limit_lowers_the_reviewed_one(self):
+        assert await self._limit({"max_completion_tokens": 2048}, reviewed=4096) == 2048
+
+    async def test_a_larger_published_limit_never_raises_the_reviewed_one(self):
+        """Raising a limit on unreviewed data is the guess this package refuses to make."""
+        assert await self._limit({"max_completion_tokens": 65536}, reviewed=4096) == 4096
+
+    async def test_a_reviewed_descriptor_with_no_limit_adopts_the_published_one(self):
+        assert await self._limit({"max_completion_tokens": 8192}, reviewed=None) == 8192
+
+    async def test_an_absent_field_changes_nothing(self):
+        assert await self._limit(None, reviewed=4096) == 4096
+
+    async def test_an_unreadable_field_changes_nothing(self):
+        assert await self._limit({"max_completion_tokens": "lots"}, reviewed=4096) == 4096
+        assert await self._limit("not-an-object", reviewed=4096) == 4096
+
+    async def test_a_provider_that_publishes_no_limit_is_unaffected(self):
+        """Every adapter but OpenRouter keeps output_field None until it is reviewed."""
+        assert GroqAdapter.output_field is None
+        assert CloudflareWorkersAiAdapter.output_field is None
+        assert MistralAdapter.output_field is None
+        assert KiloFreeAdapter.output_field is None
+
+    async def test_the_published_limit_governs_dispatch(self):
+        """A budget above what the provider publishes is refused here, not by an HTTP 400."""
+        entry = {
+            "id": self.MODEL,
+            "context_length": 262144,
+            "pricing": {"prompt": "0", "completion": "0"},
+            "top_provider": {"max_completion_tokens": 100},
+        }
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (200, {"data": [entry]}),
+                ("GET", "/key"): (200, {"data": {"is_free_tier": True}}),
+                ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
+            }
+        )
+        spec = _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL, context=262144)
+        spec.models[0].max_output_tokens = 4096
+        adapter = OpenRouterFreeAdapter(
+            spec, _settings(), credential=SecretStr("k"), transport=transport
+        )
+        request = _request(self.MODEL)
+        with pytest.raises(RequestNotSupported, match="OUTPUT_BUDGET_INVALID"):
+            await adapter.complete(request.model_copy(update={"max_output_tokens": 101}))
+        assert not any(r.method == "POST" for r in seen)
+        await adapter.complete(request.model_copy(update={"max_output_tokens": 100}))
+        assert json.loads(seen[-1].content)["max_tokens"] == 100

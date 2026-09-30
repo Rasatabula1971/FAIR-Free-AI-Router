@@ -18,6 +18,7 @@ from fair.embedded.router import EmbeddedRouter
 from fair.governor.policy import AdmissionDenied
 from fair.providers.base import AuthenticationFailed, ProviderAdapter
 from fair.providers.live import (
+    MAX_OUTPUT_TOKENS,
     TEXT_CAPABILITIES,
     CloudflareWorkersAiAdapter,
     GeminiAdapter,
@@ -120,7 +121,8 @@ _NO_STRUCTURED_OUTPUT = frozenset(TEXT_CAPABILITIES) - {"structured_output"}
 
 # TextAdapter and OllamaLocalAdapter refuse max_output_tokens above this
 # before dispatch. Declaring the cap lets the selector skip those routes.
-_TEXT_ADAPTER_MAX_OUTPUT = 4096
+# The adapters own the number; restating it here let the two drift.
+_TEXT_ADAPTER_MAX_OUTPUT = MAX_OUTPUT_TOKENS
 
 
 def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT):

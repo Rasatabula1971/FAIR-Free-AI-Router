@@ -352,6 +352,33 @@ fair._registry.adapters["groq"].safe_diagnostics()
 Raised codes, reason codes and the attempt log are identical either way; the flag
 only adds the record. It is off by default.
 
+`safe_diagnostics()` also reports, without any flag, why a reviewed model was left
+out of the live catalog. `REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED` covers five
+different causes and the router can only report the last of them:
+
+```python
+fair._registry.adapters["openrouter_free"].safe_diagnostics()["catalog_drops"]
+# {"nex-agi/nex-n2.5-mini:free": "CATALOG_CONTEXT_BELOW_REVIEWED_262144"}
+```
+
+`ABSENT_FROM_CATALOG`, `AMBIGUOUS_IN_CATALOG`, `INACTIVE_IN_CATALOG`,
+`NOT_ZERO_PRICED`, `CONTEXT_NOT_REPORTED` and `CATALOG_CONTEXT_BELOW_REVIEWED_<n>`
+are the reasons; the last names the reviewed value the catalog now contradicts.
+
+A catalog fetch that fails is remembered for as long as a successful one stays
+fresh. Only success used to be cached, so every eligible model asked again and one
+unreachable endpoint cost a read timeout per model rather than per solve.
+
+### Published output limits
+
+Where a provider publishes its own completion-token ceiling in the live catalog,
+that ceiling lowers the reviewed descriptor — it never raises it. A live catalog is
+current where a reviewed value is a claim from the day it was written, so a smaller
+published limit wins; raising a limit on unreviewed data is the guess FAIR refuses
+to make. A request above the published limit is refused before dispatch instead of
+spending quota on an HTTP 400. A provider that publishes nothing usable changes
+nothing, and only `openrouter_free` reads a field today.
+
 ```python
 # Code validation
 result = await fair.solve(

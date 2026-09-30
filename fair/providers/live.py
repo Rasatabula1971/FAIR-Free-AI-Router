@@ -39,6 +39,10 @@ from fair.schemas.domain import DTO, NormalizedModelResponse, ProviderHealth, Qu
 from fair.security.credentials import ProviderCredentials
 
 TEXT_CAPABILITIES = {"reasoning", "coding", "structured_output"}
+# The largest completion budget a TextAdapter will send, whatever a descriptor says.
+# A model may declare less -- from its review, or from the limit its provider
+# publishes in the live catalog -- and the smaller of the two governs.
+MAX_OUTPUT_TOKENS = 4096
 
 
 class LiveSettings(DTO):
@@ -139,6 +143,10 @@ class TextAdapter:
     catalog_key = "data"
     catalog_id_key = "id"
     context_field: str | None = "context_length"
+    # Where this provider publishes its own completion-token ceiling, when it does.
+    # None keeps the reviewed descriptor value untouched, which is what every
+    # provider did before the field existed.
+    output_field: str | None = None
     zero_price_models = False
     account_check_path: str | None = None
     provider_preferences: dict[str, object] | None = None
@@ -152,6 +160,8 @@ class TextAdapter:
     schema_dialect = OPENAI_STRICT
 
     _catalog_ttl = 60
+    # A failed catalog is held no longer than a successful one is held fresh.
+    _catalog_error_ttl = 60
     # An upstream error body is provider text, so only a bounded, credential-scrubbed
     # message is kept, only when an operator turns diagnostics on, and only through
     # safe_diagnostics(). No raised code and no attempt log changes either way.
@@ -165,6 +175,9 @@ class TextAdapter:
         self._model_cache = None
         self._model_cache_at = 0.0
         self._last_error: dict[str, str] | None = None
+        self._catalog_error: Exception | None = None
+        self._catalog_error_at = 0.0
+        self._catalog_drops: dict[str, str] = {}
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5, read=25, write=5, pool=5),
             trust_env=False,
@@ -289,7 +302,12 @@ class TextAdapter:
 
     def safe_diagnostics(self):
         """Fixed, secret-scanned operator diagnostics; empty unless something was recorded."""
-        return {"last_provider_error": dict(self._last_error)} if self._last_error else {}
+        record = {}
+        if self._last_error:
+            record["last_provider_error"] = dict(self._last_error)
+        if self._catalog_drops:
+            record["catalog_drops"] = dict(self._catalog_drops)
+        return record
 
     async def _json(self, method, path, payload=None):
         self._admit()
@@ -362,7 +380,21 @@ class TextAdapter:
         now = self.clock()
         if self._model_cache is not None and now - self._model_cache_at < self._catalog_ttl:
             return [m.model_copy(deep=True) for m in self._model_cache]
-        result = await self._fetch_models()
+        # A catalog that just failed will not succeed on the next model in the same
+        # solve, and every eligible model asks again: one unreachable endpoint cost
+        # three 25-second read timeouts in a row because only success was cached.
+        # The failure is held as briefly as a successful catalog is held fresh.
+        if (
+            self._catalog_error is not None
+            and now - self._catalog_error_at < self._catalog_error_ttl
+        ):
+            raise self._catalog_error.with_traceback(None)
+        try:
+            result = await self._fetch_models()
+        except Exception as error:
+            self._catalog_error, self._catalog_error_at = error, now
+            raise
+        self._catalog_error = None
         self._model_cache = result
         self._model_cache_at = now
         return result
@@ -376,28 +408,65 @@ class TextAdapter:
     def _catalog_context(self, entry):
         return None if self.context_field is None else entry.get(self.context_field)
 
+    def _catalog_output(self, entry):
+        """The provider's own maximum completion tokens for this model, when it says."""
+        return None if self.output_field is None else entry.get(self.output_field)
+
     async def _fetch_models(self):
         entries = self._catalog_entries(await self._json("GET", self.catalog_path))
-        result = []
+        result, dropped = [], {}
         for configured in self.spec.models:
             matches = [
                 entry
                 for entry in entries
                 if isinstance(entry, dict) and entry.get(self.catalog_id_key) == configured.model_id
             ]
-            if len(matches) != 1 or not configured.active:
+            if not configured.active:
+                dropped[configured.model_id] = "DESCRIPTOR_INACTIVE"
+                continue
+            if len(matches) != 1:
+                # Four different causes used to leave the same trace: the model gone
+                # from the catalog, listed twice, switched off, repriced, or shrunk
+                # below its reviewed context. The router can only report that the
+                # model was unavailable, so the reason is recorded for the operator.
+                dropped[configured.model_id] = (
+                    "ABSENT_FROM_CATALOG" if not matches else "AMBIGUOUS_IN_CATALOG"
+                )
                 continue
             entry = matches[0]
             if entry.get("active", True) is not True:
+                dropped[configured.model_id] = "INACTIVE_IN_CATALOG"
                 continue
             if self.zero_price_models and not zero_priced(entry):
+                dropped[configured.model_id] = "NOT_ZERO_PRICED"
                 continue
             if self.context_field is not None:
                 context = self._catalog_context(entry)
-                if type(context) is not int or context < configured.context_window:
+                if type(context) is not int:
+                    dropped[configured.model_id] = "CONTEXT_NOT_REPORTED"
                     continue
-            result.append(configured.model_copy(deep=True))
+                if context < configured.context_window:
+                    dropped[configured.model_id] = (
+                        f"CATALOG_CONTEXT_BELOW_REVIEWED_{configured.context_window}"
+                    )
+                    continue
+            result.append(self._with_catalog_output(configured, entry))
+        self._catalog_drops = dropped
         return result
+
+    def _with_catalog_output(self, configured, entry):
+        """Lower the reviewed output limit to the provider's own, never raise it.
+
+        A live catalog is current where a reviewed descriptor is a claim from the day
+        it was written, so a smaller published limit wins. The reverse is not true:
+        raising a limit on unreviewed data is the guess this package refuses to make.
+        A provider that publishes no usable limit changes nothing.
+        """
+        published = self._catalog_output(entry)
+        if type(published) is not int or published < 1:
+            return configured.model_copy(deep=True)
+        limit = min(published, configured.max_output_tokens or published)
+        return configured.model_copy(deep=True, update={"max_output_tokens": limit})
 
     async def _before_completion(self, payload):
         if self.account_check_path is not None:
@@ -434,7 +503,8 @@ class TextAdapter:
         model = next((item for item in models if item.model_id == request.model_id), None)
         if model is None:
             raise ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED")
-        if not 1 <= request.max_output_tokens <= 4096:
+        limit = min(model.max_output_tokens or MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+        if not 1 <= request.max_output_tokens <= limit:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         if len(request.task.encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
@@ -519,6 +589,11 @@ class OpenRouterFreeAdapter(TextAdapter):
     expected_provider = "openrouter_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
+    # OpenRouter reports the completion ceiling under top_provider rather than at the
+    # top level, so the read is a hook rather than a field name. Unconfirmed against
+    # the live API: if the shape is wrong the value is simply absent and the reviewed
+    # descriptor stands, which is the behaviour before this existed.
+    output_field = "top_provider"
     account_check_path = "/key"
     # _after_completion fails closed unless the response reports a zero cost,
     # and OpenRouter only returns usage accounting when it is asked for. Without
@@ -530,6 +605,10 @@ class OpenRouterFreeAdapter(TextAdapter):
         "data_collection": "deny",
         "max_price": {"prompt": 0, "completion": 0, "request": 0, "image": 0},
     }
+
+    def _catalog_output(self, entry):
+        top = entry.get(self.output_field)
+        return top.get("max_completion_tokens") if isinstance(top, dict) else None
 
 
 class KiloFreeAdapter(TextAdapter):
@@ -1042,7 +1121,9 @@ class OllamaLocalAdapter(TextAdapter):
         if type(context) is not int or context < model.context_window:
             raise AuthenticationFailed("LOCAL_CONTEXT_CAPACITY_NOT_CONFIRMED")
         if (
-            not 1 <= request.max_output_tokens <= 4096
+            not 1
+            <= request.max_output_tokens
+            <= min(model.max_output_tokens or MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
             or len(request.task.encode()) + request.max_output_tokens > model.context_window
         ):
             raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
