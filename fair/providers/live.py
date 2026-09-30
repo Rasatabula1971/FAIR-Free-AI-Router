@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import Field, model_validator
 
-from fair.constants import SECONDS_IN_DAY, completion_deadline
+from fair.constants import SECONDS_IN_DAY, completion_deadline, estimated_tokens
 from fair.governor.policy import admit_provider
 from fair.providers.base import (
     AccessDenied,
@@ -664,7 +664,7 @@ class TextAdapter:
         limit = min(model.max_output_tokens or ceiling, ceiling)
         if not 1 <= request.max_output_tokens <= limit:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
-        if len(request.task.encode()) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(request.task) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         schema, note = self._schema_for_transport(request)
         streaming = self.supports_streaming
@@ -681,7 +681,7 @@ class TextAdapter:
                 "json_schema": {"name": "fair_result", "strict": True, "schema": schema},
             }
         await self._before_completion(payload)
-        if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(json.dumps(payload)) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         timeout = self._completion_timeout(request, streaming)
         data = (
@@ -1252,7 +1252,7 @@ class GeminiAdapter(TextAdapter):
             )
         # Gemini publishes separate input and output limits; the output allowance does not
         # consume the configured input capacity. Byte counting remains conservative.
-        if len(json.dumps(payload).encode()) > model.context_window:
+        if estimated_tokens(json.dumps(payload)) > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         metadata = await self._metadata(model)
         if metadata is None:
@@ -1386,7 +1386,7 @@ class OllamaLocalAdapter(TextAdapter):
                 model.max_output_tokens or self.settings.max_output_tokens_ceiling,
                 self.settings.max_output_tokens_ceiling,
             )
-            or len(request.task.encode()) + request.max_output_tokens > model.context_window
+            or estimated_tokens(request.task) + request.max_output_tokens > model.context_window
         ):
             raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
         schema, note = self._schema_for_transport(request)
@@ -1399,7 +1399,7 @@ class OllamaLocalAdapter(TextAdapter):
         }
         if schema is not None:
             payload["format"] = schema
-        if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(json.dumps(payload)) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/api/chat", payload)
         try:

@@ -1,6 +1,7 @@
 import json
 import re
 
+from fair.constants import estimated_tokens
 from fair.schemas.api import SolveRequest
 from fair.schemas.domain import TaskProfile
 
@@ -50,11 +51,11 @@ def profile_task(request: SolveRequest, thresholds: dict[str, float]) -> TaskPro
     return TaskProfile(
         task_class=task_class,
         required_capabilities=required,
-        # Mirror the adapters' pre-dispatch budget check. json.dumps escapes
-        # non-ASCII input, so raw UTF-8 length can materially under-estimate
-        # the payload that is actually sent.
-        context_tokens_estimate=len(json.dumps(model_task(request)).encode("utf-8"))
-        + (len(json.dumps(request.expected_schema)) if request.expected_schema else 0)
+        # Mirrors the adapters' pre-dispatch budget check, through the same
+        # estimator, so the selector and the adapter cannot disagree about whether
+        # a request fits. A schema is counted too: the provider is sent it.
+        context_tokens_estimate=estimated_tokens(model_task(request))
+        + (estimated_tokens(json.dumps(request.expected_schema)) if request.expected_schema else 0)
         + request.max_output_tokens
         + 512,
         minimum_quality_score=thresholds[request.quality_level],
