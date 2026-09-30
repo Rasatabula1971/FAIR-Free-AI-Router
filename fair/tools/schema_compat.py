@@ -153,13 +153,18 @@ def report(schema, stream=sys.stdout):
     return clean
 
 
+def _read(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("path", help="JSON file holding the schema, or - for stdin")
     parser.add_argument("--key", help="key the schema sits under, when it is not the whole file")
     parser.add_argument("--emit", choices=sorted(DIALECTS), help="print the transported schema")
     args = parser.parse_args(argv)
-    text = sys.stdin.read() if args.path == "-" else open(args.path, encoding="utf-8").read()
+    text = sys.stdin.read() if args.path == "-" else _read(args.path)
     try:
         schema = find_schema(json.loads(text), args.key)
     except (KeyError, ValueError) as error:
