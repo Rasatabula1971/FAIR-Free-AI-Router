@@ -170,15 +170,25 @@ class SharedQuotaLedger:
             return
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
-            used, _, current_reset = self._recover(database, pool_id, now)
+            used, exhausted, current_reset = self._recover(database, pool_id, now)
             used = max(used, observed_limit - remaining)
             if reset_at is not None and now < reset_at <= now + 86400:
-                current_reset = reset_at
+                if not exhausted:
+                    current_reset = reset_at
+                elif remaining == 0 and current_reset is not None:
+                    # Another exhaustion signal: the block lasts until the later reset.
+                    current_reset = max(current_reset, reset_at)
+                # Otherwise an already-exhausted pool keeps its established
+                # reset. A positive observation can arrive late (a request that
+                # began before the exhaustion was seen) and must neither shorten
+                # nor extend the block.
             # Persist exhaustion only when the ledger knows how it will
             # recover. A provider can report zero remaining without a reset
             # timestamp; storing that forever would strand every application
-            # until the SQLite file was manually edited.
-            shared_exhausted = remaining == 0 and current_reset is not None
+            # until the SQLite file was manually edited. An exhaustion that is
+            # already recorded is never cleared here: it ends only at its reset,
+            # which _recover applies.
+            shared_exhausted = exhausted or (remaining == 0 and current_reset is not None)
             database.execute(
                 "UPDATE quota_pool_state SET used = ?, exhausted = ?, reset_at = ? "
                 "WHERE pool_id = ?",

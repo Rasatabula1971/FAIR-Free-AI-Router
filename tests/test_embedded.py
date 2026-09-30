@@ -2234,3 +2234,65 @@ class TestSharedLedgerRelease:
         assert governor.remaining(spec) == 9
         await governor.release_async(spec, "app")
         assert governor.remaining(spec) == 10
+
+
+class TestSharedExhaustionSurvivesStaleObservations:
+    """An older positive observation must not undo a still-active shared block."""
+
+    def _ledger(self, tmp_path):
+        return SharedQuotaLedger(tmp_path / "quota.sqlite3")
+
+    def _reset(self, ledger, pool="pool"):
+        (row,) = ledger.report([pool], 1002.0)
+        return row["reset_at"]
+
+    def test_stale_positive_observation_does_not_clear_explicit_exhaustion(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert ledger.available("pool", None, 1002.0) is False
+        assert ledger.available("pool", 100, 1002.0) is False
+
+    def test_stale_positive_observation_cannot_shorten_the_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert self._reset(ledger) == 2000.0
+
+    def test_stale_positive_observation_cannot_extend_the_block_either(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 9000.0, 1001.0)
+        assert self._reset(ledger) == 2000.0
+
+    def test_a_later_zero_observation_keeps_the_longer_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 5000.0, 1000.0)
+        ledger.observe("pool", 100, 0, 1500.0, 1001.0)
+        assert self._reset(ledger) == 5000.0
+        assert ledger.available("pool", None, 1002.0) is False
+
+    def test_a_zero_observation_can_lengthen_the_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 0, 4000.0, 1001.0)
+        assert self._reset(ledger) == 4000.0
+
+    def test_exhaustion_is_still_recovered_at_the_trusted_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert ledger.available("pool", None, 1999.0) is False
+        assert ledger.available("pool", None, 2000.0) is True
+
+    def test_a_positive_observation_still_updates_an_unexhausted_pool(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.observe("pool", 100, 40, 1500.0, 1001.0)
+        assert ledger.remaining("pool", 100, 1002.0) == 40
+        assert self._reset(ledger) == 1500.0
+
+    def test_the_block_is_visible_to_another_instance_on_the_same_file(self, tmp_path):
+        first, second, third = (self._ledger(tmp_path) for _ in range(3))
+        first.exhaust("pool", 2000.0, 1000.0)
+        second.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert third.available("pool", None, 1002.0) is False
