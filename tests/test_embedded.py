@@ -1683,3 +1683,151 @@ class TestProbedOutputLimits:
 
         assert MAX_OUTPUT_TOKENS_CEILING > MAX_OUTPUT_TOKENS
         assert self._limits("kilo_free")["qwen/qwen3.8-27b:free"] == MAX_OUTPUT_TOKENS
+
+
+# ── Returning an answer nothing could verify ─────────────────────────────
+
+
+_router_factory = _router
+
+
+class TestAcceptUnverified:
+    """FAIR's promise is not to present unverified text as verified, which is not the
+    same promise as never returning it."""
+
+    def _router(self, text="A considered answer with no deterministic contract."):
+        return _router_factory(entries=[(_spec(), MockAdapter("a", text=text))])
+
+    async def test_open_ended_work_escalates_without_the_flag(self):
+        """The state of affairs this exists to change."""
+        result = await self._router().solve(_request(task="explain the trade-offs"))
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.reason_code == "QUALITY_VERIFICATION_UNAVAILABLE"
+        assert result.output is None
+
+    async def test_the_answer_comes_back_when_the_caller_accepts_that(self):
+        result = await self._router().solve(
+            _request(task="explain the trade-offs", accept_unverified=True)
+        )
+        assert result.status == "ACCEPTED_UNVERIFIED"
+        assert result.reason_code == "RETURNED_WITHOUT_VERIFICATION"
+        assert result.output == "A considered answer with no deterministic contract."
+
+    async def test_it_is_never_reported_as_accepted(self):
+        """A caller comparing against ACCEPTED keeps refusing what FAIR cannot vouch for."""
+        result = await self._router().solve(
+            _request(task="explain the trade-offs", accept_unverified=True)
+        )
+        assert result.status != "ACCEPTED"
+        assert result.verification_state == "UNVERIFIED"
+        assert result.best_quality_score is None
+        assert result.quality.overall_score is None
+
+    async def test_the_attempt_log_still_calls_it_unverified(self):
+        """What FAIR knows does not change because of what the caller will take."""
+        result = await self._router().solve(
+            _request(task="explain the trade-offs", accept_unverified=True)
+        )
+        assert result.attempts[0].disposition == "UNVERIFIED"
+
+    async def test_a_verifiable_answer_is_still_verified_properly(self):
+        router = _router_factory(entries=[(_spec(), MockAdapter("a", text='{"items": [1]}'))])
+        result = await router.solve(
+            _request(
+                task="list items",
+                accept_unverified=True,
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.verification_state == "STRUCTURE_VALIDATED"
+
+    @pytest.mark.parametrize(
+        ("text", "schema"),
+        [
+            ("", None),
+            ("not json", {"type": "object", "required": ["items"]}),
+        ],
+    )
+    async def test_an_answer_that_is_wrong_is_still_refused(self, text, schema):
+        """Unverified means nothing could prove it right, not that nothing checked it."""
+        router = _router_factory(entries=[(_spec(), MockAdapter("a", text=text or " "))])
+        result = await router.solve(
+            _request(task="do the thing", accept_unverified=True, expected_schema=schema)
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.output is None
+
+    async def test_a_truncated_answer_is_still_refused(self):
+        class _Truncated(MockAdapter):
+            async def complete(self, request):
+                response = await super().complete(request)
+                return response.model_copy(update={"finish_reason": "length"})
+
+        router = _router_factory(entries=[(_spec(), _Truncated("a", text="half an ans"))])
+        result = await router.solve(_request(task="explain", accept_unverified=True))
+        assert result.status == "ESCALATION_REQUIRED"
+
+    def test_it_cannot_be_combined_with_a_demand_for_corroboration(self):
+        for demand in ({"cross_check_required": True}, {"quality_level": "high_impact_support"}):
+            with pytest.raises(ValidationError, match="accept_unverified"):
+                _request(task="explain", accept_unverified=True, **demand)
+
+    async def test_an_unverified_answer_is_never_cached(self):
+        """The cache only keeps answers a deterministic contract settled."""
+        router = _router_factory(
+            entries=[(_spec(), MockAdapter("a", text="an answer"))], cache_enabled=True
+        )
+        request = _request(task="explain", accept_unverified=True)
+        first = await router.solve(request)
+        second = await router.solve(request)
+        assert first.status == "ACCEPTED_UNVERIFIED"
+        assert second.cache_hit is False
+
+
+class TestIndependenceGroups:
+    """Two gateways serving one model gave it two ids, and comparing ids alone then
+    called the same model its own independent verifier."""
+
+    def _model(self, provider_id, model_id):
+        return next(
+            m for m in module._CLOUD_PROVIDERS[provider_id]["models"] if m.model_id == model_id
+        )
+
+    def _independent(self, a, b):
+        from fair.quality.consensus import independent
+
+        class _Spec:
+            def __init__(self, provider_id):
+                self.provider_id = provider_id
+
+        return independent((0, _Spec(a[0]), self._model(*a)), (0, _Spec(b[0]), self._model(*b)))
+
+    def test_one_model_behind_two_gateways_is_not_its_own_verifier(self):
+        assert not self._independent(
+            ("groq", "openai/gpt-oss-20b"),
+            ("cloudflare_workers_ai", "@cf/openai/gpt-oss-20b"),
+        )
+
+    def test_the_same_free_model_on_two_gateways_is_not_either(self):
+        assert not self._independent(
+            ("openrouter_free", "cohere/north-mini-code:free"),
+            ("kilo_free", "cohere/north-mini-code:free"),
+        )
+
+    def test_genuinely_different_models_still_verify_each_other(self):
+        assert self._independent(
+            ("groq", "openai/gpt-oss-120b"),
+            ("cloudflare_workers_ai", "@cf/meta/llama-4-scout-17b-16e-instruct"),
+        )
+
+    def test_every_id_naming_one_model_carries_one_group(self):
+        groups: dict = {}
+        for provider_id, entry in module._CLOUD_PROVIDERS.items():
+            for model in entry["models"]:
+                if model.independence_group:
+                    groups.setdefault(model.independence_group, []).append(
+                        (provider_id, model.model_id)
+                    )
+        # A group with one member would be doing nothing; each names a real duplicate.
+        assert all(len(members) > 1 for members in groups.values()), groups

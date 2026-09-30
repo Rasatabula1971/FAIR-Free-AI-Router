@@ -126,13 +126,22 @@ _NO_STRUCTURED_OUTPUT = frozenset(TEXT_CAPABILITIES) - {"structured_output"}
 _TEXT_ADAPTER_MAX_OUTPUT = MAX_OUTPUT_TOKENS
 
 
-def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT):
-    """Each entry is (model_id, context_window) or (model_id, context_window, capabilities)."""
+def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT, independence_group=None):
+    """Each entry is (model_id, context_window) or (model_id, context_window, capabilities).
+
+    independence_group names the weights behind an entry, for cross-checking. Two
+    gateways serving one model give it two ids, and comparing ids alone then calls
+    the same model its own independent verifier. Only an id that demonstrably names
+    the same model carries a group: two sizes from one lab, or two generations of one
+    family, may well share failure modes too, but that is a judgement about models
+    rather than a fact about names, and it belongs to whoever reviews this list.
+    """
     return [
         ModelDescriptor(
             model_id=entry[0],
             context_window=entry[1],
             max_output_tokens=max_output_tokens,
+            independence_group=independence_group,
             capabilities=set(entry[2]) if len(entry) > 2 else set(TEXT_CAPABILITIES),
         )
         for entry in entries
@@ -177,11 +186,15 @@ _CLOUD_PROVIDERS = {
         "request_limit_window": "DAILY_UTC",
         # Probed 2026-09-30: both endpoints accepted 32768, a floor rather than a
         # measured ceiling, and both answered at over 250 tokens/second.
-        "models": _text_models(
-            ("openai/gpt-oss-20b", 131072),
-            ("openai/gpt-oss-120b", 131072),
-            max_output_tokens=32768,
-        ),
+        "models": [
+            # The same weights Cloudflare serves as @cf/openai/gpt-oss-20b.
+            *_text_models(
+                ("openai/gpt-oss-20b", 131072),
+                max_output_tokens=32768,
+                independence_group="openai/gpt-oss-20b",
+            ),
+            *_text_models(("openai/gpt-oss-120b", 131072), max_output_tokens=32768),
+        ],
     },
     "openrouter_free": {
         "kwarg": "openrouter_api_key",
@@ -193,25 +206,31 @@ _CLOUD_PROVIDERS = {
         # when they point at one SharedQuotaLedger.
         "request_limit": 50,
         "request_limit_window": "DAILY_UTC",
-        "models": _text_models(
-            # Reviewed against OpenRouter on 2026-09-27. Nemotron 3 Ultra is
-            # the primary long-context reasoning/agent model but its free
-            # endpoint does not accept response_format.
-            (
-                "nvidia/nemotron-3-ultra-550b-a55b:free",
-                1000000,
-                _NO_STRUCTURED_OUTPUT,
+        "models": [
+            *_text_models(
+                # Reviewed against OpenRouter on 2026-09-27. Nemotron 3 Ultra is
+                # the primary long-context reasoning/agent model but its free
+                # endpoint does not accept response_format.
+                (
+                    "nvidia/nemotron-3-ultra-550b-a55b:free",
+                    1000000,
+                    _NO_STRUCTURED_OUTPUT,
+                ),
+                # Nex-N2.5 Mini was the only OpenRouter route here that accepted a
+                # JSON Schema. Probed 2026-09-30: ABSENT_FROM_CATALOG -- OpenRouter no
+                # longer lists it, so FAIR dropped it on every solve and reported only
+                # that a reviewed model was unavailable. Left out rather than left
+                # failing; OpenRouter now has no structured-output route, which is why
+                # a schema request skips this provider entirely.
             ),
-            # Nex-N2.5 Mini was the only OpenRouter route here that accepted a
-            # JSON Schema. Probed 2026-09-30: ABSENT_FROM_CATALOG -- OpenRouter no
-            # longer lists it, so FAIR dropped it on every solve and reported only
-            # that a reviewed model was unavailable. Left out rather than left
-            # failing; OpenRouter now has no structured-output route, which is why
-            # a schema request skips this provider entirely.
-            # Keep a fast coding-specialist fallback. It does not accept
-            # response_format, so it must not be selected for schema requests.
-            ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
-        ),
+            # A fast coding-specialist fallback. It does not accept response_format,
+            # so it must not be selected for schema requests. Kilo serves the same
+            # model, so both carry one independence group.
+            *_text_models(
+                ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
+                independence_group="cohere/north-mini-code",
+            ),
+        ],
     },
     "mistral": {
         "kwarg": "mistral_api_key",
@@ -240,12 +259,18 @@ _CLOUD_PROVIDERS = {
         # These are current non-NVIDIA zero-priced routes. Kilo model
         # availability is dynamic, so the adapter still re-checks the live
         # catalog and exact $0 pricing before every model can be used.
-        "models": _text_models(
-            ("qwen/qwen3.8-27b:free", 262144, _NO_STRUCTURED_OUTPUT),
-            ("thinkingmachines/inkling-small:free", 1048576, _NO_STRUCTURED_OUTPUT),
-            ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
-            ("liquid/lfm-2.5-2.6b:free", 65536, _NO_STRUCTURED_OUTPUT),
-        ),
+        "models": [
+            *_text_models(
+                ("qwen/qwen3.8-27b:free", 262144, _NO_STRUCTURED_OUTPUT),
+                ("thinkingmachines/inkling-small:free", 1048576, _NO_STRUCTURED_OUTPUT),
+                ("liquid/lfm-2.5-2.6b:free", 65536, _NO_STRUCTURED_OUTPUT),
+            ),
+            # The same model OpenRouter serves under this id.
+            *_text_models(
+                ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
+                independence_group="cohere/north-mini-code",
+            ),
+        ],
     },
     "cloudflare_workers_ai": {
         "kwarg": "cloudflare_api_token",
@@ -261,10 +286,14 @@ _CLOUD_PROVIDERS = {
             *_text_models(
                 ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 24000), max_output_tokens=16384
             ),
+            # The same weights Groq serves as openai/gpt-oss-20b.
             *_text_models(
                 ("@cf/openai/gpt-oss-20b", 128000),
-                ("@cf/meta/llama-4-scout-17b-16e-instruct", 131000),
                 max_output_tokens=32768,
+                independence_group="openai/gpt-oss-20b",
+            ),
+            *_text_models(
+                ("@cf/meta/llama-4-scout-17b-16e-instruct", 131000), max_output_tokens=32768
             ),
         ],
     },

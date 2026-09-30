@@ -301,6 +301,40 @@ add one even when told not to); prose around the JSON is still a schema failure.
 `standard`, escalated at `advanced` and `high_impact_support`. Tasks the profiler
 flags as needing code or grounding still require a matching contract.
 
+### Work nothing can verify
+
+Every contract below settles an answer mechanically. Open-ended work — analysis, a
+plan, a design rationale, long-form reasoning — has no such contract, so
+`acceptable()` never passes it and the request can only escalate with
+`QUALITY_VERIFICATION_UNAVAILABLE`, whichever model answered.
+
+`accept_unverified=True` changes that, and nothing else:
+
+```python
+result = await fair.solve("Explain the trade-offs between X and Y", accept_unverified=True)
+result.status              # "ACCEPTED_UNVERIFIED", never "ACCEPTED"
+result.verification_state  # "UNVERIFIED"
+result.best_quality_score  # None
+```
+
+FAIR's guarantee is that it never presents unverified text as verified. That is not
+the same as never returning it, and the two had been conflated. The answer comes
+back under its own status, with no score, and the attempt log still records the
+disposition as `UNVERIFIED`: what FAIR knows about an answer does not change because
+of what the caller is willing to take. A caller that tests `status == "ACCEPTED"`
+keeps refusing it without changing a line.
+
+Unverified means nothing could prove the answer right, not that nothing checked it.
+Everything that finds an answer actually **wrong** still refuses: an empty or
+truncated response, a schema, arithmetic or claim mismatch, a fabricated or
+unsupported citation, a self-contradiction, grounding the task required and did not
+get, and a source policy that was blocked or could not run.
+
+It cannot be combined with `cross_check_required` or `high_impact_support`. Both ask
+for independent corroboration, which is precisely what an unverified answer lacks.
+Unverified answers are never cached, since the cache only keeps what a deterministic
+contract settled.
+
 ### Schemas and provider dialects
 
 The schema you pass is full JSON Schema 2020-12 and every response is validated
@@ -562,6 +596,14 @@ truth. Without `source_reviews`, any request carrying a `source_policy` is repor
 
 ## Cross-checking
 
+Two gateways serving one model give it two ids, and comparing ids alone would call
+that model its own independent verifier — `openai/gpt-oss-20b` on Groq and
+`@cf/openai/gpt-oss-20b` on Cloudflare are the same weights. Descriptors that name
+the same model share an `independence_group`, so a cross-check cannot be satisfied
+by asking it twice. Two sizes from one lab, or two generations of one family, may
+share failure modes as well, but that is a judgement about models rather than a fact
+about names, and it is left to whoever reviews the registry.
+
 Request a second independent model to verify the answer:
 
 ```python
@@ -578,6 +620,8 @@ result = await fair.solve(
 ## Response statuses
 
 - **`ACCEPTED`** — answer passed all validation checks
+- **`ACCEPTED_UNVERIFIED`** — an answer nothing could verify, returned because the
+  request asked for it (see below). Deliberately not `ACCEPTED`
 - **`ESCALATION_REQUIRED`** — no model produced a verified answer
 - **`FAILED`** — infrastructure failure (validator error, all providers down)
 
@@ -689,7 +733,7 @@ fair = FAIR(
 )
 ```
 
-Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `ACCEPTED`, `ESCALATION_REQUIRED`, `FAILED`.
+Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `ACCEPTED`, `ACCEPTED_UNVERIFIED`, `ESCALATION_REQUIRED`, `FAILED`.
 
 ## Architecture
 
