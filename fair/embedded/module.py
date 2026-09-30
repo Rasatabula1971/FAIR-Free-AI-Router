@@ -793,8 +793,15 @@ class FAIR:
             ),
         }
 
-    def clear_cache(self, client_id: str = "embedded") -> dict:
-        return self._router.cache.clear(client_id)
+    def clear_cache(self, client_id: str | None = None) -> dict:
+        """Clear cached answers for ``client_id``, or for this instance's own identity.
+
+        Omitting ``client_id`` clears what :meth:`solve` caches by default: the
+        ``application_id`` this instance was built with (``"embedded"`` when it was
+        never named). A different client is cleared only when named explicitly.
+        """
+        identity = self._application_id if client_id is None else client_id
+        return self._router.cache.clear(identity)
 
     async def close(self):
         await self._router.close()

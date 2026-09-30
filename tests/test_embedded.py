@@ -1238,7 +1238,7 @@ class TestFAIRModule:
         fair = FAIR(providers=[(spec, adapter)], cache_enabled=True)
         await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
         result = fair.clear_cache()
-        assert result["entries_removed"] >= 0
+        assert result["entries_removed"] == 1
 
     @pytest.mark.asyncio
     async def test_event_callback(self):
@@ -2632,3 +2632,49 @@ class TestSharedLedgerClosesItsConnections:
         assert all(results)
         assert len(opened) >= 200
         assert all(self._is_closed(c) for c in opened)
+
+
+class TestClearCacheDefaultIdentity:
+    """clear_cache() with no argument clears the identity solve() caches under."""
+
+    ARITHMETIC = {"kind": "arithmetic", "expression": "15*23"}
+
+    def _fair(self, **kwargs):
+        adapter = MockAdapter("a", text="345")
+        fair = FAIR(providers=[(_spec(), adapter)], cache_enabled=True, **kwargs)
+        return fair, adapter
+
+    async def _solve(self, fair, **kwargs):
+        return await fair.solve("15*23", validation=self.ARITHMETIC, **kwargs)
+
+    async def test_a_named_application_clears_its_own_entries_by_default(self):
+        fair, adapter = self._fair(application_id="corp")
+        await self._solve(fair)
+        assert fair.clear_cache() == {"entries_removed": 1}
+        await self._solve(fair)
+        assert adapter.calls == 2  # the cleared answer was not served from cache
+
+    async def test_an_unnamed_instance_still_clears_the_embedded_identity(self):
+        fair, adapter = self._fair()
+        await self._solve(fair)
+        assert fair.clear_cache() == {"entries_removed": 1}
+        await self._solve(fair)
+        assert adapter.calls == 2
+
+    async def test_an_explicit_client_id_clears_only_that_client(self):
+        fair, adapter = self._fair(application_id="corp")
+        await self._solve(fair)
+        await self._solve(fair, client_id="video")
+        assert fair.clear_cache("video") == {"entries_removed": 1}
+        await self._solve(fair)
+        assert adapter.calls == 2  # corp's entry survived; video's did not
+
+    async def test_the_old_embedded_default_does_not_clear_a_named_application(self):
+        fair, _ = self._fair(application_id="corp")
+        await self._solve(fair)
+        assert fair.clear_cache("embedded") == {"entries_removed": 0}
+        assert fair.clear_cache() == {"entries_removed": 1}
+
+    async def test_clearing_an_empty_cache_removes_nothing(self):
+        fair, _ = self._fair(application_id="corp")
+        assert fair.clear_cache() == {"entries_removed": 0}
