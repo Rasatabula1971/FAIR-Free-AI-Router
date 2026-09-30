@@ -27,6 +27,13 @@ from fair.providers.base import (
     RateLimited,
     RequestNotSupported,
 )
+from fair.providers.schema_dialects import (
+    GEMINI,
+    JSON_SCHEMA,
+    OPENAI_STRICT,
+    constraint_notes,
+    transport_schema,
+)
 from fair.quality.json_data import strict_json
 from fair.schemas.domain import DTO, NormalizedModelResponse, ProviderHealth, QuotaSnapshot
 from fair.security.credentials import ProviderCredentials
@@ -41,6 +48,10 @@ class LiveSettings(DTO):
     gemini_max_output_tokens: int = Field(default=65536, ge=1, le=65536, strict=True)
     openrouter_free_account_confirmed: bool = False
     ollama_local_only_confirmed: bool = False
+    # Operator-only. Keeps the last non-200 provider message, bounded and scrubbed,
+    # readable through safe_diagnostics(). Off by default: an upstream body is
+    # provider text, and HTTP_400 alone leaves an operator nothing to act on.
+    provider_error_diagnostics: bool = False
     ollama_url: str = "http://127.0.0.1:11434"
     confirmed_providers: set[str] = Field(default_factory=set)
     review_max_age_days: int = Field(default=30, ge=1, le=30)
@@ -136,8 +147,16 @@ class TextAdapter:
     credential_header = "Authorization"
     credential_prefix = "Bearer "
     inspect_error_body = False
+    # Which structured-output dialect this provider's API speaks. The caller's schema
+    # is reduced to that dialect before dispatch; see fair.providers.schema_dialects.
+    schema_dialect = OPENAI_STRICT
 
     _catalog_ttl = 60
+    # An upstream error body is provider text, so only a bounded, credential-scrubbed
+    # message is kept, only when an operator turns diagnostics on, and only through
+    # safe_diagnostics(). No raised code and no attempt log changes either way.
+    _diagnostic_max_chars = 512
+    _diagnostic_parse_limit = 20_000
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -145,6 +164,7 @@ class TextAdapter:
         self._quota = QuotaSnapshot(provider_id=self.provider_id)
         self._model_cache = None
         self._model_cache_at = 0.0
+        self._last_error: dict[str, str] | None = None
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=5, read=25, write=5, pool=5),
             trust_env=False,
@@ -223,6 +243,54 @@ class TextAdapter:
         """Provider-specific structured error hook; must raise for non-200 responses."""
         self._error(status, headers)
 
+    @staticmethod
+    def _error_message(data):
+        """The human-readable message out of the error envelopes these APIs use."""
+        if isinstance(data, str):
+            return data
+        if not isinstance(data, dict):
+            return ""
+        error = data.get("error")
+        if isinstance(error, str):
+            return error
+        if isinstance(error, dict):
+            for key in ("message", "detail", "description"):
+                if isinstance(error.get(key), str):
+                    return error[key]
+        entries = data.get("errors")
+        if isinstance(entries, list):
+            messages = [
+                item["message"]
+                for item in entries
+                if isinstance(item, dict) and isinstance(item.get("message"), str)
+            ]
+            if messages:
+                return "; ".join(messages)
+        for key in ("message", "detail", "error_description"):
+            if isinstance(data.get(key), str):
+                return data[key]
+        return ""
+
+    def _record_error_diagnostic(self, status, raw):
+        text = raw.decode("utf-8", errors="replace")[: self._diagnostic_parse_limit]
+        try:
+            message = self._error_message(json.loads(text)) or text
+        except ValueError:
+            message = text
+        if self._credential is not None:
+            secret = self._credential.get_secret_value()
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        message = " ".join(message.split())
+        self._last_error = {
+            "status": f"HTTP_{status}",
+            "provider_message": message[: self._diagnostic_max_chars] or "EMPTY_ERROR_BODY",
+        }
+
+    def safe_diagnostics(self):
+        """Fixed, secret-scanned operator diagnostics; empty unless something was recorded."""
+        return {"last_provider_error": dict(self._last_error)} if self._last_error else {}
+
     async def _json(self, method, path, payload=None):
         self._admit()
         headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
@@ -233,7 +301,12 @@ class TextAdapter:
         url = path if path.startswith("https://") else self.base_url + path
         try:
             async with self._client.stream(method, url, headers=headers, json=payload) as response:
-                if response.status_code != 200 and not self.inspect_error_body:
+                # An error body is read only when a subclass parses it for quota or
+                # retry detail, or when an operator has turned diagnostics on. With
+                # neither, the status code alone is the observation and the body is
+                # never fetched -- the behaviour this branch has always had.
+                capture = response.status_code != 200 and self.settings.provider_error_diagnostics
+                if response.status_code != 200 and not self.inspect_error_body and not capture:
                     self._error(response.status_code, response.headers)
                 if response.headers.get("content-encoding", "identity") != "identity":
                     raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
@@ -243,7 +316,14 @@ class TextAdapter:
                     if size > 4_000_000:
                         raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
                     chunks.append(chunk)
-                value = strict_json(b"".join(chunks).decode("utf-8"))
+                raw = b"".join(chunks)
+                if capture:
+                    self._record_error_diagnostic(response.status_code, raw)
+                if response.status_code != 200 and not self.inspect_error_body:
+                    # The same code in the same order as with diagnostics off; a
+                    # body that is not JSON must not change what the caller sees.
+                    self._error(response.status_code, response.headers)
+                value = strict_json(raw.decode("utf-8"))
                 if not isinstance(value, dict):
                     raise ValueError()
                 if response.status_code != 200:
@@ -336,6 +416,19 @@ class TextAdapter:
             if not isinstance(usage, dict) or not zero(usage.get("cost")):
                 raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
+    def _schema_for_transport(self, request):
+        """The schema this provider can parse, and prompt text for what it cannot carry."""
+        if request.expected_json_schema is None:
+            return None, None
+        return (
+            transport_schema(request.expected_json_schema, self.schema_dialect),
+            constraint_notes(request.expected_json_schema, self.schema_dialect),
+        )
+
+    @staticmethod
+    def _task_text(request, note):
+        return request.task if note is None else request.task + "\n\n" + note
+
     async def complete(self, request):
         models = await self.list_models()
         model = next((item for item in models if item.model_id == request.model_id), None)
@@ -345,21 +438,18 @@ class TextAdapter:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         if len(request.task.encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
+        schema, note = self._schema_for_transport(request)
         payload = {
             "model": model.model_id,
-            "messages": [{"role": "user", "content": request.task}],
+            "messages": [{"role": "user", "content": self._task_text(request, note)}],
             "stream": False,
             self.output_tokens_key: request.max_output_tokens,
         }
         payload.update(copy.deepcopy(self.extra_payload))
-        if request.expected_json_schema is not None:
+        if schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": "fair_result",
-                    "strict": True,
-                    "schema": request.expected_json_schema,
-                },
+                "json_schema": {"name": "fair_result", "strict": True, "schema": schema},
             }
         await self._before_completion(payload)
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
@@ -474,8 +564,8 @@ class KiloFreeAdapter(TextAdapter):
         super().__init__(*args, **kwargs)
 
     def safe_diagnostics(self):
-        """Expose only a fixed billing-verification state, never raw provider data."""
-        return {"cost_microdollars": self._cost_observation}
+        """Fixed billing-verification state, plus whatever the base adapter recorded."""
+        return super().safe_diagnostics() | {"cost_microdollars": self._cost_observation}
 
     def _after_completion(self, data):
         usage = data.get("usage")
@@ -709,6 +799,7 @@ class GeminiAdapter(TextAdapter):
     credential_header = "x-goog-api-key"
     credential_prefix = ""
     inspect_error_body = True
+    schema_dialect = GEMINI
     _pacific = ZoneInfo("America/Los_Angeles")
 
     def _daily_reset_at(self):
@@ -819,16 +910,17 @@ class GeminiAdapter(TextAdapter):
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_REQUIRED")
         if not 1 <= request.max_output_tokens <= self.settings.gemini_max_output_tokens:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
+        schema, note = self._schema_for_transport(request)
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": request.task}]}],
+            "contents": [{"role": "user", "parts": [{"text": self._task_text(request, note)}]}],
             "generationConfig": {
                 "candidateCount": 1,
                 "maxOutputTokens": request.max_output_tokens,
             },
         }
-        if request.expected_json_schema is not None:
+        if schema is not None:
             payload["generationConfig"].update(
-                responseMimeType="application/json", responseJsonSchema=request.expected_json_schema
+                responseMimeType="application/json", responseJsonSchema=schema
             )
         # Gemini publishes separate input and output limits; the output allowance does not
         # consume the configured input capacity. Byte counting remains conservative.
@@ -888,6 +980,7 @@ class OllamaLocalAdapter(TextAdapter):
     expected_provider = "ollama_local"
     expected_access = "FREE_LOCAL"
     remote = False
+    schema_dialect = JSON_SCHEMA
 
     def __init__(self, spec, settings, **kwargs):
         self.base_url = settings.ollama_url.rstrip("/")
@@ -953,15 +1046,16 @@ class OllamaLocalAdapter(TextAdapter):
             or len(request.task.encode()) + request.max_output_tokens > model.context_window
         ):
             raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
+        schema, note = self._schema_for_transport(request)
         payload = {
             "model": model.model_id,
             "stream": False,
-            "messages": [{"role": "user", "content": request.task}],
+            "messages": [{"role": "user", "content": self._task_text(request, note)}],
             "options": {"num_predict": request.max_output_tokens, "num_ctx": model.context_window},
             "keep_alive": 0,
         }
-        if request.expected_json_schema is not None:
-            payload["format"] = request.expected_json_schema
+        if schema is not None:
+            payload["format"] = schema
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/api/chat", payload)

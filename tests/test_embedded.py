@@ -1509,3 +1509,38 @@ class TestRemovedNativeContract:
             }
         )
         assert request.validation.kind == "python_function"
+
+
+# ── Dropped schema constraints stay enforced ─────────────────────────────
+
+
+class TestTransportedConstraintsStillJudgeTheAnswer:
+    """Transport drops what a provider cannot parse; the caller's schema still decides."""
+
+    SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "items": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}}
+        },
+    }
+
+    async def _solve(self, text):
+        router = _router(entries=[(_spec(), MockAdapter("a", text=text))])
+        return await router.solve(_request(task="list items", expected_schema=self.SCHEMA))
+
+    async def test_a_response_breaking_a_dropped_min_items_is_still_rejected(self):
+        result = await self._solve('{"items": ["one"]}')
+        assert result.status == "ESCALATION_REQUIRED"
+        assert "SCHEMA_FAILURE" in result.attempts[0].quality.reject_reasons
+
+    async def test_a_response_breaking_a_dropped_min_length_is_still_rejected(self):
+        result = await self._solve('{"items": ["one", ""]}')
+        assert result.status == "ESCALATION_REQUIRED"
+        assert "SCHEMA_FAILURE" in result.attempts[0].quality.reject_reasons
+
+    async def test_a_conforming_response_is_accepted(self):
+        result = await self._solve('{"items": ["one", "two"]}')
+        assert result.status == "ACCEPTED"
+        assert result.verification_state == "STRUCTURE_VALIDATED"
