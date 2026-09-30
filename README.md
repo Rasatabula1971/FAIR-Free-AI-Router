@@ -301,6 +301,57 @@ add one even when told not to); prose around the JSON is still a schema failure.
 `standard`, escalated at `advanced` and `high_impact_support`. Tasks the profiler
 flags as needing code or grounding still require a matching contract.
 
+### Schemas and provider dialects
+
+The schema you pass is full JSON Schema 2020-12 and every response is validated
+against it locally. Provider structured-output APIs accept much less: OpenAI strict
+mode (Groq, OpenRouter, Mistral, Kilo, Cloudflare) rejects `minLength`, `minItems`,
+`maxItems`, `minimum`, `maximum`, `pattern`, `format` and `const`, and requires
+`additionalProperties: false` plus every property listed in `required`; Gemini
+rejects a different set including `additionalProperties`.
+
+FAIR therefore sends each provider only the shape of your schema — types,
+properties, required, items, enums — and restates the dropped constraints as prompt
+text ("1 to 5 items", "must not be empty"). Nothing is weakened: the full schema
+still judges the answer, and a response that breaks a dropped constraint is still a
+schema failure. `const` is rewritten as a single-value `enum`, which every dialect
+accepts.
+
+Two problems cannot be fixed this way, because repairing them would change what a
+schema means, and providers reject both with an opaque HTTP 400: an object without
+`additionalProperties: false`, or a `required` list that omits a declared property;
+and the `oneOf` / `allOf` / `not` combinators. Check a schema before wiring it in:
+
+```bash
+python -m fair.tools.schema_compat request.json
+python -m fair.tools.schema_compat request.json --key expected_schema
+python -m fair.tools.schema_compat request.json --emit openai_strict
+```
+
+It prints, per dialect, what must be fixed, what will be dropped, and the prompt
+text that replaces it. It exits non-zero when a schema needs an author fix, so it
+works as a CI check.
+
+### Diagnosing a provider rejection
+
+A non-200 from a provider is reported as its status code alone — `HTTP_400` —
+because an upstream error body is provider text, not FAIR's own observation. That
+makes an unsupported-schema rejection indistinguishable from a context-length one.
+Set `provider_error_diagnostics=True` (or `FAIR_PROVIDER_ERROR_DIAGNOSTICS=1`) and
+the last non-200 message per adapter is kept — bounded to 512 characters, with any
+credential redacted — and readable through `safe_diagnostics()`:
+
+```python
+fair = FAIR(..., provider_error_diagnostics=True)
+result = await fair.solve(...)
+fair._registry.adapters["groq"].safe_diagnostics()
+# {"last_provider_error": {"status": "HTTP_400",
+#                          "provider_message": "... 'minLength' is unsupported ..."}}
+```
+
+Raised codes, reason codes and the attempt log are identical either way; the flag
+only adds the record. It is off by default.
+
 ```python
 # Code validation
 result = await fair.solve(
@@ -450,6 +501,7 @@ FAIR(
     quota_pool_ids={              # optional account/project identity overrides
         "openrouter_free": "openrouter-main",
     },
+    provider_error_diagnostics=False, # or env: FAIR_PROVIDER_ERROR_DIAGNOSTICS
     on_event=callback,            # optional (event_type, payload) callback
 )
 ```

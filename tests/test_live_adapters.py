@@ -12,11 +12,13 @@ from fair.providers.base import (
     AccessDenied,
     AuthenticationFailed,
     BillingViolation,
+    ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
 )
 from fair.providers.live import (
     CloudflareWorkersAiAdapter,
+    GeminiAdapter,
     GroqAdapter,
     KiloFreeAdapter,
     LiveSettings,
@@ -885,3 +887,263 @@ class TestModuleWiring:
             monkeypatch.delenv(entry["env"], raising=False)
         fair = FAIR(ollama_url="http://localhost:1", ollama_models=["llama3.2:3b"])
         assert fair.providers()[0]["models"] == ["llama3.2:3b"]
+
+
+# ── Structured-output transport ──────────────────────────────────────────
+
+_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["kind", "items"],
+    "properties": {
+        "kind": {"type": "string", "const": "payoff_reveal"},
+        "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {"type": "string", "minLength": 1},
+        },
+    },
+}
+
+
+def _diagnostic_settings():
+    return LiveSettings(
+        enabled=True,
+        confirmed_providers=set(_CLOUD_PROVIDERS),
+        provider_error_diagnostics=True,
+    )
+
+
+class TestSchemaTransport:
+    """The caller's schema is reduced to what the provider parses; the rest goes in the prompt."""
+
+    MODEL = "openai/gpt-oss-20b"
+
+    def _adapter(self, settings=None, status=200, body=None):
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): (
+                    status,
+                    _completion(self.MODEL) if body is None else body,
+                ),
+            }
+        )
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            settings or _settings(),
+            credential=SecretStr("sk-secret-value"),
+            transport=transport,
+        )
+        return adapter, seen
+
+    def _schema_request(self):
+        return _request(self.MODEL).model_copy(update={"expected_json_schema": _SCHEMA})
+
+    async def _sent(self):
+        adapter, seen = self._adapter()
+        await adapter.complete(self._schema_request())
+        return json.loads(seen[-1].content)
+
+    async def test_unsupported_keywords_never_reach_the_provider(self):
+        body = json.dumps(await self._sent())
+        for keyword in ("minLength", "minItems", "maxItems"):
+            assert keyword not in body, keyword
+
+    async def test_const_is_sent_as_a_single_value_enum(self):
+        schema = (await self._sent())["response_format"]["json_schema"]["schema"]
+        assert schema["properties"]["kind"] == {"type": "string", "enum": ["payoff_reveal"]}
+
+    async def test_strict_mode_and_structure_are_preserved(self):
+        block = (await self._sent())["response_format"]["json_schema"]
+        assert block["strict"] is True
+        assert block["schema"]["additionalProperties"] is False
+        assert block["schema"]["required"] == ["kind", "items"]
+
+    async def test_dropped_constraints_are_restated_in_the_prompt(self):
+        content = (await self._sent())["messages"][0]["content"]
+        assert content.startswith("ping")
+        assert "1 to 5 items" in content
+        assert "must not be empty" in content
+
+    async def test_a_request_without_a_schema_sends_the_task_unchanged(self):
+        adapter, seen = self._adapter()
+        await adapter.complete(_request(self.MODEL))
+        payload = json.loads(seen[-1].content)
+        assert payload["messages"][0]["content"] == "ping"
+        assert "response_format" not in payload
+
+    async def test_gemini_receives_its_own_dialect(self):
+        model = "gemini-3.6-flash"
+        transport, seen = _transport(
+            {
+                ("GET", "/models/" + model): (
+                    200,
+                    {
+                        "name": "models/" + model,
+                        "inputTokenLimit": 1048576,
+                        "outputTokenLimit": 65536,
+                        "supportedGenerationMethods": ["generateContent"],
+                    },
+                ),
+                ("POST", ":generateContent"): (
+                    200,
+                    {
+                        "modelVersion": model,
+                        "candidates": [
+                            {
+                                "content": {"role": "model", "parts": [{"text": "{}"}]},
+                                "finishReason": "STOP",
+                            }
+                        ],
+                    },
+                ),
+            }
+        )
+        adapter = GeminiAdapter(
+            _spec("google_gemini_api", "FREE_RECURRING", model, context=1048576),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        await adapter.complete(_request(model).model_copy(update={"expected_json_schema": _SCHEMA}))
+        payload = json.loads(seen[-1].content)
+        schema = payload["generationConfig"]["responseJsonSchema"]
+        # Gemini rejects additionalProperties; strict mode requires it. One schema
+        # cannot satisfy both, which is the whole reason a dialect exists.
+        assert "additionalProperties" not in json.dumps(schema)
+        assert schema["properties"]["kind"]["enum"] == ["payoff_reveal"]
+        assert "1 to 5 items" in payload["contents"][0]["parts"][0]["text"]
+
+
+class TestProviderErrorDiagnostics:
+    """HTTP_400 alone leaves an operator nothing to act on; the body is opt-in and scrubbed."""
+
+    MODEL = "openai/gpt-oss-20b"
+    BODY = {"error": {"message": "response_format.json_schema.schema: 'minLength' is unsupported"}}
+
+    def _adapter(self, settings, status=400, body=None):
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): (status, self.BODY if body is None else body),
+            }
+        )
+        return GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            settings,
+            credential=SecretStr("sk-secret-value"),
+            transport=transport,
+        )
+
+    async def _fail(self, settings, **kwargs):
+        adapter = self._adapter(settings, **kwargs)
+        with pytest.raises(ProviderUnavailable, match="HTTP_400"):
+            await adapter.complete(_request(self.MODEL))
+        return adapter
+
+    async def test_nothing_is_retained_by_default(self):
+        adapter = await self._fail(_settings())
+        assert adapter.safe_diagnostics() == {}
+
+    async def test_the_provider_message_is_retained_when_enabled(self):
+        adapter = await self._fail(_diagnostic_settings())
+        record = adapter.safe_diagnostics()["last_provider_error"]
+        assert record["status"] == "HTTP_400"
+        assert "'minLength' is unsupported" in record["provider_message"]
+
+    async def test_the_raised_code_is_the_same_either_way(self):
+        # Both calls above assert ProviderUnavailable("HTTP_400"); diagnostics add a
+        # record, they never change what the router or the attempt log sees.
+        await self._fail(_settings())
+        await self._fail(_diagnostic_settings())
+
+    async def test_a_body_that_is_not_json_still_reports_the_status(self):
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): lambda request: httpx.Response(
+                    400, content=b"<html>gateway error</html>"
+                ),
+            }
+        )
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _diagnostic_settings(),
+            credential=SecretStr("sk-secret-value"),
+            transport=transport,
+        )
+        with pytest.raises(ProviderUnavailable, match="HTTP_400"):
+            await adapter.complete(_request(self.MODEL))
+        assert (
+            "gateway error" in adapter.safe_diagnostics()["last_provider_error"]["provider_message"]
+        )
+
+    async def test_a_credential_echoed_by_the_provider_is_redacted(self):
+        adapter = await self._fail(
+            _diagnostic_settings(),
+            body={"error": {"message": "invalid key sk-secret-value supplied"}},
+        )
+        message = adapter.safe_diagnostics()["last_provider_error"]["provider_message"]
+        assert "sk-secret-value" not in message
+        assert "[redacted]" in message
+
+    async def test_the_record_is_bounded(self):
+        adapter = await self._fail(_diagnostic_settings(), body={"error": {"message": "x" * 5000}})
+        message = adapter.safe_diagnostics()["last_provider_error"]["provider_message"]
+        assert len(message) <= 512
+
+    async def test_cloudflare_error_codes_still_win_over_the_record(self):
+        """A structured quota error must keep its own exception, not become HTTP_429."""
+        transport, _ = _transport(
+            {
+                ("GET", "/ai/models/search"): (
+                    200,
+                    {
+                        "result": [
+                            {
+                                "name": "@cf/openai/gpt-oss-20b",
+                                "properties": [
+                                    {"property_id": "context_window", "value": "131072"}
+                                ],
+                            }
+                        ]
+                    },
+                ),
+                ("POST", "/chat/completions"): (429, {"error": {"code": 3036}}),
+            }
+        )
+        adapter = CloudflareWorkersAiAdapter(
+            _spec("cloudflare_workers_ai", "FREE_RECURRING", "@cf/openai/gpt-oss-20b"),
+            _diagnostic_settings(),
+            account_id=ACCOUNT,
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(QuotaExceeded, match="DAILY_NEURON_ALLOCATION_SPENT"):
+            await adapter.complete(_request("@cf/openai/gpt-oss-20b"))
+
+    def test_kilo_keeps_its_billing_state_alongside_the_record(self):
+        transport, _ = _transport({})
+        adapter = KiloFreeAdapter(
+            _spec("kilo_free", "FREE_DYNAMIC", "qwen/qwen3.8-27b:free"),
+            _diagnostic_settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        assert adapter.safe_diagnostics() == {"cost_microdollars": "NOT_OBSERVED"}
+        adapter._record_error_diagnostic(400, b'{"error":{"message":"bad"}}')
+        assert adapter.safe_diagnostics() == {
+            "cost_microdollars": "NOT_OBSERVED",
+            "last_provider_error": {"status": "HTTP_400", "provider_message": "bad"},
+        }

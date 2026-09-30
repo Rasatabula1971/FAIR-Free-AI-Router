@@ -244,6 +244,14 @@ _CLOUD_PROVIDERS = {
 _LOCAL_CONTEXT_CAP = 16384
 
 
+_OFF = frozenset({"", "0", "false", "no", "off"})
+
+
+def _flag(value):
+    """An environment flag is on unless it is absent or an explicit off value."""
+    return value is not None and value.strip().casefold() not in _OFF
+
+
 def _read_env_file(path):
     values = {}
     with open(path, encoding="utf-8") as handle:
@@ -347,6 +355,7 @@ class FAIR:
         application_id: str | None = None,
         shared_quota_path: str | None = None,
         quota_pool_ids: dict[str, str] | None = None,
+        provider_error_diagnostics: bool = False,
         on_event: Callable[[str, dict], None] | None = None,
     ):
         self._registry = Registry()
@@ -406,6 +415,8 @@ class FAIR:
         live_settings = LiveSettings(
             enabled=True,
             confirmed_providers=confirmed | {"ollama_local"},
+            provider_error_diagnostics=provider_error_diagnostics
+            or _flag(env.get("FAIR_PROVIDER_ERROR_DIAGNOSTICS")),
         )
 
         for provider_id, entry in _CLOUD_PROVIDERS.items():
