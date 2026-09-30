@@ -667,6 +667,7 @@ class FAIR:
         evidence: list[dict] | None = None,
         source_policy: dict | None = None,
         cross_check_required: bool | None = None,
+        accept_unverified: bool = False,
         max_output_tokens: int = 1024,
         min_output_tokens: int | None = None,
         client_id: str | None = None,
@@ -681,8 +682,16 @@ class FAIR:
         PUBLIC routes to local Ollama or not at all -- an unroutable class
         escalates rather than downgrading to a cloud provider.
 
+        ``accept_unverified=True`` lets open-ended work that no deterministic
+        contract can verify come back under its own ``ACCEPTED_UNVERIFIED`` status,
+        with no score. Anything that finds an answer wrong still refuses it, and it
+        cannot be combined with ``cross_check_required`` or ``high_impact_support``
+        (including an instance-wide default): a conflict raises rather than
+        silently dropping the corroboration the caller or instance asked for.
+
         Returns a SolveResponse with:
-        - status: "ACCEPTED" (verified answer), "ESCALATION_REQUIRED" (no model passed),
+        - status: "ACCEPTED" (verified answer), "ACCEPTED_UNVERIFIED" (only when
+                  ``accept_unverified=True``), "ESCALATION_REQUIRED" (no model passed),
                   or "FAILED" (infrastructure failure)
         - output: the verified answer text (only when ACCEPTED)
         - quality: full QualityReport with scores and verification state
@@ -703,6 +712,7 @@ class FAIR:
                 "cross_check_required": (
                     cross_check_required if cross_check_required is not None else self._cross_check
                 ),
+                "accept_unverified": accept_unverified,
                 "max_output_tokens": max_output_tokens,
                 "min_output_tokens": min_output_tokens,
                 "priority": priority,

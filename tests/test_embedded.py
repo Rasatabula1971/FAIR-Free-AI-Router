@@ -2296,3 +2296,75 @@ class TestSharedExhaustionSurvivesStaleObservations:
         first.exhaust("pool", 2000.0, 1000.0)
         second.observe("pool", 100, 99, 1500.0, 1001.0)
         assert third.available("pool", None, 1002.0) is False
+
+
+class TestAcceptUnverifiedThroughThePublicApi:
+    """The documented call is FAIR.solve(), not EmbeddedRouter.solve(SolveRequest)."""
+
+    TASK = "Explain the trade-offs between X and Y"
+    TEXT = "A considered answer with no deterministic contract."
+
+    def _fair(self, text=None, **kwargs):
+        adapter = MockAdapter("a", text=self.TEXT if text is None else text)
+        return FAIR(providers=[(_spec(), adapter)], **kwargs), adapter
+
+    async def test_open_ended_work_still_escalates_by_default(self):
+        fair, _ = self._fair()
+        result = await fair.solve(self.TASK)
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.reason_code == "QUALITY_VERIFICATION_UNAVAILABLE"
+        assert result.output is None
+
+    async def test_the_readme_example_returns_an_unverified_answer(self):
+        fair, _ = self._fair()
+        result = await fair.solve(self.TASK, accept_unverified=True)
+        assert result.status == "ACCEPTED_UNVERIFIED"
+        assert result.verification_state == "UNVERIFIED"
+        assert result.best_quality_score is None
+        assert result.output == self.TEXT
+
+    async def test_an_answer_that_is_wrong_is_still_refused(self):
+        fair, _ = self._fair(text="   ")
+        result = await fair.solve(self.TASK, accept_unverified=True)
+        assert result.status != "ACCEPTED_UNVERIFIED"
+        assert result.output is None
+
+    async def test_a_schema_mismatch_is_still_refused(self):
+        fair, _ = self._fair(text="not json at all")
+        result = await fair.solve(
+            self.TASK,
+            accept_unverified=True,
+            expected_schema={"type": "object", "properties": {"a": {"type": "integer"}}},
+        )
+        assert result.status != "ACCEPTED_UNVERIFIED"
+        assert result.output is None
+
+    async def test_a_verifiable_answer_is_still_reported_as_verified(self):
+        fair, _ = self._fair(text="345")
+        result = await fair.solve(
+            "15*23",
+            accept_unverified=True,
+            validation={"kind": "arithmetic", "expression": "15*23"},
+        )
+        assert result.status == "ACCEPTED"
+
+    async def test_it_cannot_be_combined_with_cross_check(self):
+        fair, _ = self._fair()
+        with pytest.raises(ValidationError, match="accept_unverified"):
+            await fair.solve(self.TASK, accept_unverified=True, cross_check_required=True)
+
+    async def test_it_cannot_be_combined_with_high_impact_support(self):
+        fair, _ = self._fair(quality_level="high_impact_support")
+        with pytest.raises(ValidationError, match="accept_unverified"):
+            await fair.solve(self.TASK, accept_unverified=True)
+
+    async def test_an_instance_wide_cross_check_is_not_silently_dropped(self):
+        fair, _ = self._fair(cross_check_required=True)
+        with pytest.raises(ValidationError, match="accept_unverified"):
+            await fair.solve(self.TASK, accept_unverified=True)
+
+    async def test_unverified_answers_are_never_cached(self):
+        fair, adapter = self._fair()
+        await fair.solve(self.TASK, accept_unverified=True)
+        await fair.solve(self.TASK, accept_unverified=True)
+        assert adapter.calls == 2
