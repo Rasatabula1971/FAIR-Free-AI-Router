@@ -1006,17 +1006,17 @@ class TestEmbeddedRouter:
             max_verification_attempts=2,
         )
 
-        original_reserve = router.quota.reserve_async
+        original_reserve = router.quota.reserve_probe_async
         lost_once = False
 
-        async def reserve(spec, application_id=None):
+        async def reserve(spec, application_id=None, probe_timeout=None):
             nonlocal lost_once
             if spec.provider_id == "b" and not lost_once:
                 lost_once = True
-                return False
-            return await original_reserve(spec, application_id)
+                return False, 0
+            return await original_reserve(spec, application_id, probe_timeout)
 
-        router.quota.reserve_async = reserve
+        router.quota.reserve_probe_async = reserve
         result = await router.solve(
             _request(
                 task="15*23",
@@ -2031,10 +2031,11 @@ class TestQuotaUnderConcurrency:
         for _ in range(settings.circuit_failures):
             governor.failure("p")
         clock.now += settings.cooldown_seconds + 1
-        assert await governor.reserve_async(spec) is True
+        granted, token = await governor.reserve_probe_async(spec)
+        assert granted is True and token
         state = governor._state("p")
         assert state.circuit_state == "HALF_OPEN"
-        governor._release_probe(state)
+        governor.release_probe("p", token)
         assert state.circuit_state == "OPEN"
 
 
@@ -2368,3 +2369,131 @@ class TestAcceptUnverifiedThroughThePublicApi:
         await fair.solve(self.TASK, accept_unverified=True)
         await fair.solve(self.TASK, accept_unverified=True)
         assert adapter.calls == 2
+
+
+class TestHalfOpenProbeOwnsItsAttempt:
+    """A half-open probe stays exclusively owned for its real attempt deadline."""
+
+    def _tripped(self, now):
+        gov = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        state = gov.state("a")
+        state.circuit_state = "OPEN"
+        state.blocked_until = 0
+        return gov
+
+    def test_a_direct_caller_keeps_the_default_lease(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        assert gov.reserve(_spec()) is True
+        now[0] += 19
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+        now[0] += 2
+        assert gov.state("a").circuit_state == "OPEN"
+
+    def test_the_lease_covers_the_requested_attempt_deadline(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        assert gov.reserve(_spec(), probe_timeout=300) is True
+        now[0] += 120  # past the old 20 second lease, inside the attempt deadline
+        state = gov.state("a")
+        assert state.circuit_state == "HALF_OPEN"
+        assert state.blocked_until == 0
+        assert gov.reserve(_spec()) is False  # still exclusively owned
+
+    def test_an_abandoned_probe_still_expires_after_its_deadline(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        gov.reserve(_spec(), probe_timeout=300)
+        now[0] += 306
+        assert gov.state("a").circuit_state == "OPEN"
+
+    def test_releasing_a_probe_reopens_without_a_new_cooldown(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        granted, token = gov.reserve_probe(_spec(), probe_timeout=300)
+        assert granted and token
+        gov.release_probe("a", token)
+        state = gov.state("a")
+        assert state.circuit_state == "OPEN"
+        assert state.blocked_until == 0
+        assert gov.reserve(_spec()) is True  # the next probe may start at once
+
+    def test_a_stale_probe_cannot_release_a_newer_one(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        _, old = gov.reserve_probe(_spec(), probe_timeout=10)
+        now[0] += 16  # the first lease expired
+        assert gov.state("a").circuit_state == "OPEN"
+        now[0] += 1000  # well past the cooldown the expiry started
+        _, new = gov.reserve_probe(_spec(), probe_timeout=300)
+        assert new and new != old
+        gov.release_probe("a", old)
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+
+    def test_a_stale_completion_cannot_close_a_newer_probes_circuit(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        _, old = gov.reserve_probe(_spec(), probe_timeout=10)
+        now[0] += 16  # the first lease expired; observing it starts the cooldown
+        assert gov.state("a").circuit_state == "OPEN"
+        now[0] += 1000  # past that cooldown
+        _, new = gov.reserve_probe(_spec(), probe_timeout=300)
+        assert new and new != old
+        gov.success("a", probe_token=old)
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+        gov.failure("a", probe_token=old)
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+        gov.success("a", probe_token=new)
+        assert gov.state("a").circuit_state == "CLOSED"
+
+
+class _GatedAdapter(MockAdapter):
+    """Holds its answer until released, so a test can act while the probe is in flight."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def complete(self, request):
+        self.started.set()
+        await self.gate.wait()
+        return await super().complete(request)
+
+
+class TestHalfOpenProbeThroughTheRouter:
+    ARITHMETIC = {"kind": "arithmetic", "expression": "15*23"}
+
+    async def _start(self):
+        adapter = _GatedAdapter("a", text="345")
+        router = _router(entries=[(_spec(), adapter)])
+        now = [1000.0]
+        router.quota.clock = lambda: now[0]
+        state = router.quota.state("a")
+        state.circuit_state = "OPEN"
+        state.blocked_until = 0
+        task = asyncio.create_task(router.solve(_request(task="15*23", validation=self.ARITHMETIC)))
+        await asyncio.wait_for(adapter.started.wait(), timeout=5)
+        return router, adapter, task, now
+
+    async def test_a_slow_probe_keeps_its_half_open_slot_past_the_old_lease(self):
+        router, adapter, task, now = await self._start()
+        assert router.quota.state("a").circuit_state == "HALF_OPEN"
+        now[0] += 30  # beyond the old 20 second lease, inside the attempt deadline
+        state = router.quota.state("a")
+        assert state.circuit_state == "HALF_OPEN"
+        assert state.blocked_until == 0
+        adapter.gate.set()
+        result = await task
+        assert result.status == "ACCEPTED"
+        assert router.quota.state("a").circuit_state == "CLOSED"
+
+    async def test_cancelling_the_probe_releases_its_slot_at_once(self):
+        router, adapter, task, now = await self._start()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        state = router.quota.state("a")
+        assert state.circuit_state == "OPEN"
+        assert state.blocked_until == 0
+        assert await router.quota.reserve_async(_spec()) is True
