@@ -1,6 +1,7 @@
 """The probe spends real provider quota, so what it would send is testable offline."""
 
 import asyncio
+import copy
 import json
 
 import pytest
@@ -15,8 +16,18 @@ class _Adapter:
 
     supports_streaming = False
 
-    def __init__(self, provider_id="p", text="x" * 400, error=None, models=None, drops=None):
+    def __init__(
+        self,
+        provider_id="p",
+        text="x" * 400,
+        error=None,
+        models=None,
+        drops=None,
+        model_ids=("m",),
+    ):
         self.provider_id = provider_id
+        self.spec = _Spec(provider_id, model_ids)
+        self._model_cache = None
         self.text = text
         self.error = error
         self.calls = []
@@ -54,7 +65,17 @@ class _Adapter:
         )
 
 
+class _Spec:
+    def __init__(self, provider_id, model_ids):
+        self.provider_id = provider_id
+        self.models = [
+            ModelDescriptor(model_id=model_id, context_window=1000) for model_id in model_ids
+        ]
+
+
 def _adapters(adapter, models=("m",)):
+    """The spec carries the same models, since main() reads them from the registry."""
+    adapter.spec = _Spec(adapter.provider_id, models)
     return {adapter.provider_id: (adapter, list(models))}
 
 
@@ -219,7 +240,7 @@ class TestRecommendations:
 
     async def test_the_suggested_rate_is_under_the_slowest_route(self):
         """A rate at the slowest observation would leave that route no headroom."""
-        advice = await self._report(_Adapter(), probe.Plan(limits=True))
+        advice = await self._report(_Adapter(), probe.Plan(streaming=True))
         assert (
             advice["suggested_output_tokens_per_second"]
             <= advice["slowest_estimated_tokens_per_second"]
@@ -261,17 +282,12 @@ class TestNoSecretsLeave:
         assert "Authorization" not in json.dumps(report)
 
 
-class _Spec:
-    def __init__(self, provider_id, model_ids):
-        self.provider_id = provider_id
-        self.models = [
-            ModelDescriptor(model_id=model_id, context_window=1000) for model_id in model_ids
-        ]
-
-
 class _Registry:
+    """Registry.register stores spec.model_copy(deep=True), so these are not the same
+    object the adapter holds. A probe that lifts a cap on this copy changes nothing."""
+
     def __init__(self, adapters):
-        self.providers = {p: _Spec(p, m) for p, (_, m) in adapters.items()}
+        self.providers = {p: copy.deepcopy(a.spec) for p, (a, _) in adapters.items()}
         self.adapters = {p: a for p, (a, _) in adapters.items()}
 
 
@@ -386,12 +402,18 @@ class TestTheLimitsPassReachesTheProvider:
         assert "max_output_tokens_ceiling" not in stub.kwargs[0]
 
     def test_reviewed_caps_stop_deciding_the_answer(self, stub_fair, tmp_path):
-        """A reviewed 4096 made every larger request a local refusal -- the value under test."""
-        stub = stub_fair(_adapters(_Adapter()))
-        spec = stub._registry.providers["p"]
-        spec.models[0].max_output_tokens = 4096
+        """A reviewed 4096 made every larger request a local refusal -- the value under test.
+
+        The lift has to reach the spec the adapter holds. The registry keeps a deep
+        copy, so lifting it there left every request refused by FAIR at 4096.
+        """
+        adapter = _Adapter()
+        adapter.spec.models[0].max_output_tokens = 4096
+        stub = stub_fair(_adapters(adapter))
+        stub._registry.providers["p"].models[0].max_output_tokens = 4096
         probe.main(["--limits", "--output-tokens", "16384", "--out", str(tmp_path / "r.json")])
-        assert spec.models[0].max_output_tokens is None
+        assert adapter.spec.models[0].max_output_tokens is None
+        assert adapter._model_cache is None
 
     async def test_a_refusal_says_who_refused(self):
         from fair.providers.base import ProviderUnavailable, RequestNotSupported
@@ -453,3 +475,27 @@ class TestAProbeIsBoundedInTime:
     async def test_progress_is_silent_when_not_asked_for(self, capsys):
         await probe.run(_adapters(_Adapter()), probe.Plan(limits=True))
         assert capsys.readouterr().err == ""
+
+
+class TestTheLimitsPassDoesNotVoteOnThroughput:
+    """It asks for one word on purpose, so its seconds are latency, not throughput."""
+
+    async def test_a_one_word_answer_does_not_become_a_rate(self):
+        adapter = _Adapter(text="OK")
+        advice = probe.recommend(await probe.run(_adapters(adapter), probe.Plan(limits=True)))
+        assert "suggested_output_tokens_per_second" not in advice
+        assert advice["output_tokens"]["p/m"]["accepted_at_least"] == 8192
+
+    async def test_a_generative_pass_still_sets_the_rate(self):
+        adapter = _Adapter(text="x" * 4000)
+        advice = probe.recommend(
+            await probe.run(_adapters(adapter), probe.Plan(limits=True, streaming=True))
+        )
+        assert advice["suggested_output_tokens_per_second"] >= 1
+
+    async def test_the_summary_calls_an_accepted_budget_a_floor(self):
+        report = await probe.run(_adapters(_Adapter(text="OK")), probe.Plan(limits=True))
+        text = probe.summarise(report)
+        assert "accepted at 8192 tokens" in text
+        assert "a floor, not a ceiling" in text
+        assert "tok/s" not in text

@@ -42,6 +42,9 @@ RATE_TASK = (
     "cycle. Number every line."
 )
 RATE_TASK_TOKENS = 512
+# Only these ask for an answer long enough to time. The limits pass asks for one
+# word by design, so its seconds are latency and its rate means nothing.
+RATE_BEARING_PASSES = ("schema", "streaming")
 DEFAULT_MAX_REQUESTS = 12
 DEFAULT_ENV_FILE = ".env"
 # The adapters return text, not usage, so a rate is reported in characters and in
@@ -274,7 +277,7 @@ def recommend(report):
     for provider in report["providers"]:
         for model in provider["models"]:
             key = f"{provider['provider_id']}/{model['model_id']}"
-            for name in ("limits", "schema", "streaming"):
+            for name in RATE_BEARING_PASSES:
                 outcome = model.get(name)
                 if outcome is not None and outcome["accepted"]:
                     rates.append(outcome["estimated_tokens_per_second"])
@@ -331,7 +334,12 @@ def summarise(report):
                 outcome = model.get(name)
                 if outcome is None:
                     continue
-                if outcome["accepted"]:
+                if outcome["accepted"] and name not in RATE_BEARING_PASSES:
+                    lines.append(
+                        f"    {name:<10} accepted at {outcome.get('requested_tokens')} tokens "
+                        f"in {outcome['seconds']}s (a floor, not a ceiling)"
+                    )
+                elif outcome["accepted"]:
                     lines.append(
                         f"    {name:<10} accepted, {outcome['estimated_tokens']} tokens in "
                         f"{outcome['seconds']}s "
@@ -368,20 +376,23 @@ def _build_plan(args):
     )
 
 
-def _lift_descriptor_caps(fair, adapters):
+def _lift_descriptor_caps(adapters):
     """Let the limits pass reach the endpoint's answer rather than the descriptor's.
 
     A reviewed cap of 4096 makes every larger request a local refusal, which is the
     value under test. None means "no static local cap", so the adapter's ceiling --
-    raised for this run only -- decides, and the provider gets to answer. The process
-    exits after the run, so nothing outlives it.
+    raised for this run only -- decides, and the provider gets to answer.
+
+    The cap has to be lifted on the spec the adapter itself holds: the registry keeps
+    a deep copy, so lifting it there changed nothing an adapter would ever read, and
+    every request came back refused by FAIR with the reviewed value still in place.
+    The process exits after the run, so nothing outlives it.
     """
-    for provider_id in adapters:
-        spec = fair._registry.providers[provider_id]
-        for model in spec.models:
+    for wrapper, _ in adapters.values():
+        adapter = getattr(wrapper, "_adapter", wrapper)
+        for model in getattr(adapter, "spec", None).models if hasattr(adapter, "spec") else []:
             model.max_output_tokens = None
-        adapter = getattr(fair._registry.adapters[provider_id], "_adapter", None)
-        if adapter is not None:
+        if hasattr(adapter, "_model_cache"):
             adapter._model_cache = None
 
 
@@ -446,7 +457,7 @@ async def _main(args):
             print("No configured provider matched.", file=sys.stderr)
             return 2
         if plan.limits:
-            _lift_descriptor_caps(fair, adapters)
+            _lift_descriptor_caps(adapters)
         cost = plan_cost(adapters, plan)
         if plan.dry_run:
             print(
