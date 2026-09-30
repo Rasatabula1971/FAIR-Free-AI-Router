@@ -31,11 +31,17 @@ from dataclasses import dataclass, field
 from fair.providers.live import MAX_OUTPUT_TOKENS
 from fair.schemas.domain import NormalizedModelRequest
 
-# Long enough to measure a rate, dull enough that no model refuses it.
-PROBE_TASK = (
+# Whether an endpoint accepts a budget is answered by the request not being refused,
+# not by the model filling it. Asking for a long answer made an accepted 16384-token
+# probe generate for as long as 16384 tokens actually take -- around seventeen minutes
+# at the rate these routes run at -- to learn something the first byte already proved.
+LIMITS_TASK = "Reply with exactly: OK"
+# Rates need an answer long enough to time, and a budget small enough to wait for.
+RATE_TASK = (
     "Write a numbered list of short, self-contained factual sentences about the water "
-    "cycle. Number every line. Keep writing until you reach the output limit."
+    "cycle. Number every line."
 )
+RATE_TASK_TOKENS = 512
 DEFAULT_MAX_REQUESTS = 12
 DEFAULT_ENV_FILE = ".env"
 # The adapters return text, not usage, so a rate is reported in characters and in
@@ -52,7 +58,11 @@ class Plan:
     streaming: bool = False
     output_tokens: int = 8192
     max_requests: int = DEFAULT_MAX_REQUESTS
+    # One probe request is allowed this long. Routing budgets scale into minutes for
+    # a large answer; a probe only needs to know whether the request was taken.
+    max_seconds: float = 90.0
     dry_run: bool = False
+    progress: bool = False
 
     def passes(self):
         return [name for name in ("limits", "schema", "streaming") if getattr(self, name)]
@@ -81,9 +91,9 @@ class Budget:
             self.spent -= 1
 
 
-def _request(model_id, *, max_output_tokens, schema=None):
+def _request(model_id, *, max_output_tokens, schema=None, task=RATE_TASK):
     return NormalizedModelRequest(
-        task=PROBE_TASK,
+        task=task,
         model_id=model_id,
         request_id="probe",
         client_id="fair-probe",
@@ -108,10 +118,20 @@ def _diagnostic(adapter):
 LOCAL_REFUSALS = ("RequestNotSupported",)
 
 
-async def _complete(adapter, request):
+async def _complete(adapter, request, plan=None):
     started = time.monotonic()
+    seconds = plan.max_seconds if plan is not None else Plan.max_seconds
     try:
-        response = await adapter.complete(request)
+        response = await asyncio.wait_for(adapter.complete(request), timeout=seconds)
+    except TimeoutError:
+        return {
+            "accepted": False,
+            "error": "TimedOut",
+            "code": f"NO_ANSWER_WITHIN_{int(seconds)}S",
+            "refused_by": "probe",
+            "provider_message": None,
+            "seconds": round(time.monotonic() - started, 2),
+        }
     except Exception as error:
         name = type(error).__name__
         return {
@@ -135,6 +155,12 @@ async def _complete(adapter, request):
     }
 
 
+def _progress(plan, message):
+    """A probe pass can wait on a slow route; silence looks the same as a hang."""
+    if plan.progress:
+        print(message, file=sys.stderr, flush=True)
+
+
 async def probe_model(adapter, model_id, plan, budget, descriptor=None):
     result: dict = {"model_id": model_id}
     if descriptor is not None:
@@ -143,18 +169,24 @@ async def probe_model(adapter, model_id, plan, budget, descriptor=None):
             "max_output_tokens": descriptor.max_output_tokens,
         }
     if plan.limits and budget.take(f"limits:{model_id}"):
+        _progress(plan, f"  limits     {model_id} ...")
         result["limits"] = await _complete(
-            adapter, _request(model_id, max_output_tokens=plan.output_tokens)
+            adapter,
+            _request(model_id, max_output_tokens=plan.output_tokens, task=LIMITS_TASK),
+            plan,
         )
         result["limits"]["requested_tokens"] = plan.output_tokens
         budget.refund(result["limits"])
     if plan.schema is not None and budget.take(f"schema:{model_id}"):
+        _progress(plan, f"  schema     {model_id} ...")
         result["schema"] = await _complete(
             adapter,
             _request(model_id, max_output_tokens=min(plan.output_tokens, 2048), schema=plan.schema),
+            plan,
         )
         budget.refund(result["schema"])
     if plan.streaming and budget.take(f"streaming:{model_id}"):
+        _progress(plan, f"  streaming  {model_id} ...")
         result["streaming"] = await _stream_probe(adapter, model_id, plan)
         budget.refund(result["streaming"])
     return result
@@ -173,7 +205,7 @@ async def _stream_probe(adapter, model_id, plan):
     inner.supports_streaming = True
     try:
         outcome = await _complete(
-            adapter, _request(model_id, max_output_tokens=min(plan.output_tokens, 512))
+            adapter, _request(model_id, max_output_tokens=RATE_TASK_TOKENS), plan
         )
     finally:
         inner.supports_streaming = before
@@ -211,10 +243,10 @@ async def probe_provider(provider_id, adapter, model_ids, plan, budget):
 async def run(adapters, plan):
     """adapters: {provider_id: (adapter, [model_id, ...])}."""
     budget = Budget(remaining=plan.max_requests)
-    providers = [
-        await probe_provider(provider_id, adapter, model_ids, plan, budget)
-        for provider_id, (adapter, model_ids) in sorted(adapters.items())
-    ]
+    providers = []
+    for provider_id, (adapter, model_ids) in sorted(adapters.items()):
+        _progress(plan, f"=== {provider_id} ===")
+        providers.append(await probe_provider(provider_id, adapter, model_ids, plan, budget))
     return {
         "passes": plan.passes() or ["catalog"],
         "requests_spent": budget.spent,
@@ -330,7 +362,9 @@ def _build_plan(args):
         streaming=args.streaming or args.all,
         output_tokens=args.output_tokens,
         max_requests=args.max_requests,
+        max_seconds=args.max_seconds,
         dry_run=args.dry_run,
+        progress=not args.quiet,
     )
 
 
@@ -453,6 +487,7 @@ def main(argv=None):
     parser.add_argument("--all", action="store_true", help="every pass")
     parser.add_argument("--output-tokens", type=int, default=8192)
     parser.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
+    parser.add_argument("--max-seconds", type=float, default=90.0, help="per request")
     parser.add_argument(
         "--providers", help="comma-separated provider ids", type=lambda v: v.split(",")
     )
@@ -461,6 +496,7 @@ def main(argv=None):
     parser.add_argument("--env-file", default=DEFAULT_ENV_FILE)
     parser.add_argument("--out", default="fair-probe-report.json")
     parser.add_argument("--dry-run", action="store_true", help="print the plan, send nothing")
+    parser.add_argument("--quiet", action="store_true", help="no per-request progress")
     return asyncio.run(_main(parser.parse_args(argv)))
 
 

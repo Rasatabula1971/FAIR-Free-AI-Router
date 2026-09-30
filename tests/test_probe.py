@@ -1,5 +1,6 @@
 """The probe spends real provider quota, so what it would send is testable offline."""
 
+import asyncio
 import json
 
 import pytest
@@ -411,3 +412,44 @@ class TestTheLimitsPassReachesTheProvider:
     async def test_a_rate_is_taken_from_whichever_pass_produced_one(self):
         advice = probe.recommend(await probe.run(_adapters(_Adapter()), probe.Plan(streaming=True)))
         assert advice["suggested_output_tokens_per_second"] >= 1
+
+
+class TestAProbeIsBoundedInTime:
+    """A routing budget scales into minutes for a large answer; a probe must not."""
+
+    async def test_a_request_that_does_not_answer_is_given_up_on(self):
+        class _Slow(_Adapter):
+            async def complete(self, request):
+                await asyncio.sleep(5)
+                return await super().complete(request)
+
+        report = await probe.run(_adapters(_Slow()), probe.Plan(limits=True, max_seconds=0.05))
+        limits = report["providers"][0]["models"][0]["limits"]
+        assert limits["accepted"] is False
+        assert limits["code"] == "NO_ANSWER_WITHIN_0S"
+        assert limits["refused_by"] == "probe"
+
+    async def test_the_limits_pass_does_not_ask_the_model_to_fill_the_budget(self):
+        """Filling 16384 tokens takes as long as 16384 tokens take; a 200 already answers."""
+        adapter = _Adapter()
+        await probe.run(_adapters(adapter), probe.Plan(limits=True, output_tokens=16384))
+        assert adapter.calls[0].task == probe.LIMITS_TASK
+        assert adapter.calls[0].max_output_tokens == 16384
+
+    async def test_the_rate_pass_asks_for_something_worth_timing(self):
+        adapter = _Adapter()
+        await probe.run(_adapters(adapter), probe.Plan(streaming=True))
+        assert adapter.calls[0].task == probe.RATE_TASK
+        assert adapter.calls[0].max_output_tokens == probe.RATE_TASK_TOKENS
+
+    async def test_progress_names_each_request_before_it_is_sent(self, capsys):
+        await probe.run(
+            _adapters(_Adapter()), probe.Plan(limits=True, streaming=True, progress=True)
+        )
+        err = capsys.readouterr().err
+        assert "=== p ===" in err
+        assert "limits" in err and "streaming" in err
+
+    async def test_progress_is_silent_when_not_asked_for(self, capsys):
+        await probe.run(_adapters(_Adapter()), probe.Plan(limits=True))
+        assert capsys.readouterr().err == ""

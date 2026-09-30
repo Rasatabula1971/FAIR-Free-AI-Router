@@ -427,6 +427,14 @@ python -m fair.tools.probe --schema request.json --streaming
 python -m fair.tools.probe --providers groq --models openai/gpt-oss-120b --limits
 ```
 
+Whether an endpoint accepts a budget is answered by the request not being refused,
+so the limits pass asks for a one-word answer with a large declared ceiling rather
+than asking a model to fill it — filling 16384 tokens takes as long as 16384 tokens
+take. Throughput is measured separately, on a short generative answer. Every request
+is bounded by `--max-seconds` (90 by default), because routing budgets scale into
+minutes for a large answer and a probe only needs to know the request was taken.
+Progress is printed per request; pass `--quiet` to suppress it.
+
 It writes a JSON report and prints what a reviewer could defend putting in a
 descriptor:
 
