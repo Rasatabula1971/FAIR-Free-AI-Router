@@ -31,6 +31,24 @@ from fair.schemas.domain import (
 )
 
 
+def _returnable_unverified(request, attempt):
+    """Whether an unverified answer may be returned, when the caller asked for that.
+
+    Unverified means nothing could prove the answer right, not that nothing checked
+    it. Every check that finds an answer actually wrong still refuses it here: an
+    empty or truncated response, a schema or arithmetic or claim mismatch, a
+    fabricated or unsupported citation, a self-contradiction, missing grounding the
+    task required. A source policy that was blocked or could not run refuses too --
+    that is a policy the caller set being unmet, not an absence of proof.
+    """
+    if not request.accept_unverified or attempt.quality is None:
+        return False
+    return not attempt.quality.hard_reject and attempt.quality.source_policy.state not in {
+        "BLOCKED",
+        "SERVICE_FAILED",
+    }
+
+
 def _failure_detail(error):
     """What an attempt may record about its failure.
 
@@ -121,7 +139,7 @@ class EmbeddedRouter:
                         max_output_tokens=request.max_output_tokens,
                     )
                 ),
-                timeout=self.settings.timeout_seconds,
+                timeout=self.settings.attempt_deadline(request.max_output_tokens),
             )
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
                 raise ValueError("Response identity mismatch")
@@ -315,6 +333,7 @@ class EmbeddedRouter:
         if cached is not None:
             return cached
         attempts, tried = [], set()
+        unverified_accepted = False
         reason = "NO_ELIGIBLE_FREE_MODELS"
         accepted_response = accepted_quality = None
         validator_failed = False
@@ -367,6 +386,15 @@ class EmbeddedRouter:
             if self.stopped and not required:
                 reason = "SYSTEM_STOPPED"
                 break
+            if attempt.disposition == "UNVERIFIED" and _returnable_unverified(request, attempt):
+                # Nothing could verify this, and the caller said that is acceptable.
+                # It keeps its UNVERIFIED disposition in the attempt log and comes
+                # back under its own status: what FAIR knows about the answer does
+                # not change because of what the caller is willing to take.
+                accepted_response, accepted_quality = response, attempt.quality
+                unverified_accepted = True
+                reason = "RETURNED_WITHOUT_VERIFICATION"
+                break
             if attempt.disposition != "ACCEPTED":
                 continue
             if required:
@@ -417,6 +445,8 @@ class EmbeddedRouter:
             request_id=request_id,
             status="FAILED"
             if validator_failed
+            else "ACCEPTED_UNVERIFIED"
+            if unverified_accepted
             else "ACCEPTED"
             if accepted_response
             else "ESCALATION_REQUIRED",

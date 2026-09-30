@@ -1,5 +1,6 @@
 """Tests for the embedded FAIR module — no database, no server."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -1321,19 +1322,26 @@ class TestOpenRouterReviewedModels:
         models = {model.model_id: model for model in _CLOUD_PROVIDERS["openrouter_free"]["models"]}
         assert set(models) == {
             "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "nex-agi/nex-n2.5-mini:free",
             "cohere/north-mini-code:free",
         }
         assert models["nvidia/nemotron-3-ultra-550b-a55b:free"].context_window == 1_000_000
-        assert models["nex-agi/nex-n2.5-mini:free"].context_window == 262_144
         assert models["cohere/north-mini-code:free"].context_window == 256_000
 
         assert (
             "structured_output" not in models["nvidia/nemotron-3-ultra-550b-a55b:free"].capabilities
         )
-        assert "structured_output" in models["nex-agi/nex-n2.5-mini:free"].capabilities
         assert "structured_output" not in models["cohere/north-mini-code:free"].capabilities
         assert all(model_id.endswith(":free") for model_id in models)
+
+    def test_openrouter_currently_has_no_structured_output_route(self):
+        """Recorded, not accepted: nex-n2.5-mini carried this and left the catalog.
+
+        A request with an expected_schema needs the structured_output capability, so
+        while this holds the selector skips openrouter_free for every such request.
+        Restoring a schema-capable free model here is what changes it back.
+        """
+        models = _CLOUD_PROVIDERS["openrouter_free"]["models"]
+        assert not any("structured_output" in model.capabilities for model in models)
 
     def test_openrouter_free_account_daily_limit_is_locally_guarded(self):
         provider = _CLOUD_PROVIDERS["openrouter_free"]
@@ -1509,3 +1517,317 @@ class TestRemovedNativeContract:
             }
         )
         assert request.validation.kind == "python_function"
+
+
+# ── Dropped schema constraints stay enforced ─────────────────────────────
+
+
+class TestTransportedConstraintsStillJudgeTheAnswer:
+    """Transport drops what a provider cannot parse; the caller's schema still decides."""
+
+    SCHEMA = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "items": {"type": "array", "minItems": 2, "items": {"type": "string", "minLength": 1}}
+        },
+    }
+
+    async def _solve(self, text):
+        router = _router(entries=[(_spec(), MockAdapter("a", text=text))])
+        return await router.solve(_request(task="list items", expected_schema=self.SCHEMA))
+
+    async def test_a_response_breaking_a_dropped_min_items_is_still_rejected(self):
+        result = await self._solve('{"items": ["one"]}')
+        assert result.status == "ESCALATION_REQUIRED"
+        assert "SCHEMA_FAILURE" in result.attempts[0].quality.reject_reasons
+
+    async def test_a_response_breaking_a_dropped_min_length_is_still_rejected(self):
+        result = await self._solve('{"items": ["one", ""]}')
+        assert result.status == "ESCALATION_REQUIRED"
+        assert "SCHEMA_FAILURE" in result.attempts[0].quality.reject_reasons
+
+    async def test_a_conforming_response_is_accepted(self):
+        result = await self._solve('{"items": ["one", "two"]}')
+        assert result.status == "ACCEPTED"
+        assert result.verification_state == "STRUCTURE_VALIDATED"
+
+
+# ── Attempt budgets scale with the requested output ──────────────────────
+
+
+class TestAttemptDeadline:
+    """A fixed budget was a bet that any size of completion arrives inside it."""
+
+    def _settings(self, **kw):
+        from fair.config import RoutingSettings
+
+        return RoutingSettings(**kw)
+
+    def test_the_budget_grows_with_the_requested_output(self):
+        settings = self._settings(timeout_seconds=15, output_tokens_per_second=30)
+        assert settings.attempt_deadline(300) == pytest.approx(25)
+        assert settings.attempt_deadline(3000) == pytest.approx(115)
+
+    def test_a_tiny_request_still_gets_the_base_budget(self):
+        settings = self._settings(timeout_seconds=15)
+        assert settings.attempt_deadline(0) == 15
+
+    def test_no_attempt_may_exceed_the_ceiling(self):
+        settings = self._settings(max_timeout_seconds=100)
+        assert settings.attempt_deadline(10_000_000) == 100
+
+    def test_a_ceiling_below_the_base_is_rejected(self):
+        with pytest.raises(ValueError, match="max_timeout_seconds"):
+            self._settings(timeout_seconds=90, max_timeout_seconds=30)
+
+    async def test_a_large_request_is_no_longer_cancelled_by_the_base_budget(self):
+        """The router used to cancel at timeout_seconds however many tokens were asked for."""
+
+        class SlowAdapter(MockAdapter):
+            async def complete(self, request):
+                await asyncio.sleep(0.4)
+                return await super().complete(request)
+
+        router = _router(
+            entries=[(_spec(), SlowAdapter("a", text='{"items": [1]}'))],
+            timeout_seconds=0.2,
+            output_tokens_per_second=2000,
+            max_timeout_seconds=30,
+        )
+        # 0.2s base + 2000/2000 = 1.2s for this request; the adapter needs 0.4s.
+        assert router.settings.attempt_deadline(2000) == pytest.approx(1.2)
+        result = await router.solve(
+            _request(
+                task="list items",
+                max_output_tokens=2000,
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ACCEPTED"
+
+    async def test_the_ceiling_still_cancels_an_attempt_that_overruns(self):
+        class StalledAdapter(MockAdapter):
+            async def complete(self, request):
+                await asyncio.sleep(5)
+                return await super().complete(request)
+
+        router = _router(
+            entries=[(_spec(), StalledAdapter("a", text='{"items": [1]}'))],
+            timeout_seconds=0.1,
+            output_tokens_per_second=10000,
+            max_timeout_seconds=0.3,
+        )
+        result = await router.solve(
+            _request(
+                task="list items",
+                max_output_tokens=2000,
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.attempts[0].disposition == "INFRA_FAILURE"
+
+    def test_the_assumed_rate_comes_from_the_environment_when_unset(self, monkeypatch):
+        monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "12")
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))])
+        assert fair._router.settings.output_tokens_per_second == 12
+
+    def test_an_explicit_rate_beats_the_environment(self, monkeypatch):
+        monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "12")
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))], output_tokens_per_second=99)
+        assert fair._router.settings.output_tokens_per_second == 99
+
+    def test_an_unreadable_rate_leaves_the_default(self, monkeypatch):
+        monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "fast")
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))])
+        assert fair._router.settings.output_tokens_per_second == 40
+
+    def test_the_adapter_and_the_router_size_budgets_from_the_same_rate(self):
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))], output_tokens_per_second=7)
+        assert fair._router.settings.output_tokens_per_second == 7
+
+
+class TestProbedOutputLimits:
+    """Each figure was measured against the live endpoint, not read from a document."""
+
+    def _limits(self, provider):
+        return {
+            m.model_id: m.max_output_tokens for m in module._CLOUD_PROVIDERS[provider]["models"]
+        }
+
+    def test_cloudflare_carries_the_budgets_its_endpoints_accepted(self):
+        limits = self._limits("cloudflare_workers_ai")
+        assert limits["@cf/openai/gpt-oss-20b"] == 32768
+        assert limits["@cf/meta/llama-4-scout-17b-16e-instruct"] == 32768
+        # Refused at 32768 by the context guard, not by the endpoint: a 24000-token
+        # context cannot hold a larger answer.
+        assert limits["@cf/meta/llama-3.3-70b-instruct-fp8-fast"] == 16384
+
+    def test_gemini_still_declares_no_local_cap(self):
+        """Its ceiling is the one Google publishes per model, which FAIR reads live."""
+        assert set(self._limits("google_gemini_api").values()) == {None}
+
+    def test_groq_and_mistral_carry_the_budgets_their_endpoints_accepted(self):
+        for provider in ("groq", "mistral"):
+            assert set(self._limits(provider).values()) == {32768}, provider
+
+    def test_an_unprobed_provider_keeps_the_conservative_default(self):
+        """Kilo was rate-limited and OpenRouter refused on data policy, so neither answered."""
+        for provider in ("kilo_free", "openrouter_free"):
+            assert set(self._limits(provider).values()) == {4096}, provider
+
+    def test_raising_the_ceiling_alone_does_not_raise_an_unprobed_model(self):
+        from fair.providers.live import MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CEILING
+
+        assert MAX_OUTPUT_TOKENS_CEILING > MAX_OUTPUT_TOKENS
+        assert self._limits("kilo_free")["qwen/qwen3.8-27b:free"] == MAX_OUTPUT_TOKENS
+
+
+# ── Returning an answer nothing could verify ─────────────────────────────
+
+
+_router_factory = _router
+
+
+class TestAcceptUnverified:
+    """FAIR's promise is not to present unverified text as verified, which is not the
+    same promise as never returning it."""
+
+    def _router(self, text="A considered answer with no deterministic contract."):
+        return _router_factory(entries=[(_spec(), MockAdapter("a", text=text))])
+
+    async def test_open_ended_work_escalates_without_the_flag(self):
+        """The state of affairs this exists to change."""
+        result = await self._router().solve(_request(task="explain the trade-offs"))
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.reason_code == "QUALITY_VERIFICATION_UNAVAILABLE"
+        assert result.output is None
+
+    async def test_the_answer_comes_back_when_the_caller_accepts_that(self):
+        result = await self._router().solve(
+            _request(task="explain the trade-offs", accept_unverified=True)
+        )
+        assert result.status == "ACCEPTED_UNVERIFIED"
+        assert result.reason_code == "RETURNED_WITHOUT_VERIFICATION"
+        assert result.output == "A considered answer with no deterministic contract."
+
+    async def test_it_is_never_reported_as_accepted(self):
+        """A caller comparing against ACCEPTED keeps refusing what FAIR cannot vouch for."""
+        result = await self._router().solve(
+            _request(task="explain the trade-offs", accept_unverified=True)
+        )
+        assert result.status != "ACCEPTED"
+        assert result.verification_state == "UNVERIFIED"
+        assert result.best_quality_score is None
+        assert result.quality.overall_score is None
+
+    async def test_the_attempt_log_still_calls_it_unverified(self):
+        """What FAIR knows does not change because of what the caller will take."""
+        result = await self._router().solve(
+            _request(task="explain the trade-offs", accept_unverified=True)
+        )
+        assert result.attempts[0].disposition == "UNVERIFIED"
+
+    async def test_a_verifiable_answer_is_still_verified_properly(self):
+        router = _router_factory(entries=[(_spec(), MockAdapter("a", text='{"items": [1]}'))])
+        result = await router.solve(
+            _request(
+                task="list items",
+                accept_unverified=True,
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.verification_state == "STRUCTURE_VALIDATED"
+
+    @pytest.mark.parametrize(
+        ("text", "schema"),
+        [
+            ("", None),
+            ("not json", {"type": "object", "required": ["items"]}),
+        ],
+    )
+    async def test_an_answer_that_is_wrong_is_still_refused(self, text, schema):
+        """Unverified means nothing could prove it right, not that nothing checked it."""
+        router = _router_factory(entries=[(_spec(), MockAdapter("a", text=text or " "))])
+        result = await router.solve(
+            _request(task="do the thing", accept_unverified=True, expected_schema=schema)
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.output is None
+
+    async def test_a_truncated_answer_is_still_refused(self):
+        class _Truncated(MockAdapter):
+            async def complete(self, request):
+                response = await super().complete(request)
+                return response.model_copy(update={"finish_reason": "length"})
+
+        router = _router_factory(entries=[(_spec(), _Truncated("a", text="half an ans"))])
+        result = await router.solve(_request(task="explain", accept_unverified=True))
+        assert result.status == "ESCALATION_REQUIRED"
+
+    def test_it_cannot_be_combined_with_a_demand_for_corroboration(self):
+        for demand in ({"cross_check_required": True}, {"quality_level": "high_impact_support"}):
+            with pytest.raises(ValidationError, match="accept_unverified"):
+                _request(task="explain", accept_unverified=True, **demand)
+
+    async def test_an_unverified_answer_is_never_cached(self):
+        """The cache only keeps answers a deterministic contract settled."""
+        router = _router_factory(
+            entries=[(_spec(), MockAdapter("a", text="an answer"))], cache_enabled=True
+        )
+        request = _request(task="explain", accept_unverified=True)
+        first = await router.solve(request)
+        second = await router.solve(request)
+        assert first.status == "ACCEPTED_UNVERIFIED"
+        assert second.cache_hit is False
+
+
+class TestIndependenceGroups:
+    """Two gateways serving one model gave it two ids, and comparing ids alone then
+    called the same model its own independent verifier."""
+
+    def _model(self, provider_id, model_id):
+        return next(
+            m for m in module._CLOUD_PROVIDERS[provider_id]["models"] if m.model_id == model_id
+        )
+
+    def _independent(self, a, b):
+        from fair.quality.consensus import independent
+
+        class _Spec:
+            def __init__(self, provider_id):
+                self.provider_id = provider_id
+
+        return independent((0, _Spec(a[0]), self._model(*a)), (0, _Spec(b[0]), self._model(*b)))
+
+    def test_one_model_behind_two_gateways_is_not_its_own_verifier(self):
+        assert not self._independent(
+            ("groq", "openai/gpt-oss-20b"),
+            ("cloudflare_workers_ai", "@cf/openai/gpt-oss-20b"),
+        )
+
+    def test_the_same_free_model_on_two_gateways_is_not_either(self):
+        assert not self._independent(
+            ("openrouter_free", "cohere/north-mini-code:free"),
+            ("kilo_free", "cohere/north-mini-code:free"),
+        )
+
+    def test_genuinely_different_models_still_verify_each_other(self):
+        assert self._independent(
+            ("groq", "openai/gpt-oss-120b"),
+            ("cloudflare_workers_ai", "@cf/meta/llama-4-scout-17b-16e-instruct"),
+        )
+
+    def test_every_id_naming_one_model_carries_one_group(self):
+        groups: dict = {}
+        for provider_id, entry in module._CLOUD_PROVIDERS.items():
+            for model in entry["models"]:
+                if model.independence_group:
+                    groups.setdefault(model.independence_group, []).append(
+                        (provider_id, model.model_id)
+                    )
+        # A group with one member would be doing nothing; each names a real duplicate.
+        assert all(len(members) > 1 for members in groups.values()), groups

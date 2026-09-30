@@ -18,6 +18,8 @@ from fair.embedded.router import EmbeddedRouter
 from fair.governor.policy import AdmissionDenied
 from fair.providers.base import AuthenticationFailed, ProviderAdapter
 from fair.providers.live import (
+    MAX_OUTPUT_TOKENS,
+    MAX_OUTPUT_TOKENS_CEILING,
     TEXT_CAPABILITIES,
     CloudflareWorkersAiAdapter,
     GeminiAdapter,
@@ -120,16 +122,26 @@ _NO_STRUCTURED_OUTPUT = frozenset(TEXT_CAPABILITIES) - {"structured_output"}
 
 # TextAdapter and OllamaLocalAdapter refuse max_output_tokens above this
 # before dispatch. Declaring the cap lets the selector skip those routes.
-_TEXT_ADAPTER_MAX_OUTPUT = 4096
+# The adapters own the number; restating it here let the two drift.
+_TEXT_ADAPTER_MAX_OUTPUT = MAX_OUTPUT_TOKENS
 
 
-def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT):
-    """Each entry is (model_id, context_window) or (model_id, context_window, capabilities)."""
+def _text_models(*entries, max_output_tokens=_TEXT_ADAPTER_MAX_OUTPUT, independence_group=None):
+    """Each entry is (model_id, context_window) or (model_id, context_window, capabilities).
+
+    independence_group names the weights behind an entry, for cross-checking. Two
+    gateways serving one model give it two ids, and comparing ids alone then calls
+    the same model its own independent verifier. Only an id that demonstrably names
+    the same model carries a group: two sizes from one lab, or two generations of one
+    family, may well share failure modes too, but that is a judgement about models
+    rather than a fact about names, and it belongs to whoever reviews this list.
+    """
     return [
         ModelDescriptor(
             model_id=entry[0],
             context_window=entry[1],
             max_output_tokens=max_output_tokens,
+            independence_group=independence_group,
             capabilities=set(entry[2]) if len(entry) > 2 else set(TEXT_CAPABILITIES),
         )
         for entry in entries
@@ -172,7 +184,17 @@ _CLOUD_PROVIDERS = {
         # carried usable headers yet.
         "request_limit": 1000,
         "request_limit_window": "DAILY_UTC",
-        "models": _text_models(("openai/gpt-oss-20b", 131072), ("openai/gpt-oss-120b", 131072)),
+        # Probed 2026-09-30: both endpoints accepted 32768, a floor rather than a
+        # measured ceiling, and both answered at over 250 tokens/second.
+        "models": [
+            # The same weights Cloudflare serves as @cf/openai/gpt-oss-20b.
+            *_text_models(
+                ("openai/gpt-oss-20b", 131072),
+                max_output_tokens=32768,
+                independence_group="openai/gpt-oss-20b",
+            ),
+            *_text_models(("openai/gpt-oss-120b", 131072), max_output_tokens=32768),
+        ],
     },
     "openrouter_free": {
         "kwarg": "openrouter_api_key",
@@ -184,29 +206,45 @@ _CLOUD_PROVIDERS = {
         # when they point at one SharedQuotaLedger.
         "request_limit": 50,
         "request_limit_window": "DAILY_UTC",
-        "models": _text_models(
-            # Reviewed against OpenRouter on 2026-09-27. Nemotron 3 Ultra is
-            # the primary long-context reasoning/agent model but its free
-            # endpoint does not accept response_format.
-            (
-                "nvidia/nemotron-3-ultra-550b-a55b:free",
-                1000000,
-                _NO_STRUCTURED_OUTPUT,
+        "models": [
+            *_text_models(
+                # Reviewed against OpenRouter on 2026-09-27. Nemotron 3 Ultra is
+                # the primary long-context reasoning/agent model but its free
+                # endpoint does not accept response_format.
+                (
+                    "nvidia/nemotron-3-ultra-550b-a55b:free",
+                    1000000,
+                    _NO_STRUCTURED_OUTPUT,
+                ),
+                # Nex-N2.5 Mini was the only OpenRouter route here that accepted a
+                # JSON Schema. Probed 2026-09-30: ABSENT_FROM_CATALOG -- OpenRouter no
+                # longer lists it, so FAIR dropped it on every solve and reported only
+                # that a reviewed model was unavailable. Left out rather than left
+                # failing; OpenRouter now has no structured-output route, which is why
+                # a schema request skips this provider entirely.
             ),
-            # FAIR sends strict JSON Schema through response_format. Nex-N2.5
-            # Mini's free endpoint explicitly supports that contract.
-            ("nex-agi/nex-n2.5-mini:free", 262144),
-            # Keep a fast coding-specialist fallback. It does not accept
-            # response_format, so it must not be selected for schema requests.
-            ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
-        ),
+            # A fast coding-specialist fallback. It does not accept response_format,
+            # so it must not be selected for schema requests. Kilo serves the same
+            # model, so both carry one independence group.
+            *_text_models(
+                ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
+                independence_group="cohere/north-mini-code",
+            ),
+        ],
     },
     "mistral": {
         "kwarg": "mistral_api_key",
         "env": "MISTRAL_API_KEY",
         "adapter": MistralAdapter,
         "access_class": "FREE_RECURRING",
-        "models": _text_models(("ministral-8b-latest", 262144), ("ministral-3b-latest", 131072)),
+        # Probed 2026-09-30: both endpoints accepted 32768, a floor rather than a
+        # measured ceiling. ministral-8b is the slowest route measured here at 73.6
+        # tokens/second, which is what the assumed rate is set below.
+        "models": _text_models(
+            ("ministral-8b-latest", 262144),
+            ("ministral-3b-latest", 131072),
+            max_output_tokens=32768,
+        ),
     },
     "kilo_free": {
         "kwarg": "kilo_api_key",
@@ -221,27 +259,64 @@ _CLOUD_PROVIDERS = {
         # These are current non-NVIDIA zero-priced routes. Kilo model
         # availability is dynamic, so the adapter still re-checks the live
         # catalog and exact $0 pricing before every model can be used.
-        "models": _text_models(
-            ("qwen/qwen3.8-27b:free", 262144, _NO_STRUCTURED_OUTPUT),
-            ("thinkingmachines/inkling-small:free", 1048576, _NO_STRUCTURED_OUTPUT),
-            ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
-            ("liquid/lfm-2.5-2.6b:free", 65536, _NO_STRUCTURED_OUTPUT),
-        ),
+        "models": [
+            *_text_models(
+                ("qwen/qwen3.8-27b:free", 262144, _NO_STRUCTURED_OUTPUT),
+                ("thinkingmachines/inkling-small:free", 1048576, _NO_STRUCTURED_OUTPUT),
+                ("liquid/lfm-2.5-2.6b:free", 65536, _NO_STRUCTURED_OUTPUT),
+            ),
+            # The same model OpenRouter serves under this id.
+            *_text_models(
+                ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
+                independence_group="cohere/north-mini-code",
+            ),
+        ],
     },
     "cloudflare_workers_ai": {
         "kwarg": "cloudflare_api_token",
         "env": "CLOUDFLARE_API_TOKEN",
         "adapter": CloudflareWorkersAiAdapter,
         "access_class": "FREE_RECURRING",
-        "models": _text_models(
-            ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 24000),
-            ("@cf/openai/gpt-oss-20b", 128000),
-            ("@cf/meta/llama-4-scout-17b-16e-instruct", 131000),
-        ),
+        # Probed against the live endpoint on 2026-09-30. Each figure is the largest
+        # budget the endpoint accepted, so it is a floor rather than a measured
+        # ceiling; none was refused below it. llama-3.3-70b stops at 16384 because
+        # its 24000-token context cannot hold a larger answer, not because the
+        # endpoint refused one.
+        "models": [
+            *_text_models(
+                ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 24000), max_output_tokens=16384
+            ),
+            # The same weights Groq serves as openai/gpt-oss-20b.
+            *_text_models(
+                ("@cf/openai/gpt-oss-20b", 128000),
+                max_output_tokens=32768,
+                independence_group="openai/gpt-oss-20b",
+            ),
+            *_text_models(
+                ("@cf/meta/llama-4-scout-17b-16e-instruct", 131000), max_output_tokens=32768
+            ),
+        ],
     },
 }
 
 _LOCAL_CONTEXT_CAP = 16384
+
+
+_OFF = frozenset({"", "0", "false", "no", "off"})
+
+
+def _flag(value):
+    """An environment flag is on unless it is absent or an explicit off value."""
+    return value is not None and value.strip().casefold() not in _OFF
+
+
+def _positive_float(value, default):
+    """An unreadable or non-positive environment value leaves the default in place."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _read_env_file(path):
@@ -338,6 +413,8 @@ class FAIR:
         max_unanswered_attempts: int = 6,
         max_verification_attempts: int = 2,
         timeout_seconds: float = 15,
+        output_tokens_per_second: float | None = None,
+        max_timeout_seconds: float = 900,
         cooldown_seconds: float = 360,
         cache_enabled: bool = True,
         cache_ttl_seconds: int = 3600,
@@ -347,6 +424,8 @@ class FAIR:
         application_id: str | None = None,
         shared_quota_path: str | None = None,
         quota_pool_ids: dict[str, str] | None = None,
+        provider_error_diagnostics: bool = False,
+        max_output_tokens_ceiling: int = MAX_OUTPUT_TOKENS_CEILING,
         on_event: Callable[[str, dict], None] | None = None,
     ):
         self._registry = Registry()
@@ -391,6 +470,13 @@ class FAIR:
                 "free API tier eligible for FAIR"
             )
 
+        # Both the adapter and the router size their budgets from this, so it is
+        # resolved once before either of them is built.
+        output_tokens_per_second = (
+            output_tokens_per_second
+            if output_tokens_per_second is not None
+            else _positive_float(env.get("FAIR_OUTPUT_TOKENS_PER_SECOND"), 40)
+        )
         confirmed = set(confirmed_free_providers or ())
         if "zai_free" in confirmed:
             self.skipped.setdefault(
@@ -406,6 +492,11 @@ class FAIR:
         live_settings = LiveSettings(
             enabled=True,
             confirmed_providers=confirmed | {"ollama_local"},
+            provider_error_diagnostics=provider_error_diagnostics
+            or _flag(env.get("FAIR_PROVIDER_ERROR_DIAGNOSTICS")),
+            output_tokens_per_second=output_tokens_per_second,
+            max_completion_seconds=max_timeout_seconds,
+            max_output_tokens_ceiling=max_output_tokens_ceiling,
         )
 
         for provider_id, entry in _CLOUD_PROVIDERS.items():
@@ -469,6 +560,8 @@ class FAIR:
             max_unanswered_attempts=max_unanswered_attempts,
             max_verification_attempts=max_verification_attempts,
             timeout_seconds=timeout_seconds,
+            output_tokens_per_second=output_tokens_per_second,
+            max_timeout_seconds=max_timeout_seconds,
             cooldown_seconds=cooldown_seconds,
             cache_enabled=cache_enabled,
             cache_ttl_seconds=cache_ttl_seconds,

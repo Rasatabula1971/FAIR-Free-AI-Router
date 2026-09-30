@@ -301,6 +301,237 @@ add one even when told not to); prose around the JSON is still a schema failure.
 `standard`, escalated at `advanced` and `high_impact_support`. Tasks the profiler
 flags as needing code or grounding still require a matching contract.
 
+### Work nothing can verify
+
+Every contract below settles an answer mechanically. Open-ended work — analysis, a
+plan, a design rationale, long-form reasoning — has no such contract, so
+`acceptable()` never passes it and the request can only escalate with
+`QUALITY_VERIFICATION_UNAVAILABLE`, whichever model answered.
+
+`accept_unverified=True` changes that, and nothing else:
+
+```python
+result = await fair.solve("Explain the trade-offs between X and Y", accept_unverified=True)
+result.status              # "ACCEPTED_UNVERIFIED", never "ACCEPTED"
+result.verification_state  # "UNVERIFIED"
+result.best_quality_score  # None
+```
+
+FAIR's guarantee is that it never presents unverified text as verified. That is not
+the same as never returning it, and the two had been conflated. The answer comes
+back under its own status, with no score, and the attempt log still records the
+disposition as `UNVERIFIED`: what FAIR knows about an answer does not change because
+of what the caller is willing to take. A caller that tests `status == "ACCEPTED"`
+keeps refusing it without changing a line.
+
+Unverified means nothing could prove the answer right, not that nothing checked it.
+Everything that finds an answer actually **wrong** still refuses: an empty or
+truncated response, a schema, arithmetic or claim mismatch, a fabricated or
+unsupported citation, a self-contradiction, grounding the task required and did not
+get, and a source policy that was blocked or could not run.
+
+It cannot be combined with `cross_check_required` or `high_impact_support`. Both ask
+for independent corroboration, which is precisely what an unverified answer lacks.
+Unverified answers are never cached, since the cache only keeps what a deterministic
+contract settled.
+
+### Schemas and provider dialects
+
+The schema you pass is full JSON Schema 2020-12 and every response is validated
+against it locally. Provider structured-output APIs accept much less: OpenAI strict
+mode (Groq, OpenRouter, Mistral, Kilo, Cloudflare) rejects `minLength`, `minItems`,
+`maxItems`, `minimum`, `maximum`, `pattern`, `format` and `const`, and requires
+`additionalProperties: false` plus every property listed in `required`; Gemini
+rejects a different set including `additionalProperties`.
+
+FAIR therefore sends each provider only the shape of your schema — types,
+properties, required, items, enums — and restates the dropped constraints as prompt
+text ("1 to 5 items", "must not be empty"). Nothing is weakened: the full schema
+still judges the answer, and a response that breaks a dropped constraint is still a
+schema failure. `const` is rewritten as a single-value `enum`, which every dialect
+accepts.
+
+Two problems cannot be fixed this way, because repairing them would change what a
+schema means, and providers reject both with an opaque HTTP 400: an object without
+`additionalProperties: false`, or a `required` list that omits a declared property;
+and the `oneOf` / `allOf` / `not` combinators. Check a schema before wiring it in:
+
+```bash
+python -m fair.tools.schema_compat request.json
+python -m fair.tools.schema_compat request.json --key expected_schema
+python -m fair.tools.schema_compat request.json --emit openai_strict
+```
+
+It prints, per dialect, what must be fixed, what will be dropped, and the prompt
+text that replaces it. It exits non-zero when a schema needs an author fix, so it
+works as a CI check.
+
+### Diagnosing a provider rejection
+
+A non-200 from a provider is reported as its status code alone — `HTTP_400` —
+because an upstream error body is provider text, not FAIR's own observation. That
+makes an unsupported-schema rejection indistinguishable from a context-length one.
+Set `provider_error_diagnostics=True` (or `FAIR_PROVIDER_ERROR_DIAGNOSTICS=1`) and
+the last non-200 message per adapter is kept — bounded to 512 characters, with any
+credential redacted — and readable through `safe_diagnostics()`:
+
+```python
+fair = FAIR(..., provider_error_diagnostics=True)
+result = await fair.solve(...)
+fair._registry.adapters["groq"].safe_diagnostics()
+# {"last_provider_error": {"status": "HTTP_400",
+#                          "provider_message": "... 'minLength' is unsupported ..."}}
+```
+
+Raised codes, reason codes and the attempt log are identical either way; the flag
+only adds the record. It is off by default. The record is cleared as each request
+starts and names the path it came from, so it always describes the call in front of
+you rather than an earlier one that failed.
+
+`safe_diagnostics()` also reports, without any flag, why a reviewed model was left
+out of the live catalog. `REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED` covers five
+different causes and the router can only report the last of them:
+
+```python
+fair._registry.adapters["openrouter_free"].safe_diagnostics()["catalog_drops"]
+# {"nex-agi/nex-n2.5-mini:free": "CATALOG_CONTEXT_BELOW_REVIEWED_262144"}
+```
+
+`ABSENT_FROM_CATALOG`, `AMBIGUOUS_IN_CATALOG`, `INACTIVE_IN_CATALOG`,
+`NOT_ZERO_PRICED`, `CONTEXT_NOT_REPORTED` and `CATALOG_CONTEXT_BELOW_REVIEWED_<n>`
+are the reasons; the last names the reviewed value the catalog now contradicts.
+
+A catalog fetch that fails is remembered for as long as a successful one stays
+fresh. Only success used to be cached, so every eligible model asked again and one
+unreachable endpoint cost a read timeout per model rather than per solve.
+
+### Attempt budgets and streaming
+
+A per-attempt timeout is a bet that a completion of any size arrives inside it.
+FAIR enforced two such bets — the router waited `timeout_seconds` around the call
+and the adapter allowed 25 seconds for one read — so a large request was cancelled
+twice over before a model had finished writing. Both now scale with the requested
+output:
+
+```
+attempt budget = timeout_seconds + max_output_tokens / output_tokens_per_second
+                 bounded by max_timeout_seconds
+```
+
+At the defaults that is 41s for 1024 tokens and 117s for 4096, against a flat 15s
+before. `output_tokens_per_second` decides only how long FAIR waits before calling
+an attempt failed. The default of 40 comes from probing eight routes on 2026-09-30:
+five finished on their own at 73.6 to 324.3 tokens/second, and the three that were
+truncated had spent their whole budget getting there, which puts them above 52.6,
+64.3 and 91.6. Re-probe and raise it if your routes are faster.
+
+A generous budget is only safe if a provider that has stopped responding is still
+noticed quickly, so completions are streamed. The read timeout then applies to each
+chunk rather than to the whole answer: arriving tokens keep resetting it, and a
+stalled generation trips it in `read_timeout_seconds` however large the budget is.
+
+Streaming changes how the bytes arrive, never what has to be proved about them. The
+stream is assembled into the same envelope a buffered response returns, and every
+check — model identity, finish reason, tool-call refusal, and the zero-cost
+observation above all — then runs on the shape it has always run on. A stream
+carrying no usage is refused exactly as a buffered response carrying none is.
+
+Every adapter streams. `openrouter_free` and `kilo_free` were buffered until a
+live probe on 2026-09-30 showed a streamed completion still carrying the zero-cost
+observation they fail closed without. A route that did stop reporting a cost would
+still fail closed rather than bill, and Kilo's catalog fallback covers a response
+that omits the field on a stream exactly as when buffered.
+
+### Measuring what a provider actually accepts
+
+Several values here can only be known by asking: the output ceiling a free endpoint
+enforces, whether a schema survives its structured-output parser, whether a cost
+observation arrives on a stream, how fast a route really is. The probe asks, using
+the registered adapters so every admission, zero-cost and credential check applies
+exactly as it does in routing. It never calls `solve()` — the quality gate would
+spend extra requests and confound the measurement.
+
+Requests are the scarce resource (OpenRouter Free allows 50 a day), so the catalog
+pass costs none, every other pass costs one request per model, and the run stops at
+`--max-requests` whatever is left. Always start with a dry run:
+
+```bash
+python -m fair.tools.probe --dry-run --all          # what it would send, and how many
+python -m fair.tools.probe                          # catalog only, zero completions
+python -m fair.tools.probe --limits --output-tokens 8192
+python -m fair.tools.probe --schema request.json --streaming
+python -m fair.tools.probe --providers groq --models openai/gpt-oss-120b --limits
+```
+
+Whether an endpoint accepts a budget is answered by the request not being refused,
+so the limits pass asks for a one-word answer with a large declared ceiling rather
+than asking a model to fill it — filling 16384 tokens takes as long as 16384 tokens
+take. Throughput is measured separately, on a short generative answer. Every request
+is bounded by `--max-seconds` (90 by default), because routing budgets scale into
+minutes for a large answer and a probe only needs to know the request was taken.
+Progress is printed per request; pass `--quiet` to suppress it.
+
+It writes a JSON report and prints what a reviewer could defend putting in a
+descriptor:
+
+```json
+{
+  "output_tokens": {
+    "groq/openai/gpt-oss-120b": {"accepted_at_least": 8192, "descriptor_says": 4096},
+    "mistral/ministral-8b-latest": {"refused_at": 8192, "refusal": "OUTPUT_BUDGET_INVALID"}
+  },
+  "suggested_output_tokens_per_second": 34,
+  "cost_observed_on_stream": {"openrouter_free/...": true}
+}
+```
+
+An accepted budget is a **floor**, not a ceiling: it says the endpoint took that
+many tokens, not that it would refuse one more. A refusal is the upper bound. Both
+are named for what they are, because reporting either as "the limit" is the
+overclaim that put an unconfirmed 262144 in the registry to begin with.
+
+A throughput figure comes only from an answer that finished on its own. A truncated
+one (`finish_reason` of `length`) is reported separately as a lower bound, because
+the budget bounded it and a model that reasons before answering spends much of that
+budget on thought parts the adapter strips out of the text — `gemini-3.6-flash`
+returned 22 visible tokens against a 512-token budget, which is thinking, not a slow
+provider. Sizing a timeout from a figure like that would give a 1024-token attempt
+several minutes.
+
+The probe turns provider diagnostics on for its own run, so a refusal shows the
+provider's message rather than a bare `HTTP_400`. `cost_observed_on_stream` answers
+the one question holding `openrouter_free` and `kilo_free` on the buffered path: it
+sets `supports_streaming` on the adapter instance for a single request, restores it
+afterwards, and reports whether the zero-cost proof still arrived.
+
+### Measured output limits
+
+Probed against the live endpoints on 2026-09-30:
+
+| Route | Accepted | Note |
+|---|---|---|
+| `openai/gpt-oss-20b`, `openai/gpt-oss-120b` (Groq) | 32768 | floor; >250 tok/s |
+| `ministral-8b-latest`, `ministral-3b-latest` | 32768 | floor |
+| `@cf/openai/gpt-oss-20b` | 32768 | floor; not refused below it |
+| `@cf/meta/llama-4-scout-17b-16e-instruct` | 32768 | floor |
+| `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 16384 | 32768 exceeds its 24000 context |
+| `gemini-3.5-flash-lite`, `gemini-3.6-flash` | 32768 | checked against Google's published `outputTokenLimit` |
+
+`kilo_free` and `openrouter_free` keep the conservative 4096 default: Kilo's models
+were rate-limited and OpenRouter refused on its data policy, so neither endpoint
+actually answered. `MAX_OUTPUT_TOKENS_CEILING` bounds what any reviewed descriptor may reach;
+raising it alone changes nothing, because a descriptor declaring less still governs.
+
+### Published output limits
+
+Where a provider publishes its own completion-token ceiling in the live catalog,
+that ceiling lowers the reviewed descriptor — it never raises it. A live catalog is
+current where a reviewed value is a claim from the day it was written, so a smaller
+published limit wins; raising a limit on unreviewed data is the guess FAIR refuses
+to make. A request above the published limit is refused before dispatch instead of
+spending quota on an HTTP 400. A provider that publishes nothing usable changes
+nothing, and only `openrouter_free` reads a field today.
+
 ```python
 # Code validation
 result = await fair.solve(
@@ -367,6 +598,14 @@ truth. Without `source_reviews`, any request carrying a `source_policy` is repor
 
 ## Cross-checking
 
+Two gateways serving one model give it two ids, and comparing ids alone would call
+that model its own independent verifier — `openai/gpt-oss-20b` on Groq and
+`@cf/openai/gpt-oss-20b` on Cloudflare are the same weights. Descriptors that name
+the same model share an `independence_group`, so a cross-check cannot be satisfied
+by asking it twice. Two sizes from one lab, or two generations of one family, may
+share failure modes as well, but that is a judgement about models rather than a fact
+about names, and it is left to whoever reviews the registry.
+
 Request a second independent model to verify the answer:
 
 ```python
@@ -383,6 +622,8 @@ result = await fair.solve(
 ## Response statuses
 
 - **`ACCEPTED`** — answer passed all validation checks
+- **`ACCEPTED_UNVERIFIED`** — an answer nothing could verify, returned because the
+  request asked for it (see below). Deliberately not `ACCEPTED`
 - **`ESCALATION_REQUIRED`** — no model produced a verified answer
 - **`FAILED`** — infrastructure failure (validator error, all providers down)
 
@@ -440,7 +681,9 @@ FAIR(
     quality_level="standard",     # commodity|standard|advanced|high_impact_support
     max_attempts=3,               # answered attempts (judged by the quality gate) before escalating
     max_unanswered_attempts=6,    # models that never answered (down/slow/throttled) tolerated per solve
-    timeout_seconds=15,           # per-attempt timeout
+    timeout_seconds=15,           # base per-attempt budget, before the output allowance
+    output_tokens_per_second=30,  # assumed free-tier throughput, sizing that budget
+    max_timeout_seconds=600,      # hard ceiling on any one attempt
     cooldown_seconds=360,         # provider sit-out after circuit-break/throttle (Groq's window)
     cache_enabled=True,           # in-memory LRU cache for deterministic tasks
     cross_check_required=False,   # require independent verification
@@ -450,6 +693,7 @@ FAIR(
     quota_pool_ids={              # optional account/project identity overrides
         "openrouter_free": "openrouter-main",
     },
+    provider_error_diagnostics=False, # or env: FAIR_PROVIDER_ERROR_DIAGNOSTICS
     on_event=callback,            # optional (event_type, payload) callback
 )
 ```
@@ -491,7 +735,7 @@ fair = FAIR(
 )
 ```
 
-Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `ACCEPTED`, `ESCALATION_REQUIRED`, `FAILED`.
+Events: `PROFILED`, `EXECUTING`, `ATTEMPT_COMPLETED`, `CROSS_CHECK_COMPLETED`, `ACCEPTED`, `ACCEPTED_UNVERIFIED`, `ESCALATION_REQUIRED`, `FAILED`.
 
 ## Architecture
 

@@ -7,6 +7,7 @@ every malformed, blocked, remote-backed or over-budget case must raise rather
 than return text.
 """
 
+import json
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -130,17 +131,34 @@ def _request(model_id, task="ping", max_output_tokens=64, schema=None):
     )
 
 
+def _as_sse(body):
+    """Serve a generateContent body as one stream event, malformations and all.
+
+    A converter that reshaped the body would normalise away the very anomalies the
+    refusal tests supply, so the body is transmitted exactly as configured.
+    """
+    text = f"data: {json.dumps(body)}\n\ndata: [DONE]\n\n"
+    return httpx.Response(200, content=text.encode(), headers={"content-type": "text/event-stream"})
+
+
 def _transport(routes):
+    """A ':generateContent' route also answers the streaming endpoint, as SSE."""
     seen = []
 
     def handler(request):
         seen.append(request)
+        streaming = ":streamGenerateContent" in str(request.url)
         for (method, suffix), response in routes.items():
-            if request.method == method and suffix in str(request.url):
-                if callable(response):
-                    return response(request)
-                status, body = response
-                return httpx.Response(status, json=body)
+            if request.method != method:
+                continue
+            if not (suffix in str(request.url) or (streaming and suffix == ":generateContent")):
+                continue
+            if callable(response):
+                return response(request)
+            status, body = response
+            if status == 200 and streaming:
+                return _as_sse(body)
+            return httpx.Response(status, json=body)
         return httpx.Response(404, json={"error": {"code": 404}})
 
     return httpx.MockTransport(handler), seen
@@ -645,3 +663,82 @@ class TestOllamaLocal:
         spec.models[0] = spec.models[0].model_copy(update={"model_revision": "aaa111"})
         adapter, _ = self._adapter({("GET", "/api/tags"): (200, _tags(digest="aaa111"))}, spec=spec)
         assert [model.model_id for model in await adapter.list_models()] == [LOCAL_MODEL]
+
+
+class TestGeminiStreamAssembly:
+    """Gemini is the one route whose descriptor already allows a large budget."""
+
+    def _adapter(self, events, transport_routes=None):
+        text = "".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n"
+        routes = transport_routes or {}
+        routes[("GET", GEMINI_MODEL)] = (200, _metadata())
+        routes[("POST", ":streamGenerateContent")] = lambda request: httpx.Response(
+            200, content=text.encode(), headers={"content-type": "text/event-stream"}
+        )
+        transport, seen = _transport(routes)
+        return (
+            GeminiAdapter(
+                _gemini_spec(), _settings(), credential=SecretStr("k"), transport=transport
+            ),
+            seen,
+        )
+
+    def _chunk(self, text=None, finish=None, thought=False):
+        part = {"text": text} if not thought else {"text": text, "thought": True}
+        candidate = {"content": {"role": "model", "parts": [part] if text is not None else []}}
+        if finish is not None:
+            candidate["finishReason"] = finish
+        return {"modelVersion": GEMINI_MODEL, "candidates": [candidate]}
+
+    async def test_streamed_fragments_are_joined(self):
+        adapter, _ = self._adapter(
+            [self._chunk("Hel"), self._chunk("lo"), self._chunk(finish="STOP")]
+        )
+        response = await adapter.complete(_request(GEMINI_MODEL))
+        assert response.text == "Hello"
+        assert response.finish_reason == "stop"
+
+    async def test_the_streaming_endpoint_is_the_one_called(self):
+        adapter, seen = self._adapter([self._chunk("x"), self._chunk(finish="STOP")])
+        await adapter.complete(_request(GEMINI_MODEL))
+        assert any(":streamGenerateContent" in str(r.url) for r in seen)
+
+    async def test_thousands_of_fragments_collapse_below_the_part_bound(self):
+        """One part per chunk would trip the 4096-part envelope bound on length alone."""
+        events = [self._chunk("a") for _ in range(5000)] + [self._chunk(finish="STOP")]
+        adapter, _ = self._adapter(events)
+        assert (await adapter.complete(_request(GEMINI_MODEL))).text == "a" * 5000
+
+    async def test_thought_fragments_are_still_excluded_from_the_answer(self):
+        events = [
+            self._chunk("secret", thought=True),
+            self._chunk("visible"),
+            self._chunk(finish="STOP"),
+        ]
+        adapter, _ = self._adapter(events)
+        assert (await adapter.complete(_request(GEMINI_MODEL))).text == "visible"
+
+    async def test_a_stream_of_only_thoughts_is_refused(self):
+        events = [self._chunk("secret", thought=True), self._chunk(finish="STOP")]
+        adapter, _ = self._adapter(events)
+        with pytest.raises(MalformedResponse, match="INVALID_GEMINI_COMPLETION"):
+            await adapter.complete(_request(GEMINI_MODEL))
+
+    async def test_a_blocked_prompt_is_refused(self):
+        events = [
+            {"modelVersion": GEMINI_MODEL, "promptFeedback": {"blockReason": "SAFETY"}},
+            self._chunk("x"),
+            self._chunk(finish="STOP"),
+        ]
+        adapter, _ = self._adapter(events)
+        with pytest.raises(MalformedResponse, match="INVALID_GEMINI_COMPLETION"):
+            await adapter.complete(_request(GEMINI_MODEL))
+
+    async def test_a_stream_with_two_candidates_is_refused(self):
+        events = [
+            {"modelVersion": GEMINI_MODEL, "candidates": [{}, {}]},
+            self._chunk(finish="STOP"),
+        ]
+        adapter, _ = self._adapter(events)
+        with pytest.raises(MalformedResponse, match="INVALID_GEMINI_COMPLETION"):
+            await adapter.complete(_request(GEMINI_MODEL))

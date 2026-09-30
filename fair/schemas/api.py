@@ -36,9 +36,28 @@ class SolveRequest(DTO):
     required_capabilities: set[Capability] = Field(default_factory=set)
     freshness_required: bool = False
     cross_check_required: bool = False
+    # Return an answer nothing could verify, labelled as such. FAIR's guarantee is
+    # that it never presents unverified text as verified, which is not the same as
+    # never returning it: open-ended work -- analysis, planning, long-form reasoning
+    # -- has no deterministic contract, so without this it can only ever escalate.
+    # The answer comes back under its own status and carries no score. Everything
+    # that makes an answer wrong rather than unproven still refuses it.
+    accept_unverified: bool = False
     validation: ValidationContract | None = None
     evidence: list[Evidence] = Field(default_factory=list, max_length=10)
     source_policy: SourcePolicy | None = None
+
+    @model_validator(mode="after")
+    def unverified_answers_are_not_high_assurance(self):
+        if self.accept_unverified and (
+            self.cross_check_required or self.quality_level == "high_impact_support"
+        ):
+            raise ValueError(
+                "accept_unverified cannot be combined with cross_check_required or "
+                "high_impact_support: both ask for independent corroboration, which is "
+                "the thing an unverified answer does not have"
+            )
+        return self
 
     @model_validator(mode="after")
     def unique_sources(self):
@@ -78,7 +97,9 @@ class SolveResponse(DTO):
     request_id: str
     execution_kind: Literal["PRIMARY", "SHADOW"] = "PRIMARY"
     parent_request_id: str | None = None
-    status: Literal["ACCEPTED", "ESCALATION_REQUIRED", "FAILED"]
+    # ACCEPTED_UNVERIFIED is deliberately not ACCEPTED: a caller that checks for
+    # equality keeps refusing what FAIR could not vouch for, whatever it asked for.
+    status: Literal["ACCEPTED", "ACCEPTED_UNVERIFIED", "ESCALATION_REQUIRED", "FAILED"]
     reason_code: str
     attempts: list[Attempt]
     minimum_required: float

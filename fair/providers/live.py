@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import Field, model_validator
 
-from fair.constants import SECONDS_IN_DAY
+from fair.constants import SECONDS_IN_DAY, completion_deadline
 from fair.governor.policy import admit_provider
 from fair.providers.base import (
     AccessDenied,
@@ -27,11 +27,26 @@ from fair.providers.base import (
     RateLimited,
     RequestNotSupported,
 )
+from fair.providers.schema_dialects import (
+    GEMINI,
+    JSON_SCHEMA,
+    OPENAI_STRICT,
+    constraint_notes,
+    transport_schema,
+)
 from fair.quality.json_data import strict_json
 from fair.schemas.domain import DTO, NormalizedModelResponse, ProviderHealth, QuotaSnapshot
 from fair.security.credentials import ProviderCredentials
 
 TEXT_CAPABILITIES = {"reasoning", "coding", "structured_output"}
+# The output cap a model keeps until its endpoint has been asked for more. It is the
+# descriptor default for an unreviewed model, not a ceiling on a reviewed one.
+MAX_OUTPUT_TOKENS = 4096
+# The largest completion budget a TextAdapter will send, whatever a descriptor says.
+# A descriptor declaring less still governs, so raising this alone changes nothing:
+# an unprobed model stays at MAX_OUTPUT_TOKENS. Probed 2026-09-30, four routes took
+# a 32768-token request, so that is as far as a reviewed descriptor may now reach.
+MAX_OUTPUT_TOKENS_CEILING = 32768
 
 
 class LiveSettings(DTO):
@@ -41,6 +56,23 @@ class LiveSettings(DTO):
     gemini_max_output_tokens: int = Field(default=65536, ge=1, le=65536, strict=True)
     openrouter_free_account_confirmed: bool = False
     ollama_local_only_confirmed: bool = False
+    # Operator-only. Keeps the last non-200 provider message, bounded and scrubbed,
+    # readable through safe_diagnostics(). Off by default: an upstream body is
+    # provider text, and HTTP_400 alone leaves an operator nothing to act on.
+    provider_error_diagnostics: bool = False
+    # Idle budget between two reads. On a streaming completion this is the stall
+    # detector -- tokens arriving keep resetting it -- so the overall budget below
+    # can be generous without letting a dead generation hang.
+    read_timeout_seconds: float = Field(default=25, gt=0, le=300)
+    # Assumed free-tier throughput and hard ceiling, sizing the budget for a
+    # buffered completion exactly as RoutingSettings sizes the attempt around it.
+    # See RoutingSettings.output_tokens_per_second for where 40 comes from.
+    output_tokens_per_second: float = Field(default=40, gt=0, le=10000)
+    max_completion_seconds: float = Field(default=900, gt=0, le=3600)
+    # The largest completion budget any TextAdapter will send. A descriptor may
+    # declare less and the smaller value governs; raising this alone changes
+    # nothing. Raise both only for a route whose real ceiling has been measured.
+    max_output_tokens_ceiling: int = Field(default=MAX_OUTPUT_TOKENS_CEILING, ge=1, le=131072)
     ollama_url: str = "http://127.0.0.1:11434"
     confirmed_providers: set[str] = Field(default_factory=set)
     review_max_age_days: int = Field(default=30, ge=1, le=30)
@@ -128,6 +160,10 @@ class TextAdapter:
     catalog_key = "data"
     catalog_id_key = "id"
     context_field: str | None = "context_length"
+    # Where this provider publishes its own completion-token ceiling, when it does.
+    # None keeps the reviewed descriptor value untouched, which is what every
+    # provider did before the field existed.
+    output_field: str | None = None
     zero_price_models = False
     account_check_path: str | None = None
     provider_preferences: dict[str, object] | None = None
@@ -136,8 +172,23 @@ class TextAdapter:
     credential_header = "Authorization"
     credential_prefix = "Bearer "
     inspect_error_body = False
+    # Which structured-output dialect this provider's API speaks. The caller's schema
+    # is reduced to that dialect before dispatch; see fair.providers.schema_dialects.
+    schema_dialect = OPENAI_STRICT
+    # A buffered completion sends nothing until the last token is written, so the
+    # whole generation has to fit one read. Streaming turns that into one read per
+    # chunk, which is what lets a large budget be waited for without also waiting
+    # that long on a provider that has stopped responding.
+    supports_streaming = True
 
     _catalog_ttl = 60
+    # A failed catalog is held no longer than a successful one is held fresh.
+    _catalog_error_ttl = 60
+    # An upstream error body is provider text, so only a bounded, credential-scrubbed
+    # message is kept, only when an operator turns diagnostics on, and only through
+    # safe_diagnostics(). No raised code and no attempt log changes either way.
+    _diagnostic_max_chars = 512
+    _diagnostic_parse_limit = 20_000
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -145,13 +196,34 @@ class TextAdapter:
         self._quota = QuotaSnapshot(provider_id=self.provider_id)
         self._model_cache = None
         self._model_cache_at = 0.0
+        self._last_error: dict[str, str] | None = None
+        self._catalog_error: Exception | None = None
+        self._catalog_error_at = 0.0
+        self._catalog_drops: dict[str, str] = {}
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5, read=25, write=5, pool=5),
+            timeout=self._timeout(settings.read_timeout_seconds),
             trust_env=False,
             follow_redirects=False,
             transport=transport,
         )
         self._admit()
+
+    @staticmethod
+    def _timeout(read):
+        return httpx.Timeout(connect=5, read=read, write=5, pool=5)
+
+    def _completion_timeout(self, request, streaming):
+        """How long one read may block: per chunk when streaming, else the whole answer."""
+        if streaming:
+            return self._timeout(self.settings.read_timeout_seconds)
+        return self._timeout(
+            completion_deadline(
+                request.max_output_tokens,
+                base_seconds=self.settings.read_timeout_seconds,
+                tokens_per_second=self.settings.output_tokens_per_second,
+                ceiling_seconds=self.settings.max_completion_seconds,
+            )
+        )
 
     def _admit(self):
         admit_provider(self.spec, now=datetime.fromtimestamp(self.clock(), UTC))
@@ -223,8 +295,177 @@ class TextAdapter:
         """Provider-specific structured error hook; must raise for non-200 responses."""
         self._error(status, headers)
 
-    async def _json(self, method, path, payload=None):
+    @staticmethod
+    def _error_message(data):
+        """The human-readable message out of the error envelopes these APIs use."""
+        if isinstance(data, str):
+            return data
+        if not isinstance(data, dict):
+            return ""
+        error = data.get("error")
+        if isinstance(error, str):
+            return error
+        if isinstance(error, dict):
+            for key in ("message", "detail", "description"):
+                if isinstance(error.get(key), str):
+                    return error[key]
+        entries = data.get("errors")
+        if isinstance(entries, list):
+            messages = [
+                item["message"]
+                for item in entries
+                if isinstance(item, dict) and isinstance(item.get("message"), str)
+            ]
+            if messages:
+                return "; ".join(messages)
+        for key in ("message", "detail", "error_description"):
+            if isinstance(data.get(key), str):
+                return data[key]
+        return ""
+
+    def _record_error_diagnostic(self, status, path, raw):
+        text = raw.decode("utf-8", errors="replace")[: self._diagnostic_parse_limit]
+        try:
+            message = self._error_message(json.loads(text)) or text
+        except ValueError:
+            message = text
+        if self._credential is not None:
+            secret = self._credential.get_secret_value()
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        message = " ".join(message.split())
+        self._last_error = {
+            "status": f"HTTP_{status}",
+            "path": path,
+            "provider_message": message[: self._diagnostic_max_chars] or "EMPTY_ERROR_BODY",
+        }
+
+    def safe_diagnostics(self):
+        """Fixed, secret-scanned operator diagnostics; empty unless something was recorded."""
+        record = {}
+        if self._last_error:
+            record["last_provider_error"] = dict(self._last_error)
+        if self._catalog_drops:
+            record["catalog_drops"] = dict(self._catalog_drops)
+        return record
+
+    async def _stream_json(self, path, payload, timeout):
+        """Read an SSE completion and assemble the envelope a buffered one would have.
+
+        Every check downstream -- the zero-cost observation above all -- then runs on
+        the same shape it has always run on. A stream that carries no usage assembles
+        without usage and is refused by _after_completion exactly as a buffered
+        response without usage is refused today. Streaming changes how the bytes
+        arrive, never what has to be proved about them.
+        """
+        chunks = await self._stream_chunks(path, payload, timeout)
+        model = content = finish = usage = None
+        role = "assistant"
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            if isinstance(chunk.get("model"), str):
+                # Every chunk has to name the same model. Letting the last one win
+                # would accept a stream whose body came from somewhere else as long
+                # as its final chunk carried the right name.
+                if model is not None and chunk["model"] != model:
+                    raise MalformedResponse("INCONSISTENT_COMPLETION_STREAM")
+                model = chunk["model"]
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            choices = chunk.get("choices")
+            if not choices:
+                continue
+            if not isinstance(choices, list) or len(choices) != 1:
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict) or delta.get("tool_calls") or delta.get("function_call"):
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            if isinstance(delta.get("role"), str):
+                role = delta["role"]
+            piece = delta.get("content")
+            if isinstance(piece, str):
+                content = (content or "") + piece
+            if isinstance(choice.get("finish_reason"), str):
+                finish = choice["finish_reason"]
+        assembled = {
+            "model": model,
+            "choices": [{"message": {"role": role, "content": content}, "finish_reason": finish}],
+        }
+        if usage is not None:
+            assembled["usage"] = usage
+        return assembled
+
+    async def _stream_chunks(self, path, payload, timeout):
         self._admit()
+        self._last_error = None
+        url = path if path.startswith("https://") else self.base_url + path
+        headers = {"Accept": "text/event-stream", "Accept-Encoding": "identity"}
+        if self._credential is not None:
+            headers[self.credential_header] = (
+                self.credential_prefix + self._credential.get_secret_value()
+            )
+        chunks, size = [], 0
+        try:
+            async with self._client.stream(
+                "POST", url, headers=headers, json=payload, timeout=timeout
+            ) as response:
+                if response.status_code != 200:
+                    raw = await response.aread()
+                    if self.settings.provider_error_diagnostics:
+                        self._record_error_diagnostic(response.status_code, path, raw)
+                    self._error_from_body(
+                        response.status_code, response.headers, self._maybe_json(raw)
+                    )
+                    raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
+                self._quota = self._observe(response.headers)
+                async for line in response.aiter_lines():
+                    size += len(line)
+                    if size > 4_000_000 or len(chunks) > 100_000:
+                        raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
+                    if not line.startswith("data:"):
+                        continue
+                    body = line[len("data:") :].strip()
+                    if not body or body == "[DONE]":
+                        continue
+                    chunk = strict_json(body)
+                    if isinstance(chunk, dict) and (
+                        "error" in chunk or chunk.get("success") is False
+                    ):
+                        if self.settings.provider_error_diagnostics:
+                            self._record_error_diagnostic(200, path, body.encode())
+                        error = chunk.get("error")
+                        self._error_from_body(
+                            error.get("code", 500)
+                            if isinstance(error, dict) and type(error.get("code")) is int
+                            else 500,
+                            response.headers,
+                            chunk,
+                        )
+                        raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
+                    chunks.append(chunk)
+        except httpx.HTTPError:
+            raise ProviderUnavailable("PROVIDER_TRANSPORT_FAILED") from None
+        except (ValueError, UnicodeError, RecursionError):
+            raise MalformedResponse("MALFORMED_PROVIDER_RESPONSE") from None
+        if not chunks:
+            raise MalformedResponse("EMPTY_COMPLETION_STREAM")
+        return chunks
+
+    @staticmethod
+    def _maybe_json(raw):
+        try:
+            value = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    async def _json(self, method, path, payload=None, timeout=None):
+        self._admit()
+        self._last_error = None
         headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
         if self._credential is not None:
             headers[self.credential_header] = (
@@ -232,8 +473,15 @@ class TextAdapter:
             )
         url = path if path.startswith("https://") else self.base_url + path
         try:
-            async with self._client.stream(method, url, headers=headers, json=payload) as response:
-                if response.status_code != 200 and not self.inspect_error_body:
+            async with self._client.stream(
+                method, url, headers=headers, json=payload, timeout=timeout or self._client.timeout
+            ) as response:
+                # An error body is read only when a subclass parses it for quota or
+                # retry detail, or when an operator has turned diagnostics on. With
+                # neither, the status code alone is the observation and the body is
+                # never fetched -- the behaviour this branch has always had.
+                capture = response.status_code != 200 and self.settings.provider_error_diagnostics
+                if response.status_code != 200 and not self.inspect_error_body and not capture:
                     self._error(response.status_code, response.headers)
                 if response.headers.get("content-encoding", "identity") != "identity":
                     raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
@@ -243,7 +491,14 @@ class TextAdapter:
                     if size > 4_000_000:
                         raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
                     chunks.append(chunk)
-                value = strict_json(b"".join(chunks).decode("utf-8"))
+                raw = b"".join(chunks)
+                if capture:
+                    self._record_error_diagnostic(response.status_code, path, raw)
+                if response.status_code != 200 and not self.inspect_error_body:
+                    # The same code in the same order as with diagnostics off; a
+                    # body that is not JSON must not change what the caller sees.
+                    self._error(response.status_code, response.headers)
+                value = strict_json(raw.decode("utf-8"))
                 if not isinstance(value, dict):
                     raise ValueError()
                 if response.status_code != 200:
@@ -282,7 +537,21 @@ class TextAdapter:
         now = self.clock()
         if self._model_cache is not None and now - self._model_cache_at < self._catalog_ttl:
             return [m.model_copy(deep=True) for m in self._model_cache]
-        result = await self._fetch_models()
+        # A catalog that just failed will not succeed on the next model in the same
+        # solve, and every eligible model asks again: one unreachable endpoint cost
+        # three 25-second read timeouts in a row because only success was cached.
+        # The failure is held as briefly as a successful catalog is held fresh.
+        if (
+            self._catalog_error is not None
+            and now - self._catalog_error_at < self._catalog_error_ttl
+        ):
+            raise self._catalog_error.with_traceback(None)
+        try:
+            result = await self._fetch_models()
+        except Exception as error:
+            self._catalog_error, self._catalog_error_at = error, now
+            raise
+        self._catalog_error = None
         self._model_cache = result
         self._model_cache_at = now
         return result
@@ -296,28 +565,65 @@ class TextAdapter:
     def _catalog_context(self, entry):
         return None if self.context_field is None else entry.get(self.context_field)
 
+    def _catalog_output(self, entry):
+        """The provider's own maximum completion tokens for this model, when it says."""
+        return None if self.output_field is None else entry.get(self.output_field)
+
     async def _fetch_models(self):
         entries = self._catalog_entries(await self._json("GET", self.catalog_path))
-        result = []
+        result, dropped = [], {}
         for configured in self.spec.models:
             matches = [
                 entry
                 for entry in entries
                 if isinstance(entry, dict) and entry.get(self.catalog_id_key) == configured.model_id
             ]
-            if len(matches) != 1 or not configured.active:
+            if not configured.active:
+                dropped[configured.model_id] = "DESCRIPTOR_INACTIVE"
+                continue
+            if len(matches) != 1:
+                # Four different causes used to leave the same trace: the model gone
+                # from the catalog, listed twice, switched off, repriced, or shrunk
+                # below its reviewed context. The router can only report that the
+                # model was unavailable, so the reason is recorded for the operator.
+                dropped[configured.model_id] = (
+                    "ABSENT_FROM_CATALOG" if not matches else "AMBIGUOUS_IN_CATALOG"
+                )
                 continue
             entry = matches[0]
             if entry.get("active", True) is not True:
+                dropped[configured.model_id] = "INACTIVE_IN_CATALOG"
                 continue
             if self.zero_price_models and not zero_priced(entry):
+                dropped[configured.model_id] = "NOT_ZERO_PRICED"
                 continue
             if self.context_field is not None:
                 context = self._catalog_context(entry)
-                if type(context) is not int or context < configured.context_window:
+                if type(context) is not int:
+                    dropped[configured.model_id] = "CONTEXT_NOT_REPORTED"
                     continue
-            result.append(configured.model_copy(deep=True))
+                if context < configured.context_window:
+                    dropped[configured.model_id] = (
+                        f"CATALOG_CONTEXT_BELOW_REVIEWED_{configured.context_window}"
+                    )
+                    continue
+            result.append(self._with_catalog_output(configured, entry))
+        self._catalog_drops = dropped
         return result
+
+    def _with_catalog_output(self, configured, entry):
+        """Lower the reviewed output limit to the provider's own, never raise it.
+
+        A live catalog is current where a reviewed descriptor is a claim from the day
+        it was written, so a smaller published limit wins. The reverse is not true:
+        raising a limit on unreviewed data is the guess this package refuses to make.
+        A provider that publishes no usable limit changes nothing.
+        """
+        published = self._catalog_output(entry)
+        if type(published) is not int or published < 1:
+            return configured.model_copy(deep=True)
+        limit = min(published, configured.max_output_tokens or published)
+        return configured.model_copy(deep=True, update={"max_output_tokens": limit})
 
     async def _before_completion(self, payload):
         if self.account_check_path is not None:
@@ -336,35 +642,53 @@ class TextAdapter:
             if not isinstance(usage, dict) or not zero(usage.get("cost")):
                 raise BillingViolation("ZERO_COST_OBSERVATION_NOT_CONFIRMED")
 
+    def _schema_for_transport(self, request):
+        """The schema this provider can parse, and prompt text for what it cannot carry."""
+        if request.expected_json_schema is None:
+            return None, None
+        return (
+            transport_schema(request.expected_json_schema, self.schema_dialect),
+            constraint_notes(request.expected_json_schema, self.schema_dialect),
+        )
+
+    @staticmethod
+    def _task_text(request, note):
+        return request.task if note is None else request.task + "\n\n" + note
+
     async def complete(self, request):
         models = await self.list_models()
         model = next((item for item in models if item.model_id == request.model_id), None)
         if model is None:
             raise ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED")
-        if not 1 <= request.max_output_tokens <= 4096:
+        ceiling = self.settings.max_output_tokens_ceiling
+        limit = min(model.max_output_tokens or ceiling, ceiling)
+        if not 1 <= request.max_output_tokens <= limit:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         if len(request.task.encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
+        schema, note = self._schema_for_transport(request)
+        streaming = self.supports_streaming
         payload = {
             "model": model.model_id,
-            "messages": [{"role": "user", "content": request.task}],
-            "stream": False,
+            "messages": [{"role": "user", "content": self._task_text(request, note)}],
+            "stream": streaming,
             self.output_tokens_key: request.max_output_tokens,
         }
         payload.update(copy.deepcopy(self.extra_payload))
-        if request.expected_json_schema is not None:
+        if schema is not None:
             payload["response_format"] = {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": "fair_result",
-                    "strict": True,
-                    "schema": request.expected_json_schema,
-                },
+                "json_schema": {"name": "fair_result", "strict": True, "schema": schema},
             }
         await self._before_completion(payload)
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
-        data = await self._json("POST", "/chat/completions", payload)
+        timeout = self._completion_timeout(request, streaming)
+        data = (
+            await self._stream_json("/chat/completions", payload, timeout)
+            if streaming
+            else await self._json("POST", "/chat/completions", payload, timeout=timeout)
+        )
         self._after_completion(data)
         try:
             choices = data["choices"]
@@ -429,6 +753,17 @@ class OpenRouterFreeAdapter(TextAdapter):
     expected_provider = "openrouter_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
+    # Probed against the live API on 2026-09-30: a streamed completion still carried
+    # the zero-cost observation, so the proof this adapter fails closed without is not
+    # lost by streaming. One model answered (cohere/north-mini-code:free); the rest
+    # were unreachable for unrelated reasons, and a route that did stop reporting a
+    # cost would still fail closed rather than bill.
+    supports_streaming = True
+    # OpenRouter reports the completion ceiling under top_provider rather than at the
+    # top level, so the read is a hook rather than a field name. Unconfirmed against
+    # the live API: if the shape is wrong the value is simply absent and the reviewed
+    # descriptor stands, which is the behaviour before this existed.
+    output_field = "top_provider"
     account_check_path = "/key"
     # _after_completion fails closed unless the response reports a zero cost,
     # and OpenRouter only returns usage accounting when it is asked for. Without
@@ -441,6 +776,10 @@ class OpenRouterFreeAdapter(TextAdapter):
         "max_price": {"prompt": 0, "completion": 0, "request": 0, "image": 0},
     }
 
+    def _catalog_output(self, entry):
+        top = entry.get(self.output_field)
+        return top.get("max_completion_tokens") if isinstance(top, dict) else None
+
 
 class KiloFreeAdapter(TextAdapter):
     """Kilo Gateway: only current ':free' models with zero catalog pricing pass."""
@@ -449,6 +788,10 @@ class KiloFreeAdapter(TextAdapter):
     expected_provider = "kilo_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
+    # Probed 2026-09-30 as OpenRouter was: a streamed completion still reported
+    # cost_microdollars. The catalog fallback below covers a response that omits it,
+    # on a stream exactly as when buffered.
+    supports_streaming = True
 
     _explicitly_temporary_ids = frozenset(
         {
@@ -474,8 +817,8 @@ class KiloFreeAdapter(TextAdapter):
         super().__init__(*args, **kwargs)
 
     def safe_diagnostics(self):
-        """Expose only a fixed billing-verification state, never raw provider data."""
-        return {"cost_microdollars": self._cost_observation}
+        """Fixed billing-verification state, plus whatever the base adapter recorded."""
+        return super().safe_diagnostics() | {"cost_microdollars": self._cost_observation}
 
     def _after_completion(self, data):
         usage = data.get("usage")
@@ -709,6 +1052,7 @@ class GeminiAdapter(TextAdapter):
     credential_header = "x-goog-api-key"
     credential_prefix = ""
     inspect_error_body = True
+    schema_dialect = GEMINI
     _pacific = ZoneInfo("America/Los_Angeles")
 
     def _daily_reset_at(self):
@@ -811,6 +1155,81 @@ class GeminiAdapter(TextAdapter):
                 result.append(model.model_copy(deep=True))
         return result
 
+    async def _stream_generate(self, model, payload, timeout):
+        """Assemble streamed candidates into the envelope generateContent returns.
+
+        The checks in complete() -- model identity, prompt feedback, role, finish
+        reason and the per-part key rules -- then run exactly as they do on a
+        buffered answer. Anything this method cannot aggregate is handed on
+        unchanged rather than rejected here, so a malformed stream is refused by
+        those checks, under the code they have always used, instead of gaining a
+        second name for the same failure.
+        """
+        chunks = await self._stream_chunks(
+            "/models/" + model.model_id + ":streamGenerateContent?alt=sse", payload, timeout
+        )
+        version = finish = feedback = None
+        role = "model"
+        parts: list = []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                return {}
+            if isinstance(chunk.get("modelVersion"), str):
+                version = chunk["modelVersion"]
+            if chunk.get("promptFeedback"):
+                feedback = chunk["promptFeedback"]
+            candidates = chunk.get("candidates")
+            if not candidates:
+                continue
+            if not isinstance(candidates, list) or len(candidates) != 1:
+                return chunk
+            candidate = candidates[0]
+            if not isinstance(candidate, dict):
+                return chunk
+            if isinstance(candidate.get("finishReason"), str):
+                finish = candidate["finishReason"]
+            content = candidate.get("content")
+            if content is None:
+                continue
+            if not isinstance(content, dict) or not isinstance(content.get("parts", []), list):
+                return chunk
+            if isinstance(content.get("role"), str):
+                role = content["role"]
+            parts.extend(content.get("parts") or [])
+        assembled = {
+            "modelVersion": version,
+            "candidates": [
+                {
+                    "content": {"role": role, "parts": self._merge_parts(parts)},
+                    "finishReason": finish,
+                }
+            ],
+        }
+        if feedback is not None:
+            assembled["promptFeedback"] = feedback
+        return assembled
+
+    @staticmethod
+    def _merge_parts(parts):
+        """Collapse a stream's text fragments so the envelope sees an ordinary part list.
+
+        One part per chunk would put thousands in a large answer and trip the 4096-part
+        bound on length alone. Only neighbours carrying the same keys and the same
+        thought flag merge, so nothing a part declares is lost, and a part this cannot
+        read is passed through for the envelope check to refuse.
+        """
+        merged: list[tuple[object, dict]] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                merged.append((None, part))
+                continue
+            signature = (tuple(sorted(part.keys() - {"text"})), part.get("thought", False))
+            if merged and merged[-1][0] == signature and isinstance(part.get("text"), str):
+                merged[-1][1]["text"] = merged[-1][1].get("text", "") + part["text"]
+                continue
+            merged.append((signature, dict(part)))
+        return [item for _, item in merged]
+
     async def complete(self, request):
         model = next(
             (m for m in self.spec.models if m.active and m.model_id == request.model_id), None
@@ -819,16 +1238,17 @@ class GeminiAdapter(TextAdapter):
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_REQUIRED")
         if not 1 <= request.max_output_tokens <= self.settings.gemini_max_output_tokens:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
+        schema, note = self._schema_for_transport(request)
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": request.task}]}],
+            "contents": [{"role": "user", "parts": [{"text": self._task_text(request, note)}]}],
             "generationConfig": {
                 "candidateCount": 1,
                 "maxOutputTokens": request.max_output_tokens,
             },
         }
-        if request.expected_json_schema is not None:
+        if schema is not None:
             payload["generationConfig"].update(
-                responseMimeType="application/json", responseJsonSchema=request.expected_json_schema
+                responseMimeType="application/json", responseJsonSchema=schema
             )
         # Gemini publishes separate input and output limits; the output allowance does not
         # consume the configured input capacity. Byte counting remains conservative.
@@ -839,7 +1259,17 @@ class GeminiAdapter(TextAdapter):
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_UNAVAILABLE_OR_CHANGED")
         if request.max_output_tokens > metadata["outputTokenLimit"]:
             raise RequestNotSupported("OUTPUT_BUDGET_EXCEEDS_MODEL_LIMIT")
-        data = await self._json("POST", "/models/" + model.model_id + ":generateContent", payload)
+        streaming = self.supports_streaming
+        timeout = self._completion_timeout(request, streaming)
+        if streaming:
+            data = await self._stream_generate(model, payload, timeout)
+        else:
+            data = await self._json(
+                "POST",
+                "/models/" + model.model_id + ":generateContent",
+                payload,
+                timeout=timeout,
+            )
         try:
             candidates = data["candidates"]
             if (
@@ -888,6 +1318,7 @@ class OllamaLocalAdapter(TextAdapter):
     expected_provider = "ollama_local"
     expected_access = "FREE_LOCAL"
     remote = False
+    schema_dialect = JSON_SCHEMA
 
     def __init__(self, spec, settings, **kwargs):
         self.base_url = settings.ollama_url.rstrip("/")
@@ -949,19 +1380,25 @@ class OllamaLocalAdapter(TextAdapter):
         if type(context) is not int or context < model.context_window:
             raise AuthenticationFailed("LOCAL_CONTEXT_CAPACITY_NOT_CONFIRMED")
         if (
-            not 1 <= request.max_output_tokens <= 4096
+            not 1
+            <= request.max_output_tokens
+            <= min(
+                model.max_output_tokens or self.settings.max_output_tokens_ceiling,
+                self.settings.max_output_tokens_ceiling,
+            )
             or len(request.task.encode()) + request.max_output_tokens > model.context_window
         ):
             raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
+        schema, note = self._schema_for_transport(request)
         payload = {
             "model": model.model_id,
             "stream": False,
-            "messages": [{"role": "user", "content": request.task}],
+            "messages": [{"role": "user", "content": self._task_text(request, note)}],
             "options": {"num_predict": request.max_output_tokens, "num_ctx": model.context_window},
             "keep_alive": 0,
         }
-        if request.expected_json_schema is not None:
-            payload["format"] = request.expected_json_schema
+        if schema is not None:
+            payload["format"] = schema
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/api/chat", payload)
