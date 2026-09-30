@@ -764,3 +764,126 @@ class TestGeminiStreamAssembly:
         adapter, _ = self._adapter(events)
         with pytest.raises(MalformedResponse, match="INVALID_GEMINI_COMPLETION"):
             await adapter.complete(_request(GEMINI_MODEL))
+
+
+class TestOllamaCompletionTimeout:
+    """A buffered local completion gets the output-based read budget, not 25 seconds."""
+
+    def _adapter(self, settings=None):
+        timeouts = {}
+
+        def routes(path, body):
+            def handler(request):
+                timeouts[path] = request.extensions["timeout"]["read"]
+                return httpx.Response(200, json=body)
+
+            return handler
+
+        transport, _ = _transport(
+            {
+                ("GET", "/api/tags"): routes("tags", _tags()),
+                ("POST", "/api/show"): routes("show", _show()),
+                ("POST", "/api/chat"): routes("chat", _chat()),
+            }
+        )
+        adapter = OllamaLocalAdapter(_local_spec(), settings or _settings(), transport=transport)
+        return adapter, timeouts
+
+    async def test_a_large_local_completion_waits_longer_than_the_catalog_reads(self):
+        from fair.constants import completion_deadline
+
+        settings = _settings()
+        adapter, timeouts = self._adapter(settings)
+        await adapter.complete(_request(LOCAL_MODEL, max_output_tokens=4096))
+        expected = completion_deadline(
+            4096,
+            base_seconds=settings.read_timeout_seconds,
+            tokens_per_second=settings.output_tokens_per_second,
+            ceiling_seconds=settings.max_completion_seconds,
+        )
+        assert timeouts["chat"] == expected
+        assert timeouts["chat"] > settings.read_timeout_seconds
+
+    async def test_catalog_and_metadata_reads_keep_the_short_budget(self):
+        settings = _settings()
+        adapter, timeouts = self._adapter(settings)
+        await adapter.complete(_request(LOCAL_MODEL, max_output_tokens=4096))
+        assert timeouts["tags"] == settings.read_timeout_seconds
+        assert timeouts["show"] == settings.read_timeout_seconds
+
+    async def test_the_completion_budget_never_exceeds_the_configured_ceiling(self):
+        settings = _settings(max_completion_seconds=60)
+        adapter, timeouts = self._adapter(settings)
+        await adapter.complete(_request(LOCAL_MODEL, max_output_tokens=4096))
+        assert timeouts["chat"] <= 60
+
+
+class TestOllamaCompletionTimeoutOverARealSocket:
+    """httpx's MockTransport never enforces a socket timeout, so prove it for real.
+
+    Scaled down: a 1 second base read timeout and 64 tokens at 40 tokens/second give a
+    completion budget of 2.6 seconds, against a server that answers after a delay.
+    """
+
+    async def _serve(self, chat_delay):
+        import asyncio
+
+        bodies = {
+            "/api/tags": _tags(),
+            "/api/show": _show(),
+            "/api/chat": _chat(),
+        }
+
+        async def handle(reader, writer):
+            head = await reader.readuntil(b"\r\n\r\n")
+            lines = head.decode().split("\r\n")
+            path = lines[0].split(" ")[1]
+            length = 0
+            for line in lines[1:]:
+                if line.lower().startswith("content-length:"):
+                    length = int(line.split(":")[1])
+            if length:
+                await reader.readexactly(length)
+            if path == "/api/chat":
+                await asyncio.sleep(chat_delay)
+            payload = json.dumps(bodies[path]).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Connection: close\r\nContent-Length: "
+                + str(len(payload)).encode()
+                + b"\r\n\r\n"
+                + payload
+            )
+            await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        return server, server.sockets[0].getsockname()[1]
+
+    def _adapter(self, port):
+        settings = _settings(
+            ollama_url=f"http://127.0.0.1:{port}",
+            read_timeout_seconds=1,
+            output_tokens_per_second=40,
+        )
+        return OllamaLocalAdapter(_local_spec(), settings)
+
+    async def test_a_slow_answer_inside_the_completion_budget_succeeds(self):
+        server, port = await self._serve(chat_delay=1.8)
+        try:
+            response = await self._adapter(port).complete(_request(LOCAL_MODEL))
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert response.text == "pong"
+
+    async def test_an_answer_beyond_the_completion_budget_still_fails(self):
+        from fair.providers.base import ProviderUnavailable
+
+        server, port = await self._serve(chat_delay=3.4)
+        try:
+            with pytest.raises(ProviderUnavailable, match="PROVIDER_TRANSPORT_FAILED"):
+                await self._adapter(port).complete(_request(LOCAL_MODEL))
+        finally:
+            server.close()
+            await server.wait_closed()

@@ -1463,7 +1463,15 @@ class OllamaLocalAdapter(TextAdapter):
             payload["format"] = schema
         if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
-        data = await self._json("POST", "/api/chat", payload)
+        # A buffered answer arrives all at once, so the read timeout has to cover the
+        # whole generation, sized by the requested budget like every other adapter.
+        # Catalog and metadata reads keep the short default.
+        data = await self._json(
+            "POST",
+            "/api/chat",
+            payload,
+            timeout=self._completion_timeout(request, streaming=False),
+        )
         try:
             message = data["message"]
             if (
