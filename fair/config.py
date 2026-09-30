@@ -28,12 +28,18 @@ class RoutingSettings(DTO):
     timeout_seconds: float = Field(default=15, gt=0, le=120)
     # Assumed free-tier throughput, used only to size the budget above. It never
     # promises a rate; it decides how long FAIR waits before calling an attempt
-    # failed. Probed 2026-09-30: 16.1 and 29.7 tokens/second on the two free routes
-    # that answered, both measured over a short completion and so including
-    # time-to-first-token. 15 sits under the slower of the two.
-    output_tokens_per_second: float = Field(default=15, gt=0, le=10000)
-    # Hard ceiling on any single attempt, however many tokens it asked for.
-    max_timeout_seconds: float = Field(default=600, gt=0, le=3600)
+    # failed. Probed 2026-09-30 across eight routes: five finished on their own at
+    # 73.6 to 324.3 tokens/second, and the three that were truncated spent their
+    # whole budget to get there, which puts them above 52.6, 64.3 and 91.6. 40 sits
+    # under every one of those. An earlier 15 came from reading a truncated answer's
+    # visible tokens as its rate, which understates a reasoning model several-fold.
+    output_tokens_per_second: float = Field(default=40, gt=0, le=10000)
+    # Hard ceiling on any single attempt, however many tokens it asked for. Eight
+    # routes now accept 32768 tokens, which the assumed rate sizes at around 834
+    # seconds, so a lower ceiling would cancel a large answer that was arriving
+    # normally. It is only ever reached by a generation still producing tokens: one
+    # that stalls trips the per-chunk read timeout in read_timeout_seconds.
+    max_timeout_seconds: float = Field(default=900, gt=0, le=3600)
     circuit_failures: int = Field(default=3, ge=1)
     circuit_window_seconds: float = Field(default=60, gt=0)
     # Groq's request window refills at 86.4 s per request; a short burst reports ~5m45s.

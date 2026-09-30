@@ -1642,7 +1642,7 @@ class TestAttemptDeadline:
     def test_an_unreadable_rate_leaves_the_default(self, monkeypatch):
         monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "fast")
         fair = FAIR(providers=[(_spec(), MockAdapter("a"))])
-        assert fair._router.settings.output_tokens_per_second == 15
+        assert fair._router.settings.output_tokens_per_second == 40
 
     def test_the_adapter_and_the_router_size_budgets_from_the_same_rate(self):
         fair = FAIR(providers=[(_spec(), MockAdapter("a"))], output_tokens_per_second=7)
@@ -1669,12 +1669,17 @@ class TestProbedOutputLimits:
         """Its ceiling is the one Google publishes per model, which FAIR reads live."""
         assert set(self._limits("google_gemini_api").values()) == {None}
 
+    def test_groq_and_mistral_carry_the_budgets_their_endpoints_accepted(self):
+        for provider in ("groq", "mistral"):
+            assert set(self._limits(provider).values()) == {32768}, provider
+
     def test_an_unprobed_provider_keeps_the_conservative_default(self):
-        for provider in ("groq", "mistral", "kilo_free", "openrouter_free"):
+        """Kilo was rate-limited and OpenRouter refused on data policy, so neither answered."""
+        for provider in ("kilo_free", "openrouter_free"):
             assert set(self._limits(provider).values()) == {4096}, provider
 
     def test_raising_the_ceiling_alone_does_not_raise_an_unprobed_model(self):
         from fair.providers.live import MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CEILING
 
         assert MAX_OUTPUT_TOKENS_CEILING > MAX_OUTPUT_TOKENS
-        assert self._limits("groq")["openai/gpt-oss-20b"] == MAX_OUTPUT_TOKENS
+        assert self._limits("kilo_free")["qwen/qwen3.8-27b:free"] == MAX_OUTPUT_TOKENS

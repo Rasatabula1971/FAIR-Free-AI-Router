@@ -129,6 +129,7 @@ async def _complete(adapter, request, plan=None):
     except TimeoutError:
         return {
             "accepted": False,
+            "requested_tokens": request.max_output_tokens,
             "error": "TimedOut",
             "code": f"NO_ANSWER_WITHIN_{int(seconds)}S",
             "refused_by": "probe",
@@ -139,6 +140,7 @@ async def _complete(adapter, request, plan=None):
         name = type(error).__name__
         return {
             "accepted": False,
+            "requested_tokens": request.max_output_tokens,
             "error": name,
             "code": str(error),
             "refused_by": "fair" if name in LOCAL_REFUSALS else "provider",
@@ -150,6 +152,7 @@ async def _complete(adapter, request, plan=None):
     tokens = characters / CHARS_PER_TOKEN
     return {
         "accepted": True,
+        "requested_tokens": request.max_output_tokens,
         "finish_reason": response.finish_reason,
         "characters": characters,
         "estimated_tokens": round(tokens),
@@ -178,7 +181,6 @@ async def probe_model(adapter, model_id, plan, budget, descriptor=None):
             _request(model_id, max_output_tokens=plan.output_tokens, task=LIMITS_TASK),
             plan,
         )
-        result["limits"]["requested_tokens"] = plan.output_tokens
         budget.refund(result["limits"])
     if plan.schema is not None and budget.take(f"schema:{model_id}"):
         _progress(plan, f"  schema     {model_id} ...")
@@ -281,14 +283,21 @@ def recommend(report):
                 outcome = model.get(name)
                 if outcome is None or not outcome["accepted"]:
                     continue
-                # A truncated answer cannot measure throughput. The budget bounded it,
-                # and a model that reasons before answering spends much of that budget
-                # on thought parts the adapter strips out of the text, so the tokens
-                # counted here are far fewer than the tokens generated.
+                # An answer that finished on its own measures throughput directly.
+                # A truncated one does not -- the tokens counted are the visible ones,
+                # and a model that reasons first spends much of the budget on thought
+                # parts the adapter strips out. But the budget was spent in full to
+                # reach that truncation, so budget over elapsed is a floor under the
+                # real rate, and a floor is what sizing a timeout needs.
                 if outcome.get("finish_reason") == "stop":
                     rates.append(outcome["estimated_tokens_per_second"])
-                else:
-                    truncated[key] = outcome["estimated_tokens_per_second"]
+                    continue
+                implied = round(outcome["requested_tokens"] / max(outcome["seconds"], 1e-6), 1)
+                truncated[key] = {
+                    "visible_tokens_per_second": outcome["estimated_tokens_per_second"],
+                    "implied_at_least": implied,
+                }
+                rates.append(implied)
             limits = model.get("limits")
             if limits is not None:
                 observed: dict = {}
@@ -316,13 +325,8 @@ def recommend(report):
         # and a rate set at the slowest observation would leave that route no headroom.
         advice["slowest_estimated_tokens_per_second"] = min(rates)
         advice["suggested_output_tokens_per_second"] = max(1, round(min(rates) * 0.8))
-    elif truncated:
-        advice["no_rate_measured"] = (
-            "every answer was truncated by its budget, so the figures below are lower "
-            "bounds on throughput, not measurements of it"
-        )
     if truncated:
-        advice["lower_bound_tokens_per_second_truncated"] = truncated
+        advice["truncated_answers"] = truncated
     if streamable:
         advice["cost_observed_on_stream"] = streamable
     return advice

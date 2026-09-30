@@ -382,12 +382,12 @@ attempt budget = timeout_seconds + max_output_tokens / output_tokens_per_second
                  bounded by max_timeout_seconds
 ```
 
-At the defaults that is 83s for 1024 tokens and 288s for 4096, against a flat 15s
+At the defaults that is 41s for 1024 tokens and 117s for 4096, against a flat 15s
 before. `output_tokens_per_second` decides only how long FAIR waits before calling
-an attempt failed. The default of 15 comes from probing the free routes that
-answered on 2026-09-30 — 16.1 and 29.7 tokens/second, both measured over a short
-completion and so including time-to-first-token. Re-probe and raise it if your
-routes are faster.
+an attempt failed. The default of 40 comes from probing eight routes on 2026-09-30:
+five finished on their own at 73.6 to 324.3 tokens/second, and the three that were
+truncated had spent their whole budget getting there, which puts them above 52.6,
+64.3 and 91.6. Re-probe and raise it if your routes are faster.
 
 A generous budget is only safe if a provider that has stopped responding is still
 noticed quickly, so completions are streamed. The read timeout then applies to each
@@ -474,13 +474,16 @@ Probed against the live endpoints on 2026-09-30:
 
 | Route | Accepted | Note |
 |---|---|---|
+| `openai/gpt-oss-20b`, `openai/gpt-oss-120b` (Groq) | 32768 | floor; >250 tok/s |
+| `ministral-8b-latest`, `ministral-3b-latest` | 32768 | floor |
 | `@cf/openai/gpt-oss-20b` | 32768 | floor; not refused below it |
 | `@cf/meta/llama-4-scout-17b-16e-instruct` | 32768 | floor |
 | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 16384 | 32768 exceeds its 24000 context |
 | `gemini-3.5-flash-lite`, `gemini-3.6-flash` | 32768 | checked against Google's published `outputTokenLimit` |
 
-Everything else keeps the conservative 4096 default until its endpoint has been
-asked. `MAX_OUTPUT_TOKENS_CEILING` bounds what any reviewed descriptor may reach;
+`kilo_free` and `openrouter_free` keep the conservative 4096 default: Kilo's models
+were rate-limited and OpenRouter refused on its data policy, so neither endpoint
+actually answered. `MAX_OUTPUT_TOKENS_CEILING` bounds what any reviewed descriptor may reach;
 raising it alone changes nothing, because a descriptor declaring less still governs.
 
 ### Published output limits

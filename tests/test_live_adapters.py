@@ -1622,8 +1622,8 @@ class TestCompletionBudgets:
 
     def test_a_buffered_read_has_to_cover_the_whole_answer(self):
         adapter = self._adapter()
-        assert self._read(adapter, 300, False) == pytest.approx(45)
-        assert self._read(adapter, 3000, False) == pytest.approx(225)
+        assert self._read(adapter, 300, False) == pytest.approx(32.5)
+        assert self._read(adapter, 3000, False) == pytest.approx(100)
 
     def test_no_single_read_may_exceed_the_ceiling(self):
         adapter = self._adapter(max_completion_seconds=90)

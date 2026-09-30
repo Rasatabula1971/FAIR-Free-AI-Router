@@ -66,9 +66,9 @@ class LiveSettings(DTO):
     read_timeout_seconds: float = Field(default=25, gt=0, le=300)
     # Assumed free-tier throughput and hard ceiling, sizing the budget for a
     # buffered completion exactly as RoutingSettings sizes the attempt around it.
-    # See RoutingSettings.output_tokens_per_second for where 15 comes from.
-    output_tokens_per_second: float = Field(default=15, gt=0, le=10000)
-    max_completion_seconds: float = Field(default=600, gt=0, le=3600)
+    # See RoutingSettings.output_tokens_per_second for where 40 comes from.
+    output_tokens_per_second: float = Field(default=40, gt=0, le=10000)
+    max_completion_seconds: float = Field(default=900, gt=0, le=3600)
     # The largest completion budget any TextAdapter will send. A descriptor may
     # declare less and the smaller value governs; raising this alone changes
     # nothing. Raise both only for a route whose real ceiling has been measured.

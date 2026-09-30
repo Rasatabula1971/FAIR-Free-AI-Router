@@ -175,7 +175,13 @@ _CLOUD_PROVIDERS = {
         # carried usable headers yet.
         "request_limit": 1000,
         "request_limit_window": "DAILY_UTC",
-        "models": _text_models(("openai/gpt-oss-20b", 131072), ("openai/gpt-oss-120b", 131072)),
+        # Probed 2026-09-30: both endpoints accepted 32768, a floor rather than a
+        # measured ceiling, and both answered at over 250 tokens/second.
+        "models": _text_models(
+            ("openai/gpt-oss-20b", 131072),
+            ("openai/gpt-oss-120b", 131072),
+            max_output_tokens=32768,
+        ),
     },
     "openrouter_free": {
         "kwarg": "openrouter_api_key",
@@ -212,7 +218,14 @@ _CLOUD_PROVIDERS = {
         "env": "MISTRAL_API_KEY",
         "adapter": MistralAdapter,
         "access_class": "FREE_RECURRING",
-        "models": _text_models(("ministral-8b-latest", 262144), ("ministral-3b-latest", 131072)),
+        # Probed 2026-09-30: both endpoints accepted 32768, a floor rather than a
+        # measured ceiling. ministral-8b is the slowest route measured here at 73.6
+        # tokens/second, which is what the assumed rate is set below.
+        "models": _text_models(
+            ("ministral-8b-latest", 262144),
+            ("ministral-3b-latest", 131072),
+            max_output_tokens=32768,
+        ),
     },
     "kilo_free": {
         "kwarg": "kilo_api_key",
@@ -372,7 +385,7 @@ class FAIR:
         max_verification_attempts: int = 2,
         timeout_seconds: float = 15,
         output_tokens_per_second: float | None = None,
-        max_timeout_seconds: float = 600,
+        max_timeout_seconds: float = 900,
         cooldown_seconds: float = 360,
         cache_enabled: bool = True,
         cache_ttl_seconds: int = 3600,
@@ -433,7 +446,7 @@ class FAIR:
         output_tokens_per_second = (
             output_tokens_per_second
             if output_tokens_per_second is not None
-            else _positive_float(env.get("FAIR_OUTPUT_TOKENS_PER_SECOND"), 15)
+            else _positive_float(env.get("FAIR_OUTPUT_TOKENS_PER_SECOND"), 40)
         )
         confirmed = set(confirmed_free_providers or ())
         if "zai_free" in confirmed:

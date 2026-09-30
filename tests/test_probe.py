@@ -521,11 +521,12 @@ class TestATruncatedAnswerCannotMeasureThroughput:
         assert advice["suggested_output_tokens_per_second"] >= 1
         assert "lower_bound_tokens_per_second_truncated" not in advice
 
-    async def test_a_truncated_answer_is_a_lower_bound_not_a_rate(self):
+    async def test_a_truncated_answer_bounds_the_rate_instead_of_measuring_it(self):
+        """The budget was spent in full to reach the truncation, so budget/seconds is a floor."""
         advice = await self._advice("length")
-        assert "suggested_output_tokens_per_second" not in advice
-        assert "p/m" in advice["lower_bound_tokens_per_second_truncated"]
-        assert "lower bounds" in advice["no_rate_measured"]
+        observed = advice["truncated_answers"]["p/m"]
+        assert observed["implied_at_least"] > observed["visible_tokens_per_second"]
+        assert advice["slowest_estimated_tokens_per_second"] == observed["implied_at_least"]
 
     async def test_a_reasoning_model_does_not_drag_the_fleet_rate_down(self):
         """22 visible tokens against a 512 budget is thinking, not a slow provider."""
@@ -534,4 +535,7 @@ class TestATruncatedAnswerCannotMeasureThroughput:
         adapters = {**_adapters(fast), **_adapters(thinker)}
         advice = probe.recommend(await probe.run(adapters, probe.Plan(streaming=True)))
         assert advice["slowest_estimated_tokens_per_second"] > 1
-        assert "thinker/m" in advice["lower_bound_tokens_per_second_truncated"]
+        assert "thinker/m" in advice["truncated_answers"]
+        # 2 visible characters says nothing; the budget it burned through says a lot.
+        thinker = advice["truncated_answers"]["thinker/m"]
+        assert thinker["implied_at_least"] > thinker["visible_tokens_per_second"]
