@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from pydantic import Field, model_validator
 
-from fair.constants import SECONDS_IN_DAY
+from fair.constants import SECONDS_IN_DAY, completion_deadline
 from fair.governor.policy import admit_provider
 from fair.providers.base import (
     AccessDenied,
@@ -56,6 +56,14 @@ class LiveSettings(DTO):
     # readable through safe_diagnostics(). Off by default: an upstream body is
     # provider text, and HTTP_400 alone leaves an operator nothing to act on.
     provider_error_diagnostics: bool = False
+    # Idle budget between two reads. On a streaming completion this is the stall
+    # detector -- tokens arriving keep resetting it -- so the overall budget below
+    # can be generous without letting a dead generation hang.
+    read_timeout_seconds: float = Field(default=25, gt=0, le=300)
+    # Assumed free-tier throughput and hard ceiling, sizing the budget for a
+    # buffered completion exactly as RoutingSettings sizes the attempt around it.
+    output_tokens_per_second: float = Field(default=30, gt=0, le=10000)
+    max_completion_seconds: float = Field(default=600, gt=0, le=3600)
     ollama_url: str = "http://127.0.0.1:11434"
     confirmed_providers: set[str] = Field(default_factory=set)
     review_max_age_days: int = Field(default=30, ge=1, le=30)
@@ -158,6 +166,11 @@ class TextAdapter:
     # Which structured-output dialect this provider's API speaks. The caller's schema
     # is reduced to that dialect before dispatch; see fair.providers.schema_dialects.
     schema_dialect = OPENAI_STRICT
+    # A buffered completion sends nothing until the last token is written, so the
+    # whole generation has to fit one read. Streaming turns that into one read per
+    # chunk, which is what lets a large budget be waited for without also waiting
+    # that long on a provider that has stopped responding.
+    supports_streaming = True
 
     _catalog_ttl = 60
     # A failed catalog is held no longer than a successful one is held fresh.
@@ -179,12 +192,29 @@ class TextAdapter:
         self._catalog_error_at = 0.0
         self._catalog_drops: dict[str, str] = {}
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5, read=25, write=5, pool=5),
+            timeout=self._timeout(settings.read_timeout_seconds),
             trust_env=False,
             follow_redirects=False,
             transport=transport,
         )
         self._admit()
+
+    @staticmethod
+    def _timeout(read):
+        return httpx.Timeout(connect=5, read=read, write=5, pool=5)
+
+    def _completion_timeout(self, request, streaming):
+        """How long one read may block: per chunk when streaming, else the whole answer."""
+        if streaming:
+            return self._timeout(self.settings.read_timeout_seconds)
+        return self._timeout(
+            completion_deadline(
+                request.max_output_tokens,
+                base_seconds=self.settings.read_timeout_seconds,
+                tokens_per_second=self.settings.output_tokens_per_second,
+                ceiling_seconds=self.settings.max_completion_seconds,
+            )
+        )
 
     def _admit(self):
         admit_provider(self.spec, now=datetime.fromtimestamp(self.clock(), UTC))
@@ -309,7 +339,104 @@ class TextAdapter:
             record["catalog_drops"] = dict(self._catalog_drops)
         return record
 
-    async def _json(self, method, path, payload=None):
+    async def _stream_json(self, path, payload, timeout):
+        """Read an SSE completion and assemble the envelope a buffered one would have.
+
+        Every check downstream -- the zero-cost observation above all -- then runs on
+        the same shape it has always run on. A stream that carries no usage assembles
+        without usage and is refused by _after_completion exactly as a buffered
+        response without usage is refused today. Streaming changes how the bytes
+        arrive, never what has to be proved about them.
+        """
+        chunks = await self._stream_chunks(path, payload, timeout)
+        model = content = finish = usage = None
+        role = "assistant"
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            if isinstance(chunk.get("model"), str):
+                # Every chunk has to name the same model. Letting the last one win
+                # would accept a stream whose body came from somewhere else as long
+                # as its final chunk carried the right name.
+                if model is not None and chunk["model"] != model:
+                    raise MalformedResponse("INCONSISTENT_COMPLETION_STREAM")
+                model = chunk["model"]
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            choices = chunk.get("choices")
+            if not choices:
+                continue
+            if not isinstance(choices, list) or len(choices) != 1:
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            choice = choices[0]
+            if not isinstance(choice, dict):
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict) or delta.get("tool_calls") or delta.get("function_call"):
+                raise MalformedResponse("INVALID_COMPLETION_STREAM")
+            if isinstance(delta.get("role"), str):
+                role = delta["role"]
+            piece = delta.get("content")
+            if isinstance(piece, str):
+                content = (content or "") + piece
+            if isinstance(choice.get("finish_reason"), str):
+                finish = choice["finish_reason"]
+        assembled = {
+            "model": model,
+            "choices": [{"message": {"role": role, "content": content}, "finish_reason": finish}],
+        }
+        if usage is not None:
+            assembled["usage"] = usage
+        return assembled
+
+    async def _stream_chunks(self, path, payload, timeout):
+        url = path if path.startswith("https://") else self.base_url + path
+        headers = {"Accept": "text/event-stream", "Accept-Encoding": "identity"}
+        if self._credential is not None:
+            headers[self.credential_header] = (
+                self.credential_prefix + self._credential.get_secret_value()
+            )
+        chunks, size = [], 0
+        try:
+            async with self._client.stream(
+                "POST", url, headers=headers, json=payload, timeout=timeout
+            ) as response:
+                if response.status_code != 200:
+                    raw = await response.aread()
+                    if self.settings.provider_error_diagnostics:
+                        self._record_error_diagnostic(response.status_code, raw)
+                    self._error_from_body(
+                        response.status_code, response.headers, self._maybe_json(raw)
+                    )
+                    raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
+                self._quota = self._observe(response.headers)
+                async for line in response.aiter_lines():
+                    size += len(line)
+                    if size > 4_000_000 or len(chunks) > 100_000:
+                        raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
+                    if not line.startswith("data:"):
+                        continue
+                    body = line[len("data:") :].strip()
+                    if not body or body == "[DONE]":
+                        continue
+                    chunks.append(strict_json(body))
+        except httpx.HTTPError:
+            raise ProviderUnavailable("PROVIDER_TRANSPORT_FAILED") from None
+        except (ValueError, UnicodeError, RecursionError):
+            raise MalformedResponse("MALFORMED_PROVIDER_RESPONSE") from None
+        if not chunks:
+            raise MalformedResponse("EMPTY_COMPLETION_STREAM")
+        return chunks
+
+    @staticmethod
+    def _maybe_json(raw):
+        try:
+            value = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    async def _json(self, method, path, payload=None, timeout=None):
         self._admit()
         headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
         if self._credential is not None:
@@ -318,7 +445,9 @@ class TextAdapter:
             )
         url = path if path.startswith("https://") else self.base_url + path
         try:
-            async with self._client.stream(method, url, headers=headers, json=payload) as response:
+            async with self._client.stream(
+                method, url, headers=headers, json=payload, timeout=timeout or self._client.timeout
+            ) as response:
                 # An error body is read only when a subclass parses it for quota or
                 # retry detail, or when an operator has turned diagnostics on. With
                 # neither, the status code alone is the observation and the body is
@@ -509,10 +638,11 @@ class TextAdapter:
         if len(request.task.encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         schema, note = self._schema_for_transport(request)
+        streaming = self.supports_streaming
         payload = {
             "model": model.model_id,
             "messages": [{"role": "user", "content": self._task_text(request, note)}],
-            "stream": False,
+            "stream": streaming,
             self.output_tokens_key: request.max_output_tokens,
         }
         payload.update(copy.deepcopy(self.extra_payload))
@@ -524,7 +654,12 @@ class TextAdapter:
         await self._before_completion(payload)
         if len(json.dumps(payload).encode()) + request.max_output_tokens > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
-        data = await self._json("POST", "/chat/completions", payload)
+        timeout = self._completion_timeout(request, streaming)
+        data = (
+            await self._stream_json("/chat/completions", payload, timeout)
+            if streaming
+            else await self._json("POST", "/chat/completions", payload, timeout=timeout)
+        )
         self._after_completion(data)
         try:
             choices = data["choices"]
@@ -589,6 +724,11 @@ class OpenRouterFreeAdapter(TextAdapter):
     expected_provider = "openrouter_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
+    # The zero-cost observation this adapter fails closed without has to arrive in
+    # the response. Whether OpenRouter emits it on a stream is unverified against the
+    # live API, and a wrong answer here would refuse every completion rather than
+    # merely time one out. Buffered until a live check says otherwise.
+    supports_streaming = False
     # OpenRouter reports the completion ceiling under top_provider rather than at the
     # top level, so the read is a hook rather than a field name. Unconfirmed against
     # the live API: if the shape is wrong the value is simply absent and the reviewed
@@ -618,6 +758,9 @@ class KiloFreeAdapter(TextAdapter):
     expected_provider = "kilo_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
+    # As OpenRouter: cost_microdollars has to come back with the answer, and its
+    # own comment notes some non-streaming responses already omit it.
+    supports_streaming = False
 
     _explicitly_temporary_ids = frozenset(
         {
@@ -981,6 +1124,81 @@ class GeminiAdapter(TextAdapter):
                 result.append(model.model_copy(deep=True))
         return result
 
+    async def _stream_generate(self, model, payload, timeout):
+        """Assemble streamed candidates into the envelope generateContent returns.
+
+        The checks in complete() -- model identity, prompt feedback, role, finish
+        reason and the per-part key rules -- then run exactly as they do on a
+        buffered answer. Anything this method cannot aggregate is handed on
+        unchanged rather than rejected here, so a malformed stream is refused by
+        those checks, under the code they have always used, instead of gaining a
+        second name for the same failure.
+        """
+        chunks = await self._stream_chunks(
+            "/models/" + model.model_id + ":streamGenerateContent?alt=sse", payload, timeout
+        )
+        version = finish = feedback = None
+        role = "model"
+        parts: list = []
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                return {}
+            if isinstance(chunk.get("modelVersion"), str):
+                version = chunk["modelVersion"]
+            if chunk.get("promptFeedback"):
+                feedback = chunk["promptFeedback"]
+            candidates = chunk.get("candidates")
+            if not candidates:
+                continue
+            if not isinstance(candidates, list) or len(candidates) != 1:
+                return chunk
+            candidate = candidates[0]
+            if not isinstance(candidate, dict):
+                return chunk
+            if isinstance(candidate.get("finishReason"), str):
+                finish = candidate["finishReason"]
+            content = candidate.get("content")
+            if content is None:
+                continue
+            if not isinstance(content, dict) or not isinstance(content.get("parts", []), list):
+                return chunk
+            if isinstance(content.get("role"), str):
+                role = content["role"]
+            parts.extend(content.get("parts") or [])
+        assembled = {
+            "modelVersion": version,
+            "candidates": [
+                {
+                    "content": {"role": role, "parts": self._merge_parts(parts)},
+                    "finishReason": finish,
+                }
+            ],
+        }
+        if feedback is not None:
+            assembled["promptFeedback"] = feedback
+        return assembled
+
+    @staticmethod
+    def _merge_parts(parts):
+        """Collapse a stream's text fragments so the envelope sees an ordinary part list.
+
+        One part per chunk would put thousands in a large answer and trip the 4096-part
+        bound on length alone. Only neighbours carrying the same keys and the same
+        thought flag merge, so nothing a part declares is lost, and a part this cannot
+        read is passed through for the envelope check to refuse.
+        """
+        merged: list[tuple[object, dict]] = []
+        for part in parts:
+            if not isinstance(part, dict):
+                merged.append((None, part))
+                continue
+            signature = (tuple(sorted(part.keys() - {"text"})), part.get("thought", False))
+            if merged and merged[-1][0] == signature and isinstance(part.get("text"), str):
+                merged[-1][1]["text"] = merged[-1][1].get("text", "") + part["text"]
+                continue
+            merged.append((signature, dict(part)))
+        return [item for _, item in merged]
+
     async def complete(self, request):
         model = next(
             (m for m in self.spec.models if m.active and m.model_id == request.model_id), None
@@ -1010,7 +1228,17 @@ class GeminiAdapter(TextAdapter):
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_UNAVAILABLE_OR_CHANGED")
         if request.max_output_tokens > metadata["outputTokenLimit"]:
             raise RequestNotSupported("OUTPUT_BUDGET_EXCEEDS_MODEL_LIMIT")
-        data = await self._json("POST", "/models/" + model.model_id + ":generateContent", payload)
+        streaming = self.supports_streaming
+        timeout = self._completion_timeout(request, streaming)
+        if streaming:
+            data = await self._stream_generate(model, payload, timeout)
+        else:
+            data = await self._json(
+                "POST",
+                "/models/" + model.model_id + ":generateContent",
+                payload,
+                timeout=timeout,
+            )
         try:
             candidates = data["candidates"]
             if (

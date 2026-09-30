@@ -12,6 +12,7 @@ from fair.providers.base import (
     AccessDenied,
     AuthenticationFailed,
     BillingViolation,
+    MalformedResponse,
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
@@ -111,8 +112,35 @@ def _completion(model_id, content="pong", usage=None):
     return body
 
 
+def _asked_for_a_stream(request):
+    try:
+        return json.loads(request.content).get("stream") is True
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return False
+
+
+def _as_sse(body):
+    """Re-serve a buffered completion as the event stream a provider would send."""
+    choice = (body.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    model = body.get("model")
+    events = [
+        {"model": model, "choices": [{"delta": {"role": message.get("role", "assistant")}}]},
+        {"model": model, "choices": [{"delta": {"content": message.get("content", "")}}]},
+        {"model": model, "choices": [{"delta": {}, "finish_reason": choice.get("finish_reason")}]},
+    ]
+    if body.get("usage") is not None:
+        events.append({"model": model, "choices": [], "usage": body["usage"]})
+    text = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+    return httpx.Response(200, content=text.encode(), headers={"content-type": "text/event-stream"})
+
+
 def _transport(routes):
-    """routes: {(method, path_suffix): (status, json_body) | callable(request)}."""
+    """routes: {(method, path_suffix): (status, json_body) | callable(request)}.
+
+    A route asked for with "stream": true is served as SSE, the way a provider
+    answers a streaming request, so one route serves both transports.
+    """
     seen = []
 
     def handler(request):
@@ -126,6 +154,8 @@ def _transport(routes):
                 if callable(response):
                     return response(request)
                 status, body = response
+                if status == 200 and _asked_for_a_stream(request):
+                    return _as_sse(body)
                 return httpx.Response(status, json=body)
         return httpx.Response(404, json={"error": {"code": 404}})
 
@@ -991,17 +1021,28 @@ class TestSchemaTransport:
                         "supportedGenerationMethods": ["generateContent"],
                     },
                 ),
-                ("POST", ":generateContent"): (
+                # Gemini streams; one event carrying the envelope it would have buffered.
+                ("POST", "GenerateContent"): lambda request: httpx.Response(
                     200,
-                    {
-                        "modelVersion": model,
-                        "candidates": [
+                    content=(
+                        "data: "
+                        + json.dumps(
                             {
-                                "content": {"role": "model", "parts": [{"text": "{}"}]},
-                                "finishReason": "STOP",
+                                "modelVersion": model,
+                                "candidates": [
+                                    {
+                                        "content": {
+                                            "role": "model",
+                                            "parts": [{"text": "{}"}],
+                                        },
+                                        "finishReason": "STOP",
+                                    }
+                                ],
                             }
-                        ],
-                    },
+                        )
+                        + "\n\ndata: [DONE]\n\n"
+                    ).encode(),
+                    headers={"content-type": "text/event-stream"},
                 ),
             }
         )
@@ -1402,3 +1443,193 @@ class TestPublishedOutputLimit:
         assert not any(r.method == "POST" for r in seen)
         await adapter.complete(request.model_copy(update={"max_output_tokens": 100}))
         assert json.loads(seen[-1].content)["max_tokens"] == 100
+
+
+# ── Streaming transport and scaled budgets ───────────────────────────────
+
+
+def _sse(events):
+    text = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+    return httpx.Response(200, content=text.encode(), headers={"content-type": "text/event-stream"})
+
+
+class TestStreamingTransport:
+    MODEL = "openai/gpt-oss-20b"
+
+    def _adapter(self, events, settings=None, cls=GroqAdapter, provider="groq"):
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): lambda request: _sse(events),
+            }
+        )
+        return (
+            cls(
+                _spec(provider, "FREE_RECURRING", self.MODEL),
+                settings or _settings(),
+                credential=SecretStr("k"),
+                transport=transport,
+            ),
+            seen,
+        )
+
+    def _events(self, pieces, finish="stop", usage=None):
+        events = [{"model": self.MODEL, "choices": [{"delta": {"role": "assistant"}}]}]
+        events += [{"model": self.MODEL, "choices": [{"delta": {"content": p}}]} for p in pieces]
+        events.append({"model": self.MODEL, "choices": [{"delta": {}, "finish_reason": finish}]})
+        if usage is not None:
+            events.append({"model": self.MODEL, "choices": [], "usage": usage})
+        return events
+
+    async def test_a_streamed_answer_is_assembled_in_order(self):
+        adapter, _ = self._adapter(self._events(["Hel", "lo ", "world"]))
+        response = await adapter.complete(_request(self.MODEL))
+        assert response.text == "Hello world"
+        assert response.finish_reason == "stop"
+
+    async def test_the_request_asks_for_a_stream(self):
+        adapter, seen = self._adapter(self._events(["x"]))
+        await adapter.complete(_request(self.MODEL))
+        assert json.loads(seen[-1].content)["stream"] is True
+
+    async def test_a_truncated_answer_still_reports_length(self):
+        adapter, _ = self._adapter(self._events(["x"], finish="length"))
+        assert (await adapter.complete(_request(self.MODEL))).finish_reason == "length"
+
+    async def test_an_empty_stream_is_refused(self):
+        adapter, _ = self._adapter([])
+        with pytest.raises(MalformedResponse, match="EMPTY_COMPLETION_STREAM"):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_stream_with_no_content_is_refused(self):
+        adapter, _ = self._adapter(self._events([]))
+        with pytest.raises(MalformedResponse, match="INVALID_CHAT_COMPLETION"):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_stream_whose_chunks_disagree_about_the_model_is_refused(self):
+        """Letting the last chunk win would accept a body that came from elsewhere."""
+        events = self._events(["x"])
+        events[1]["model"] = "someone/else"
+        adapter, _ = self._adapter(events)
+        with pytest.raises(MalformedResponse, match="INCONSISTENT_COMPLETION_STREAM"):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_stream_naming_only_another_model_is_refused(self):
+        events = [
+            {"model": "someone/else", "choices": [{"delta": {"content": "x"}}]},
+            {"model": "someone/else", "choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        adapter, _ = self._adapter(events)
+        with pytest.raises(MalformedResponse, match="INVALID_CHAT_COMPLETION"):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_delta_carrying_tool_calls_is_refused(self):
+        events = self._events(["x"])
+        events[1]["choices"][0]["delta"]["tool_calls"] = [{"id": "1"}]
+        adapter, _ = self._adapter(events)
+        with pytest.raises(MalformedResponse, match="INVALID_COMPLETION_STREAM"):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_stream_with_no_finish_reason_is_refused(self):
+        events = self._events(["x"], finish=None)
+        adapter, _ = self._adapter(events)
+        with pytest.raises(MalformedResponse, match="INVALID_CHAT_COMPLETION"):
+            await adapter.complete(_request(self.MODEL))
+
+
+class TestStreamingKeepsTheBillingProof:
+    """Streaming changes how the bytes arrive, never what has to be proved about them."""
+
+    MODEL = "qwen/qwen3.8-27b:free"
+
+    def _adapter(self, events, streaming):
+        catalog = {
+            "data": [
+                {
+                    "id": self.MODEL,
+                    "context_length": 262144,
+                    "pricing": {"prompt": "0", "completion": "0"},
+                }
+            ]
+        }
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (200, catalog),
+                ("POST", "/chat/completions"): lambda request: _sse(events),
+            }
+        )
+        adapter = KiloFreeAdapter(
+            _spec("kilo_free", "FREE_DYNAMIC", self.MODEL, context=262144),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        adapter.supports_streaming = streaming
+        return adapter
+
+    def _events(self, usage=None):
+        events = [
+            {"model": self.MODEL, "choices": [{"delta": {"role": "assistant"}}]},
+            {"model": self.MODEL, "choices": [{"delta": {"content": "hi"}}]},
+            {"model": self.MODEL, "choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        if usage is not None:
+            events.append({"model": self.MODEL, "choices": [], "usage": usage})
+        return events
+
+    async def test_a_stream_reporting_a_nonzero_cost_is_refused(self):
+        adapter = self._adapter(self._events(usage={"cost_microdollars": 7}), streaming=True)
+        with pytest.raises(BillingViolation):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_stream_carrying_a_zero_cost_is_accepted(self):
+        adapter = self._adapter(self._events(usage={"cost_microdollars": 0}), streaming=True)
+        assert (await adapter.complete(_request(self.MODEL))).text == "hi"
+
+    async def test_the_zero_price_adapters_stay_buffered_until_that_is_verified(self):
+        """A missing usage chunk would refuse every completion, not merely slow one down."""
+        assert OpenRouterFreeAdapter.supports_streaming is False
+        assert KiloFreeAdapter.supports_streaming is False
+        assert GroqAdapter.supports_streaming is True
+        assert MistralAdapter.supports_streaming is True
+        assert CloudflareWorkersAiAdapter.supports_streaming is True
+        assert GeminiAdapter.supports_streaming is True
+
+
+class TestCompletionBudgets:
+    MODEL = "openai/gpt-oss-20b"
+
+    def _adapter(self, **settings_kw):
+        transport, _ = _transport({})
+        return GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            LiveSettings(enabled=True, confirmed_providers=set(_CLOUD_PROVIDERS), **settings_kw),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+
+    def _read(self, adapter, tokens, streaming):
+        request = _request(self.MODEL).model_copy(update={"max_output_tokens": tokens})
+        return adapter._completion_timeout(request, streaming).read
+
+    def test_a_streaming_read_is_the_idle_budget_whatever_the_size(self):
+        """Tokens arriving reset it, so it detects a stall rather than bounding the answer."""
+        adapter = self._adapter()
+        assert self._read(adapter, 256, True) == 25
+        assert self._read(adapter, 32768, True) == 25
+
+    def test_a_buffered_read_has_to_cover_the_whole_answer(self):
+        adapter = self._adapter()
+        assert self._read(adapter, 300, False) == pytest.approx(35)
+        assert self._read(adapter, 3000, False) == pytest.approx(125)
+
+    def test_no_single_read_may_exceed_the_ceiling(self):
+        adapter = self._adapter(max_completion_seconds=90)
+        assert self._read(adapter, 1_000_000, False) == 90
+
+    def test_the_assumed_rate_is_configurable(self):
+        adapter = self._adapter(output_tokens_per_second=10)
+        assert self._read(adapter, 300, False) == pytest.approx(55)

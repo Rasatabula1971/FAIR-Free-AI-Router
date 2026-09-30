@@ -369,6 +369,41 @@ A catalog fetch that fails is remembered for as long as a successful one stays
 fresh. Only success used to be cached, so every eligible model asked again and one
 unreachable endpoint cost a read timeout per model rather than per solve.
 
+### Attempt budgets and streaming
+
+A per-attempt timeout is a bet that a completion of any size arrives inside it.
+FAIR enforced two such bets — the router waited `timeout_seconds` around the call
+and the adapter allowed 25 seconds for one read — so a large request was cancelled
+twice over before a model had finished writing. Both now scale with the requested
+output:
+
+```
+attempt budget = timeout_seconds + max_output_tokens / output_tokens_per_second
+                 bounded by max_timeout_seconds
+```
+
+At the defaults that is 49s for 1024 tokens and 151s for 4096, against a flat 15s
+before. `output_tokens_per_second` is an assumption about free-tier throughput, not
+a measurement: it only decides how long FAIR waits before calling an attempt failed.
+Lower it where models are slow.
+
+A generous budget is only safe if a provider that has stopped responding is still
+noticed quickly, so completions are streamed. The read timeout then applies to each
+chunk rather than to the whole answer: arriving tokens keep resetting it, and a
+stalled generation trips it in `read_timeout_seconds` however large the budget is.
+
+Streaming changes how the bytes arrive, never what has to be proved about them. The
+stream is assembled into the same envelope a buffered response returns, and every
+check — model identity, finish reason, tool-call refusal, and the zero-cost
+observation above all — then runs on the shape it has always run on. A stream
+carrying no usage is refused exactly as a buffered response carrying none is.
+
+`openrouter_free` and `kilo_free` stay buffered (`supports_streaming = False`).
+Both fail closed without a cost observation in the response, and whether that
+observation arrives on a stream is unverified against the live APIs; a wrong answer
+there would refuse every completion rather than merely slow one down. Flip the flag
+once a live check confirms it.
+
 ### Published output limits
 
 Where a provider publishes its own completion-token ceiling in the live catalog,
@@ -518,7 +553,9 @@ FAIR(
     quality_level="standard",     # commodity|standard|advanced|high_impact_support
     max_attempts=3,               # answered attempts (judged by the quality gate) before escalating
     max_unanswered_attempts=6,    # models that never answered (down/slow/throttled) tolerated per solve
-    timeout_seconds=15,           # per-attempt timeout
+    timeout_seconds=15,           # base per-attempt budget, before the output allowance
+    output_tokens_per_second=30,  # assumed free-tier throughput, sizing that budget
+    max_timeout_seconds=600,      # hard ceiling on any one attempt
     cooldown_seconds=360,         # provider sit-out after circuit-break/throttle (Groq's window)
     cache_enabled=True,           # in-memory LRU cache for deterministic tasks
     cross_check_required=False,   # require independent verification

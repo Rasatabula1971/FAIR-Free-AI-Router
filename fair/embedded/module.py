@@ -254,6 +254,15 @@ def _flag(value):
     return value is not None and value.strip().casefold() not in _OFF
 
 
+def _positive_float(value, default):
+    """An unreadable or non-positive environment value leaves the default in place."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _read_env_file(path):
     values = {}
     with open(path, encoding="utf-8") as handle:
@@ -348,6 +357,8 @@ class FAIR:
         max_unanswered_attempts: int = 6,
         max_verification_attempts: int = 2,
         timeout_seconds: float = 15,
+        output_tokens_per_second: float | None = None,
+        max_timeout_seconds: float = 600,
         cooldown_seconds: float = 360,
         cache_enabled: bool = True,
         cache_ttl_seconds: int = 3600,
@@ -402,6 +413,13 @@ class FAIR:
                 "free API tier eligible for FAIR"
             )
 
+        # Both the adapter and the router size their budgets from this, so it is
+        # resolved once before either of them is built.
+        output_tokens_per_second = (
+            output_tokens_per_second
+            if output_tokens_per_second is not None
+            else _positive_float(env.get("FAIR_OUTPUT_TOKENS_PER_SECOND"), 30)
+        )
         confirmed = set(confirmed_free_providers or ())
         if "zai_free" in confirmed:
             self.skipped.setdefault(
@@ -419,6 +437,8 @@ class FAIR:
             confirmed_providers=confirmed | {"ollama_local"},
             provider_error_diagnostics=provider_error_diagnostics
             or _flag(env.get("FAIR_PROVIDER_ERROR_DIAGNOSTICS")),
+            output_tokens_per_second=output_tokens_per_second,
+            max_completion_seconds=max_timeout_seconds,
         )
 
         for provider_id, entry in _CLOUD_PROVIDERS.items():
@@ -482,6 +502,8 @@ class FAIR:
             max_unanswered_attempts=max_unanswered_attempts,
             max_verification_attempts=max_verification_attempts,
             timeout_seconds=timeout_seconds,
+            output_tokens_per_second=output_tokens_per_second,
+            max_timeout_seconds=max_timeout_seconds,
             cooldown_seconds=cooldown_seconds,
             cache_enabled=cache_enabled,
             cache_ttl_seconds=cache_ttl_seconds,

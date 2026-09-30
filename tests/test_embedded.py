@@ -1,5 +1,6 @@
 """Tests for the embedded FAIR module — no database, no server."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -1544,3 +1545,98 @@ class TestTransportedConstraintsStillJudgeTheAnswer:
         result = await self._solve('{"items": ["one", "two"]}')
         assert result.status == "ACCEPTED"
         assert result.verification_state == "STRUCTURE_VALIDATED"
+
+
+# ── Attempt budgets scale with the requested output ──────────────────────
+
+
+class TestAttemptDeadline:
+    """A fixed budget was a bet that any size of completion arrives inside it."""
+
+    def _settings(self, **kw):
+        from fair.config import RoutingSettings
+
+        return RoutingSettings(**kw)
+
+    def test_the_budget_grows_with_the_requested_output(self):
+        settings = self._settings(timeout_seconds=15, output_tokens_per_second=30)
+        assert settings.attempt_deadline(300) == pytest.approx(25)
+        assert settings.attempt_deadline(3000) == pytest.approx(115)
+
+    def test_a_tiny_request_still_gets_the_base_budget(self):
+        settings = self._settings(timeout_seconds=15)
+        assert settings.attempt_deadline(0) == 15
+
+    def test_no_attempt_may_exceed_the_ceiling(self):
+        settings = self._settings(max_timeout_seconds=100)
+        assert settings.attempt_deadline(10_000_000) == 100
+
+    def test_a_ceiling_below_the_base_is_rejected(self):
+        with pytest.raises(ValueError, match="max_timeout_seconds"):
+            self._settings(timeout_seconds=90, max_timeout_seconds=30)
+
+    async def test_a_large_request_is_no_longer_cancelled_by_the_base_budget(self):
+        """The router used to cancel at timeout_seconds however many tokens were asked for."""
+
+        class SlowAdapter(MockAdapter):
+            async def complete(self, request):
+                await asyncio.sleep(0.4)
+                return await super().complete(request)
+
+        router = _router(
+            entries=[(_spec(), SlowAdapter("a", text='{"items": [1]}'))],
+            timeout_seconds=0.2,
+            output_tokens_per_second=2000,
+            max_timeout_seconds=30,
+        )
+        # 0.2s base + 2000/2000 = 1.2s for this request; the adapter needs 0.4s.
+        assert router.settings.attempt_deadline(2000) == pytest.approx(1.2)
+        result = await router.solve(
+            _request(
+                task="list items",
+                max_output_tokens=2000,
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ACCEPTED"
+
+    async def test_the_ceiling_still_cancels_an_attempt_that_overruns(self):
+        class StalledAdapter(MockAdapter):
+            async def complete(self, request):
+                await asyncio.sleep(5)
+                return await super().complete(request)
+
+        router = _router(
+            entries=[(_spec(), StalledAdapter("a", text='{"items": [1]}'))],
+            timeout_seconds=0.1,
+            output_tokens_per_second=10000,
+            max_timeout_seconds=0.3,
+        )
+        result = await router.solve(
+            _request(
+                task="list items",
+                max_output_tokens=2000,
+                expected_schema={"type": "object", "required": ["items"]},
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.attempts[0].disposition == "INFRA_FAILURE"
+
+    def test_the_assumed_rate_comes_from_the_environment_when_unset(self, monkeypatch):
+        monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "12")
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))])
+        assert fair._router.settings.output_tokens_per_second == 12
+
+    def test_an_explicit_rate_beats_the_environment(self, monkeypatch):
+        monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "12")
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))], output_tokens_per_second=99)
+        assert fair._router.settings.output_tokens_per_second == 99
+
+    def test_an_unreadable_rate_leaves_the_default(self, monkeypatch):
+        monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "fast")
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))])
+        assert fair._router.settings.output_tokens_per_second == 30
+
+    def test_the_adapter_and_the_router_size_budgets_from_the_same_rate(self):
+        fair = FAIR(providers=[(_spec(), MockAdapter("a"))], output_tokens_per_second=7)
+        assert fair._router.settings.output_tokens_per_second == 7

@@ -121,7 +121,7 @@ class EmbeddedRouter:
                         max_output_tokens=request.max_output_tokens,
                     )
                 ),
-                timeout=self.settings.timeout_seconds,
+                timeout=self.settings.attempt_deadline(request.max_output_tokens),
             )
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
                 raise ValueError("Response identity mismatch")
