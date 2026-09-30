@@ -1183,10 +1183,14 @@ class TestProviderErrorDiagnostics:
             transport=transport,
         )
         assert adapter.safe_diagnostics() == {"cost_microdollars": "NOT_OBSERVED"}
-        adapter._record_error_diagnostic(400, b'{"error":{"message":"bad"}}')
+        adapter._record_error_diagnostic(400, "/chat/completions", b'{"error":{"message":"bad"}}')
         assert adapter.safe_diagnostics() == {
             "cost_microdollars": "NOT_OBSERVED",
-            "last_provider_error": {"status": "HTTP_400", "provider_message": "bad"},
+            "last_provider_error": {
+                "status": "HTTP_400",
+                "path": "/chat/completions",
+                "provider_message": "bad",
+            },
         }
 
 
@@ -1632,3 +1636,136 @@ class TestCompletionBudgets:
     def test_the_assumed_rate_is_configurable(self):
         adapter = self._adapter(output_tokens_per_second=10)
         assert self._read(adapter, 300, False) == pytest.approx(55)
+
+
+class TestADiagnosticBelongsToOneRequest:
+    """Kept past its request, a diagnostic is read against the next call and blames
+    the wrong model for the previous one's failure."""
+
+    MODEL = "openai/gpt-oss-20b"
+
+    def _adapter(self, completions):
+        """completions: a list of (status, body) served in order."""
+        remaining = list(completions)
+
+        def handler(request):
+            if request.url.path.endswith("/models"):
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                )
+            status, body = remaining.pop(0)
+            if status == 200 and _asked_for_a_stream(request):
+                return _as_sse(body)
+            return httpx.Response(status, json=body)
+
+        return GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _diagnostic_settings(),
+            credential=SecretStr("sk-secret-value"),
+            transport=httpx.MockTransport(handler),
+        )
+
+    async def test_a_success_clears_the_previous_failure(self):
+        adapter = self._adapter(
+            [
+                (400, {"error": {"message": "first model was throttled"}}),
+                (200, _completion(MODEL_OK := self.MODEL)),
+            ]
+        )
+        with pytest.raises(ProviderUnavailable):
+            await adapter.complete(_request(self.MODEL))
+        assert "throttled" in adapter.safe_diagnostics()["last_provider_error"]["provider_message"]
+        await adapter.complete(_request(MODEL_OK))
+        assert adapter.safe_diagnostics() == {}
+
+    async def test_a_later_failure_does_not_report_an_earlier_one(self):
+        adapter = self._adapter(
+            [
+                (400, {"error": {"message": "daily limit for some other model"}}),
+                (200, _completion(self.MODEL)),
+                (503, {"error": {"message": "upstream unavailable"}}),
+            ]
+        )
+        with pytest.raises(ProviderUnavailable):
+            await adapter.complete(_request(self.MODEL))
+        await adapter.complete(_request(self.MODEL))
+        with pytest.raises(ProviderUnavailable):
+            await adapter.complete(_request(self.MODEL))
+        message = adapter.safe_diagnostics()["last_provider_error"]["provider_message"]
+        assert "upstream unavailable" in message
+        assert "some other model" not in message
+
+    async def test_the_record_names_the_request_it_came_from(self):
+        adapter = self._adapter([(400, {"error": {"message": "bad"}})])
+        with pytest.raises(ProviderUnavailable):
+            await adapter.complete(_request(self.MODEL))
+        assert adapter.safe_diagnostics()["last_provider_error"]["path"] == "/chat/completions"
+
+
+class TestAnErrorInsideAStreamIsStillAnError:
+    """A provider can answer 200 and put the failure in the body. Reading that as a
+    malformed completion loses a throttle the governor would have acted on."""
+
+    MODEL = "openai/gpt-oss-20b"
+
+    def _adapter(self, events, headers=None):
+        text = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+        def handler(request):
+            if request.url.path.endswith("/models"):
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                )
+            return httpx.Response(
+                200,
+                content=text.encode(),
+                headers={"content-type": "text/event-stream", **(headers or {})},
+            )
+
+        return GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _diagnostic_settings(),
+            credential=SecretStr("sk-secret-value"),
+            transport=httpx.MockTransport(handler),
+        )
+
+    async def test_a_rate_limit_delivered_in_a_stream_is_a_rate_limit(self):
+        adapter = self._adapter([{"error": {"code": 429, "message": "Rate limit exceeded"}}])
+        with pytest.raises(RateLimited):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_an_exhausted_quota_delivered_in_a_stream_is_refused_as_one(self):
+        adapter = self._adapter(
+            [{"error": {"code": 429, "message": "daily cap"}}],
+            headers={"x-ratelimit-limit-requests": "50", "x-ratelimit-remaining-requests": "0"},
+        )
+        with pytest.raises(QuotaExceeded):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_an_unauthenticated_stream_is_refused_as_one(self):
+        adapter = self._adapter([{"error": {"code": 401, "message": "bad key"}}])
+        with pytest.raises(AuthenticationFailed):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_the_message_is_kept_for_the_operator(self):
+        adapter = self._adapter([{"error": {"code": 429, "message": "Rate limit exceeded: rpd"}}])
+        with pytest.raises(RateLimited):
+            await adapter.complete(_request(self.MODEL))
+        record = adapter.safe_diagnostics()["last_provider_error"]
+        assert "Rate limit exceeded: rpd" in record["provider_message"]
+
+    async def test_a_success_envelope_with_success_false_is_refused(self):
+        adapter = self._adapter([{"success": False, "result": None}])
+        with pytest.raises((ProviderUnavailable, MalformedResponse)):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_an_ordinary_stream_is_unaffected(self):
+        adapter = self._adapter(
+            [
+                {"model": self.MODEL, "choices": [{"delta": {"content": "fine"}}]},
+                {"model": self.MODEL, "choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ]
+        )
+        assert (await adapter.complete(_request(self.MODEL))).text == "fine"

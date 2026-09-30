@@ -384,7 +384,9 @@ fair._registry.adapters["groq"].safe_diagnostics()
 ```
 
 Raised codes, reason codes and the attempt log are identical either way; the flag
-only adds the record. It is off by default.
+only adds the record. It is off by default. The record is cleared as each request
+starts and names the path it came from, so it always describes the call in front of
+you rather than an earlier one that failed.
 
 `safe_diagnostics()` also reports, without any flag, why a reviewed model was left
 out of the live catalog. `REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED` covers five

@@ -323,7 +323,7 @@ class TextAdapter:
                 return data[key]
         return ""
 
-    def _record_error_diagnostic(self, status, raw):
+    def _record_error_diagnostic(self, status, path, raw):
         text = raw.decode("utf-8", errors="replace")[: self._diagnostic_parse_limit]
         try:
             message = self._error_message(json.loads(text)) or text
@@ -336,6 +336,7 @@ class TextAdapter:
         message = " ".join(message.split())
         self._last_error = {
             "status": f"HTTP_{status}",
+            "path": path,
             "provider_message": message[: self._diagnostic_max_chars] or "EMPTY_ERROR_BODY",
         }
 
@@ -399,6 +400,8 @@ class TextAdapter:
         return assembled
 
     async def _stream_chunks(self, path, payload, timeout):
+        self._admit()
+        self._last_error = None
         url = path if path.startswith("https://") else self.base_url + path
         headers = {"Accept": "text/event-stream", "Accept-Encoding": "identity"}
         if self._credential is not None:
@@ -413,7 +416,7 @@ class TextAdapter:
                 if response.status_code != 200:
                     raw = await response.aread()
                     if self.settings.provider_error_diagnostics:
-                        self._record_error_diagnostic(response.status_code, raw)
+                        self._record_error_diagnostic(response.status_code, path, raw)
                     self._error_from_body(
                         response.status_code, response.headers, self._maybe_json(raw)
                     )
@@ -428,7 +431,22 @@ class TextAdapter:
                     body = line[len("data:") :].strip()
                     if not body or body == "[DONE]":
                         continue
-                    chunks.append(strict_json(body))
+                    chunk = strict_json(body)
+                    if isinstance(chunk, dict) and (
+                        "error" in chunk or chunk.get("success") is False
+                    ):
+                        if self.settings.provider_error_diagnostics:
+                            self._record_error_diagnostic(200, path, body.encode())
+                        error = chunk.get("error")
+                        self._error_from_body(
+                            error.get("code", 500)
+                            if isinstance(error, dict) and type(error.get("code")) is int
+                            else 500,
+                            response.headers,
+                            chunk,
+                        )
+                        raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
+                    chunks.append(chunk)
         except httpx.HTTPError:
             raise ProviderUnavailable("PROVIDER_TRANSPORT_FAILED") from None
         except (ValueError, UnicodeError, RecursionError):
@@ -447,6 +465,7 @@ class TextAdapter:
 
     async def _json(self, method, path, payload=None, timeout=None):
         self._admit()
+        self._last_error = None
         headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
         if self._credential is not None:
             headers[self.credential_header] = (
@@ -474,7 +493,7 @@ class TextAdapter:
                     chunks.append(chunk)
                 raw = b"".join(chunks)
                 if capture:
-                    self._record_error_diagnostic(response.status_code, raw)
+                    self._record_error_diagnostic(response.status_code, path, raw)
                 if response.status_code != 200 and not self.inspect_error_body:
                     # The same code in the same order as with diagnostics off; a
                     # body that is not JSON must not change what the caller sees.
