@@ -37,6 +37,19 @@ jobs:
       - name: Mypy
         run: mypy fair
 
+  windows-import:
+    name: Windows clean install and import
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install project with service extras
+        run: python -m pip install -e ".[service]"
+      - name: Import FAIR and resolve the Pacific zone
+        run: python -c "from fair import FAIR; from zoneinfo import ZoneInfo; print(ZoneInfo('America/Los_Angeles'))"
+
   tests:
     name: Pytest + coverage
     runs-on: ubuntu-latest
