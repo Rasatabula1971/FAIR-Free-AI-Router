@@ -1647,3 +1647,34 @@ class TestAttemptDeadline:
     def test_the_adapter_and_the_router_size_budgets_from_the_same_rate(self):
         fair = FAIR(providers=[(_spec(), MockAdapter("a"))], output_tokens_per_second=7)
         assert fair._router.settings.output_tokens_per_second == 7
+
+
+class TestProbedOutputLimits:
+    """Each figure was measured against the live endpoint, not read from a document."""
+
+    def _limits(self, provider):
+        return {
+            m.model_id: m.max_output_tokens for m in module._CLOUD_PROVIDERS[provider]["models"]
+        }
+
+    def test_cloudflare_carries_the_budgets_its_endpoints_accepted(self):
+        limits = self._limits("cloudflare_workers_ai")
+        assert limits["@cf/openai/gpt-oss-20b"] == 32768
+        assert limits["@cf/meta/llama-4-scout-17b-16e-instruct"] == 32768
+        # Refused at 32768 by the context guard, not by the endpoint: a 24000-token
+        # context cannot hold a larger answer.
+        assert limits["@cf/meta/llama-3.3-70b-instruct-fp8-fast"] == 16384
+
+    def test_gemini_still_declares_no_local_cap(self):
+        """Its ceiling is the one Google publishes per model, which FAIR reads live."""
+        assert set(self._limits("google_gemini_api").values()) == {None}
+
+    def test_an_unprobed_provider_keeps_the_conservative_default(self):
+        for provider in ("groq", "mistral", "kilo_free", "openrouter_free"):
+            assert set(self._limits(provider).values()) == {4096}, provider
+
+    def test_raising_the_ceiling_alone_does_not_raise_an_unprobed_model(self):
+        from fair.providers.live import MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CEILING
+
+        assert MAX_OUTPUT_TOKENS_CEILING > MAX_OUTPUT_TOKENS
+        assert self._limits("groq")["openai/gpt-oss-20b"] == MAX_OUTPUT_TOKENS

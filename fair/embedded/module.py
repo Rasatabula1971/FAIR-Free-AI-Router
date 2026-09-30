@@ -19,6 +19,7 @@ from fair.governor.policy import AdmissionDenied
 from fair.providers.base import AuthenticationFailed, ProviderAdapter
 from fair.providers.live import (
     MAX_OUTPUT_TOKENS,
+    MAX_OUTPUT_TOKENS_CEILING,
     TEXT_CAPABILITIES,
     CloudflareWorkersAiAdapter,
     GeminiAdapter,
@@ -238,11 +239,21 @@ _CLOUD_PROVIDERS = {
         "env": "CLOUDFLARE_API_TOKEN",
         "adapter": CloudflareWorkersAiAdapter,
         "access_class": "FREE_RECURRING",
-        "models": _text_models(
-            ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 24000),
-            ("@cf/openai/gpt-oss-20b", 128000),
-            ("@cf/meta/llama-4-scout-17b-16e-instruct", 131000),
-        ),
+        # Probed against the live endpoint on 2026-09-30. Each figure is the largest
+        # budget the endpoint accepted, so it is a floor rather than a measured
+        # ceiling; none was refused below it. llama-3.3-70b stops at 16384 because
+        # its 24000-token context cannot hold a larger answer, not because the
+        # endpoint refused one.
+        "models": [
+            *_text_models(
+                ("@cf/meta/llama-3.3-70b-instruct-fp8-fast", 24000), max_output_tokens=16384
+            ),
+            *_text_models(
+                ("@cf/openai/gpt-oss-20b", 128000),
+                ("@cf/meta/llama-4-scout-17b-16e-instruct", 131000),
+                max_output_tokens=32768,
+            ),
+        ],
     },
 }
 
@@ -372,7 +383,7 @@ class FAIR:
         shared_quota_path: str | None = None,
         quota_pool_ids: dict[str, str] | None = None,
         provider_error_diagnostics: bool = False,
-        max_output_tokens_ceiling: int = MAX_OUTPUT_TOKENS,
+        max_output_tokens_ceiling: int = MAX_OUTPUT_TOKENS_CEILING,
         on_event: Callable[[str, dict], None] | None = None,
     ):
         self._registry = Registry()

@@ -273,14 +273,22 @@ def recommend(report):
     registry in the first place, so both are named for what they are, next to whatever
     the live catalog publishes.
     """
-    output, rates, streamable = {}, [], {}
+    output, rates, streamable, truncated = {}, [], {}, {}
     for provider in report["providers"]:
         for model in provider["models"]:
             key = f"{provider['provider_id']}/{model['model_id']}"
             for name in RATE_BEARING_PASSES:
                 outcome = model.get(name)
-                if outcome is not None and outcome["accepted"]:
+                if outcome is None or not outcome["accepted"]:
+                    continue
+                # A truncated answer cannot measure throughput. The budget bounded it,
+                # and a model that reasons before answering spends much of that budget
+                # on thought parts the adapter strips out of the text, so the tokens
+                # counted here are far fewer than the tokens generated.
+                if outcome.get("finish_reason") == "stop":
                     rates.append(outcome["estimated_tokens_per_second"])
+                else:
+                    truncated[key] = outcome["estimated_tokens_per_second"]
             limits = model.get("limits")
             if limits is not None:
                 observed: dict = {}
@@ -308,6 +316,13 @@ def recommend(report):
         # and a rate set at the slowest observation would leave that route no headroom.
         advice["slowest_estimated_tokens_per_second"] = min(rates)
         advice["suggested_output_tokens_per_second"] = max(1, round(min(rates) * 0.8))
+    elif truncated:
+        advice["no_rate_measured"] = (
+            "every answer was truncated by its budget, so the figures below are lower "
+            "bounds on throughput, not measurements of it"
+        )
+    if truncated:
+        advice["lower_bound_tokens_per_second_truncated"] = truncated
     if streamable:
         advice["cost_observed_on_stream"] = streamable
     return advice

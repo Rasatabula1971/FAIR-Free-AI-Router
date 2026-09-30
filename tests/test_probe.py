@@ -499,3 +499,39 @@ class TestTheLimitsPassDoesNotVoteOnThroughput:
         assert "accepted at 8192 tokens" in text
         assert "a floor, not a ceiling" in text
         assert "tok/s" not in text
+
+
+class TestATruncatedAnswerCannotMeasureThroughput:
+    """The budget bounded it, and thought parts spend budget without appearing in text."""
+
+    class _Finish(_Adapter):
+        finish = "stop"
+
+        async def complete(self, request):
+            response = await super().complete(request)
+            return response.model_copy(update={"finish_reason": self.finish})
+
+    async def _advice(self, finish, text="x" * 400):
+        adapter = self._Finish(text=text)
+        adapter.finish = finish
+        return probe.recommend(await probe.run(_adapters(adapter), probe.Plan(streaming=True)))
+
+    async def test_a_completed_answer_sets_the_rate(self):
+        advice = await self._advice("stop")
+        assert advice["suggested_output_tokens_per_second"] >= 1
+        assert "lower_bound_tokens_per_second_truncated" not in advice
+
+    async def test_a_truncated_answer_is_a_lower_bound_not_a_rate(self):
+        advice = await self._advice("length")
+        assert "suggested_output_tokens_per_second" not in advice
+        assert "p/m" in advice["lower_bound_tokens_per_second_truncated"]
+        assert "lower bounds" in advice["no_rate_measured"]
+
+    async def test_a_reasoning_model_does_not_drag_the_fleet_rate_down(self):
+        """22 visible tokens against a 512 budget is thinking, not a slow provider."""
+        fast, thinker = self._Finish("fast", text="x" * 4000), self._Finish("thinker", text="xx")
+        fast.finish, thinker.finish = "stop", "length"
+        adapters = {**_adapters(fast), **_adapters(thinker)}
+        advice = probe.recommend(await probe.run(adapters, probe.Plan(streaming=True)))
+        assert advice["slowest_estimated_tokens_per_second"] > 1
+        assert "thinker/m" in advice["lower_bound_tokens_per_second_truncated"]

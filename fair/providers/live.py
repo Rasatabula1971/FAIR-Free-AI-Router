@@ -39,10 +39,14 @@ from fair.schemas.domain import DTO, NormalizedModelResponse, ProviderHealth, Qu
 from fair.security.credentials import ProviderCredentials
 
 TEXT_CAPABILITIES = {"reasoning", "coding", "structured_output"}
-# The largest completion budget a TextAdapter will send, whatever a descriptor says.
-# A model may declare less -- from its review, or from the limit its provider
-# publishes in the live catalog -- and the smaller of the two governs.
+# The output cap a model keeps until its endpoint has been asked for more. It is the
+# descriptor default for an unreviewed model, not a ceiling on a reviewed one.
 MAX_OUTPUT_TOKENS = 4096
+# The largest completion budget a TextAdapter will send, whatever a descriptor says.
+# A descriptor declaring less still governs, so raising this alone changes nothing:
+# an unprobed model stays at MAX_OUTPUT_TOKENS. Probed 2026-09-30, four routes took
+# a 32768-token request, so that is as far as a reviewed descriptor may now reach.
+MAX_OUTPUT_TOKENS_CEILING = 32768
 
 
 class LiveSettings(DTO):
@@ -68,7 +72,7 @@ class LiveSettings(DTO):
     # The largest completion budget any TextAdapter will send. A descriptor may
     # declare less and the smaller value governs; raising this alone changes
     # nothing. Raise both only for a route whose real ceiling has been measured.
-    max_output_tokens_ceiling: int = Field(default=MAX_OUTPUT_TOKENS, ge=1, le=131072)
+    max_output_tokens_ceiling: int = Field(default=MAX_OUTPUT_TOKENS_CEILING, ge=1, le=131072)
     ollama_url: str = "http://127.0.0.1:11434"
     confirmed_providers: set[str] = Field(default_factory=set)
     review_max_age_days: int = Field(default=30, ge=1, le=30)

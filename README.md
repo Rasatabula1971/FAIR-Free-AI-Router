@@ -454,11 +454,34 @@ many tokens, not that it would refuse one more. A refusal is the upper bound. Bo
 are named for what they are, because reporting either as "the limit" is the
 overclaim that put an unconfirmed 262144 in the registry to begin with.
 
+A throughput figure comes only from an answer that finished on its own. A truncated
+one (`finish_reason` of `length`) is reported separately as a lower bound, because
+the budget bounded it and a model that reasons before answering spends much of that
+budget on thought parts the adapter strips out of the text — `gemini-3.6-flash`
+returned 22 visible tokens against a 512-token budget, which is thinking, not a slow
+provider. Sizing a timeout from a figure like that would give a 1024-token attempt
+several minutes.
+
 The probe turns provider diagnostics on for its own run, so a refusal shows the
 provider's message rather than a bare `HTTP_400`. `cost_observed_on_stream` answers
 the one question holding `openrouter_free` and `kilo_free` on the buffered path: it
 sets `supports_streaming` on the adapter instance for a single request, restores it
 afterwards, and reports whether the zero-cost proof still arrived.
+
+### Measured output limits
+
+Probed against the live endpoints on 2026-09-30:
+
+| Route | Accepted | Note |
+|---|---|---|
+| `@cf/openai/gpt-oss-20b` | 32768 | floor; not refused below it |
+| `@cf/meta/llama-4-scout-17b-16e-instruct` | 32768 | floor |
+| `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | 16384 | 32768 exceeds its 24000 context |
+| `gemini-3.5-flash-lite`, `gemini-3.6-flash` | 32768 | checked against Google's published `outputTokenLimit` |
+
+Everything else keeps the conservative 4096 default until its endpoint has been
+asked. `MAX_OUTPUT_TOKENS_CEILING` bounds what any reviewed descriptor may reach;
+raising it alone changes nothing, because a descriptor declaring less still governs.
 
 ### Published output limits
 
