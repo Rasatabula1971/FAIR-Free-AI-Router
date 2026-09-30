@@ -2497,3 +2497,138 @@ class TestHalfOpenProbeThroughTheRouter:
         assert state.circuit_state == "OPEN"
         assert state.blocked_until == 0
         assert await router.quota.reserve_async(_spec()) is True
+
+
+class TestSharedLedgerClosesItsConnections:
+    """Every ledger operation closes the connection it opened, however it ends."""
+
+    @pytest.fixture
+    def opened(self, monkeypatch):
+        import sqlite3
+
+        connections = []
+        real = sqlite3.connect
+
+        class Tracked(sqlite3.Connection):
+            # close() is recorded on the object, so the check also works for a
+            # connection opened in a worker thread, which SQLite will not let the
+            # test thread query.
+            was_closed = False
+
+            def close(self):
+                self.was_closed = True
+                super().close()
+
+        def spy(*args, **kwargs):
+            connection = real(*args, factory=Tracked, **kwargs)
+            connections.append(connection)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", spy)
+        return connections
+
+    @staticmethod
+    def _is_closed(connection):
+        return getattr(connection, "was_closed", False)
+
+    def _assert_all_closed(self, connections):
+        assert connections, "the operation should have opened a connection"
+        assert all(self._is_closed(c) for c in connections)
+
+    def test_initialisation_closes_its_connection(self, tmp_path, opened):
+        SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        self._assert_all_closed(opened)
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda ledger: ledger.remaining("pool", 10, 1000.0),
+            lambda ledger: ledger.available("pool", 10, 1000.0),
+            lambda ledger: ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1000.0),
+            lambda ledger: ledger.observe("pool", 10, 4, 1500.0, 1000.0),
+            lambda ledger: ledger.exhaust("pool", 2000.0, 1000.0),
+            lambda ledger: ledger.report(["pool"], 1000.0),
+            lambda ledger: ledger.release("pool", "corp", 1000.0),
+        ],
+    )
+    def test_every_operation_closes_its_connection(self, tmp_path, opened, call):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        opened.clear()
+        call(ledger)
+        self._assert_all_closed(opened)
+
+    def test_a_denied_reservation_closes_its_connection(self, tmp_path, opened):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        opened.clear()
+        assert ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1001.0) is False
+        self._assert_all_closed(opened)
+
+    def test_a_failed_transaction_rolls_back_and_closes(self, tmp_path, opened):
+        import sqlite3
+
+        path = tmp_path / "quota.sqlite3"
+        ledger = SharedQuotaLedger(path)
+
+        def boom(database, pool_id, now):
+            database.execute("INSERT INTO quota_pool_state(pool_id) VALUES (?)", (pool_id,))
+            raise RuntimeError("mid-transaction failure")
+
+        ledger._recover = boom
+        opened.clear()
+        with pytest.raises(RuntimeError):
+            ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1000.0)
+        self._assert_all_closed(opened)
+        with sqlite3.connect(path) as check:
+            count = check.execute(
+                "SELECT COUNT(*) FROM quota_pool_state WHERE pool_id = 'pool'"
+            ).fetchone()[0]
+        check.close()
+        assert count == 0  # rolled back, not committed
+
+    def test_a_connection_that_fails_during_setup_is_closed(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        path = tmp_path / "quota.sqlite3"
+        ledger = SharedQuotaLedger(path)
+        real_connections = []
+        real = sqlite3.connect
+
+        class Flaky(sqlite3.Connection):
+            was_closed = False
+
+            def execute(self, sql, *args):
+                if "foreign_keys" in sql:
+                    raise sqlite3.OperationalError("setup failed")
+                return super().execute(sql, *args)
+
+            def close(self):
+                self.was_closed = True
+                super().close()
+
+        def spy(*args, **kwargs):
+            connection = real(*args, factory=Flaky, **kwargs)
+            real_connections.append(connection)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", spy)
+        with pytest.raises(sqlite3.OperationalError):
+            ledger.available("pool", 10, 1000.0)
+        assert real_connections
+        assert all(self._is_closed(c) for c in real_connections)
+
+    def test_a_concurrent_burst_leaves_no_open_connections(self, tmp_path, opened):
+        from concurrent.futures import ThreadPoolExecutor
+
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        opened.clear()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    lambda i: ledger.reserve("pool", f"app-{i % 4}", 1000, "DAILY_UTC", 1000.0),
+                    range(200),
+                )
+            )
+        assert all(results)
+        assert len(opened) >= 200
+        assert all(self._is_closed(c) for c in opened)

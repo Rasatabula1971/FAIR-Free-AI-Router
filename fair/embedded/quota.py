@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -45,7 +46,7 @@ class SharedQuotaLedger:
     def __init__(self, path):
         self.path = str(Path(path).expanduser().resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("PRAGMA journal_mode=WAL")
             database.execute(
                 """
@@ -72,9 +73,28 @@ class SharedQuotaLedger:
 
     def _connect(self):
         database = sqlite3.connect(self.path, timeout=5)
-        database.execute("PRAGMA busy_timeout=5000")
-        database.execute("PRAGMA foreign_keys=ON")
+        try:
+            database.execute("PRAGMA busy_timeout=5000")
+            database.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            database.close()
+            raise
         return database
+
+    @contextmanager
+    def _transaction(self):
+        """One transaction on a connection that is always closed afterwards.
+
+        ``with connection:`` only commits or rolls back; it does not close. Leaving
+        the connection to the garbage collector ties its file handle to object
+        lifetime, so this owns it explicitly on success, early return and error.
+        """
+        database = self._connect()
+        try:
+            with database:
+                yield database
+        finally:
+            database.close()
 
     def _recover(self, database, pool_id, now):
         row = database.execute(
@@ -102,14 +122,14 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if limit is None:
             return None
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, _, _ = self._recover(database, pool_id, now)
             return max(0, limit - used)
 
     def available(self, pool_id, limit, now):
         pool_id = _identity(pool_id, "quota pool id", 256)
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, exhausted, _ = self._recover(database, pool_id, now)
             return not exhausted and (limit is None or used < limit)
@@ -117,7 +137,7 @@ class SharedQuotaLedger:
     def reserve(self, pool_id, application_id, limit, window, now):
         pool_id = _identity(pool_id, "quota pool id", 256)
         application_id = _identity(application_id, "application id")
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, exhausted, reset_at = self._recover(database, pool_id, now)
             if exhausted or (limit is not None and used >= limit):
@@ -148,7 +168,7 @@ class SharedQuotaLedger:
         """
         pool_id = _identity(pool_id, "quota pool id", 256)
         application_id = _identity(application_id, "application id")
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, _exhausted, reset_at = self._recover(database, pool_id, now)
             database.execute(
@@ -168,7 +188,7 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if remaining is None or observed_limit is None or remaining > observed_limit:
             return
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, exhausted, current_reset = self._recover(database, pool_id, now)
             used = max(used, observed_limit - remaining)
@@ -199,7 +219,7 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if reset_at is None or not isfinite(reset_at) or reset_at <= now:
             return
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             self._recover(database, pool_id, now)
             database.execute(
@@ -209,7 +229,7 @@ class SharedQuotaLedger:
 
     def report(self, pool_ids, now):
         pool_ids = sorted({_identity(value, "quota pool id", 256) for value in pool_ids})
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             for pool_id in pool_ids:
                 self._recover(database, pool_id, now)
