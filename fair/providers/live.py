@@ -62,8 +62,13 @@ class LiveSettings(DTO):
     read_timeout_seconds: float = Field(default=25, gt=0, le=300)
     # Assumed free-tier throughput and hard ceiling, sizing the budget for a
     # buffered completion exactly as RoutingSettings sizes the attempt around it.
-    output_tokens_per_second: float = Field(default=30, gt=0, le=10000)
+    # See RoutingSettings.output_tokens_per_second for where 15 comes from.
+    output_tokens_per_second: float = Field(default=15, gt=0, le=10000)
     max_completion_seconds: float = Field(default=600, gt=0, le=3600)
+    # The largest completion budget any TextAdapter will send. A descriptor may
+    # declare less and the smaller value governs; raising this alone changes
+    # nothing. Raise both only for a route whose real ceiling has been measured.
+    max_output_tokens_ceiling: int = Field(default=MAX_OUTPUT_TOKENS, ge=1, le=131072)
     ollama_url: str = "http://127.0.0.1:11434"
     confirmed_providers: set[str] = Field(default_factory=set)
     review_max_age_days: int = Field(default=30, ge=1, le=30)
@@ -632,7 +637,8 @@ class TextAdapter:
         model = next((item for item in models if item.model_id == request.model_id), None)
         if model is None:
             raise ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED")
-        limit = min(model.max_output_tokens or MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+        ceiling = self.settings.max_output_tokens_ceiling
+        limit = min(model.max_output_tokens or ceiling, ceiling)
         if not 1 <= request.max_output_tokens <= limit:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         if len(request.task.encode()) + request.max_output_tokens > model.context_window:
@@ -724,11 +730,12 @@ class OpenRouterFreeAdapter(TextAdapter):
     expected_provider = "openrouter_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
-    # The zero-cost observation this adapter fails closed without has to arrive in
-    # the response. Whether OpenRouter emits it on a stream is unverified against the
-    # live API, and a wrong answer here would refuse every completion rather than
-    # merely time one out. Buffered until a live check says otherwise.
-    supports_streaming = False
+    # Probed against the live API on 2026-09-30: a streamed completion still carried
+    # the zero-cost observation, so the proof this adapter fails closed without is not
+    # lost by streaming. One model answered (cohere/north-mini-code:free); the rest
+    # were unreachable for unrelated reasons, and a route that did stop reporting a
+    # cost would still fail closed rather than bill.
+    supports_streaming = True
     # OpenRouter reports the completion ceiling under top_provider rather than at the
     # top level, so the read is a hook rather than a field name. Unconfirmed against
     # the live API: if the shape is wrong the value is simply absent and the reviewed
@@ -758,9 +765,10 @@ class KiloFreeAdapter(TextAdapter):
     expected_provider = "kilo_free"
     expected_access = "FREE_DYNAMIC"
     zero_price_models = True
-    # As OpenRouter: cost_microdollars has to come back with the answer, and its
-    # own comment notes some non-streaming responses already omit it.
-    supports_streaming = False
+    # Probed 2026-09-30 as OpenRouter was: a streamed completion still reported
+    # cost_microdollars. The catalog fallback below covers a response that omits it,
+    # on a stream exactly as when buffered.
+    supports_streaming = True
 
     _explicitly_temporary_ids = frozenset(
         {
@@ -1351,7 +1359,10 @@ class OllamaLocalAdapter(TextAdapter):
         if (
             not 1
             <= request.max_output_tokens
-            <= min(model.max_output_tokens or MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+            <= min(
+                model.max_output_tokens or self.settings.max_output_tokens_ceiling,
+                self.settings.max_output_tokens_ceiling,
+            )
             or len(request.task.encode()) + request.max_output_tokens > model.context_window
         ):
             raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")

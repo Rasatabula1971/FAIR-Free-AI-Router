@@ -26,10 +26,12 @@ class RoutingSettings(DTO):
     # budget an attempt actually gets is this plus the requested output tokens at
     # output_tokens_per_second, bounded by max_timeout_seconds.
     timeout_seconds: float = Field(default=15, gt=0, le=120)
-    # Assumed free-tier throughput, used only to size the budget above. Lower it
-    # where models are slow; it never promises a rate, it only decides how long
-    # FAIR waits before calling an attempt failed.
-    output_tokens_per_second: float = Field(default=30, gt=0, le=10000)
+    # Assumed free-tier throughput, used only to size the budget above. It never
+    # promises a rate; it decides how long FAIR waits before calling an attempt
+    # failed. Probed 2026-09-30: 16.1 and 29.7 tokens/second on the two free routes
+    # that answered, both measured over a short completion and so including
+    # time-to-first-token. 15 sits under the slower of the two.
+    output_tokens_per_second: float = Field(default=15, gt=0, le=10000)
     # Hard ceiling on any single attempt, however many tokens it asked for.
     max_timeout_seconds: float = Field(default=600, gt=0, le=3600)
     circuit_failures: int = Field(default=3, ge=1)

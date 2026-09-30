@@ -28,6 +28,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+from fair.providers.live import MAX_OUTPUT_TOKENS
 from fair.schemas.domain import NormalizedModelRequest
 
 # Long enough to measure a rate, dull enough that no model refuses it.
@@ -73,6 +74,12 @@ class Budget:
         self.spent += 1
         return True
 
+    def refund(self, outcome):
+        """A request FAIR refused before dispatch spent no provider quota."""
+        if outcome.get("refused_by") == "fair":
+            self.remaining += 1
+            self.spent -= 1
+
 
 def _request(model_id, *, max_output_tokens, schema=None):
     return NormalizedModelRequest(
@@ -96,15 +103,22 @@ def _diagnostic(adapter):
     return error.get("provider_message") if isinstance(error, dict) else None
 
 
+# FAIR raises this before dispatch, so it is FAIR's own budget answering, not the
+# provider's. It spends no quota and measures nothing about the endpoint.
+LOCAL_REFUSALS = ("RequestNotSupported",)
+
+
 async def _complete(adapter, request):
     started = time.monotonic()
     try:
         response = await adapter.complete(request)
     except Exception as error:
+        name = type(error).__name__
         return {
             "accepted": False,
-            "error": type(error).__name__,
+            "error": name,
             "code": str(error),
+            "refused_by": "fair" if name in LOCAL_REFUSALS else "provider",
             "provider_message": _diagnostic(adapter),
             "seconds": round(time.monotonic() - started, 2),
         }
@@ -133,13 +147,16 @@ async def probe_model(adapter, model_id, plan, budget, descriptor=None):
             adapter, _request(model_id, max_output_tokens=plan.output_tokens)
         )
         result["limits"]["requested_tokens"] = plan.output_tokens
+        budget.refund(result["limits"])
     if plan.schema is not None and budget.take(f"schema:{model_id}"):
         result["schema"] = await _complete(
             adapter,
             _request(model_id, max_output_tokens=min(plan.output_tokens, 2048), schema=plan.schema),
         )
+        budget.refund(result["schema"])
     if plan.streaming and budget.take(f"streaming:{model_id}"):
         result["streaming"] = await _stream_probe(adapter, model_id, plan)
+        budget.refund(result["streaming"])
     return result
 
 
@@ -225,15 +242,19 @@ def recommend(report):
     for provider in report["providers"]:
         for model in provider["models"]:
             key = f"{provider['provider_id']}/{model['model_id']}"
+            for name in ("limits", "schema", "streaming"):
+                outcome = model.get(name)
+                if outcome is not None and outcome["accepted"]:
+                    rates.append(outcome["estimated_tokens_per_second"])
             limits = model.get("limits")
             if limits is not None:
                 observed: dict = {}
                 if limits["accepted"]:
                     observed["accepted_at_least"] = limits["requested_tokens"]
-                    rates.append(limits["estimated_tokens_per_second"])
                 else:
                     observed["refused_at"] = limits["requested_tokens"]
                     observed["refusal"] = limits["code"]
+                    observed["refused_by"] = limits["refused_by"]
                 catalog = model.get("catalog") or {}
                 if catalog.get("max_output_tokens") is not None:
                     # The descriptor after live reconciliation. Where a provider
@@ -313,6 +334,23 @@ def _build_plan(args):
     )
 
 
+def _lift_descriptor_caps(fair, adapters):
+    """Let the limits pass reach the endpoint's answer rather than the descriptor's.
+
+    A reviewed cap of 4096 makes every larger request a local refusal, which is the
+    value under test. None means "no static local cap", so the adapter's ceiling --
+    raised for this run only -- decides, and the provider gets to answer. The process
+    exits after the run, so nothing outlives it.
+    """
+    for provider_id in adapters:
+        spec = fair._registry.providers[provider_id]
+        for model in spec.models:
+            model.max_output_tokens = None
+        adapter = getattr(fair._registry.adapters[provider_id], "_adapter", None)
+        if adapter is not None:
+            adapter._model_cache = None
+
+
 def _adapters(fair, only_providers, only_models):
     selected = {}
     for spec in fair._registry.providers.values():
@@ -328,6 +366,24 @@ def _adapters(fair, only_providers, only_models):
     return selected
 
 
+def _confirmed(args, env_file):
+    """The recurring-free accounts an operator has confirmed, as the console reads them.
+
+    Without these only the runtime-zero-cost gateways come up, so a probe that did not
+    read them silently measured a fraction of the fleet and said nothing about the
+    rest. --confirm still overrides.
+    """
+    if args.confirm:
+        return {name.strip() for name in args.confirm.split(",") if name.strip()}
+    from fair.embedded.module import _CLOUD_PROVIDERS, _read_env_file
+
+    values = dict(os.environ)
+    if env_file and os.path.exists(env_file):
+        values = _read_env_file(env_file) | values
+    named = values.get("FAIR_CONFIRMED_FREE_PROVIDERS", "")
+    return {name.strip() for name in named.split(",") if name.strip()} & set(_CLOUD_PROVIDERS)
+
+
 async def _main(args):
     from fair import FAIR
 
@@ -339,14 +395,24 @@ async def _main(args):
     elif args.env_file and args.env_file != DEFAULT_ENV_FILE:
         print(f"No such env file: {args.env_file}", file=sys.stderr)
         return 2
-    if args.confirm:
-        kwargs["confirmed_free_providers"] = set(args.confirm.split(","))
+    kwargs["confirmed_free_providers"] = _confirmed(args, args.env_file)
+    # The limits pass has to be allowed past FAIR's own ceiling, or it measures that
+    # constant instead of the endpoint and never sends a request at all.
+    if plan.limits:
+        kwargs["max_output_tokens_ceiling"] = max(plan.output_tokens, MAX_OUTPUT_TOKENS)
     fair = FAIR(**kwargs)
     try:
         adapters = _adapters(fair, set(args.providers or ()), set(args.models or ()))
+        if fair.skipped:
+            print("Not configured, so not probed:", file=sys.stderr)
+            for provider_id, reason in sorted(fair.skipped.items()):
+                print(f"  {provider_id}: {reason}", file=sys.stderr)
+            print(file=sys.stderr)
         if not adapters:
             print("No configured provider matched.", file=sys.stderr)
             return 2
+        if plan.limits:
+            _lift_descriptor_caps(fair, adapters)
         cost = plan_cost(adapters, plan)
         if plan.dry_run:
             print(

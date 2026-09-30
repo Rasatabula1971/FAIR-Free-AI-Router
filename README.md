@@ -382,10 +382,12 @@ attempt budget = timeout_seconds + max_output_tokens / output_tokens_per_second
                  bounded by max_timeout_seconds
 ```
 
-At the defaults that is 49s for 1024 tokens and 151s for 4096, against a flat 15s
-before. `output_tokens_per_second` is an assumption about free-tier throughput, not
-a measurement: it only decides how long FAIR waits before calling an attempt failed.
-Lower it where models are slow.
+At the defaults that is 83s for 1024 tokens and 288s for 4096, against a flat 15s
+before. `output_tokens_per_second` decides only how long FAIR waits before calling
+an attempt failed. The default of 15 comes from probing the free routes that
+answered on 2026-09-30 — 16.1 and 29.7 tokens/second, both measured over a short
+completion and so including time-to-first-token. Re-probe and raise it if your
+routes are faster.
 
 A generous budget is only safe if a provider that has stopped responding is still
 noticed quickly, so completions are streamed. The read timeout then applies to each
@@ -398,11 +400,11 @@ check — model identity, finish reason, tool-call refusal, and the zero-cost
 observation above all — then runs on the shape it has always run on. A stream
 carrying no usage is refused exactly as a buffered response carrying none is.
 
-`openrouter_free` and `kilo_free` stay buffered (`supports_streaming = False`).
-Both fail closed without a cost observation in the response, and whether that
-observation arrives on a stream is unverified against the live APIs; a wrong answer
-there would refuse every completion rather than merely slow one down. Flip the flag
-once a live check confirms it.
+Every adapter streams. `openrouter_free` and `kilo_free` were buffered until a
+live probe on 2026-09-30 showed a streamed completion still carrying the zero-cost
+observation they fail closed without. A route that did stop reporting a cost would
+still fail closed rather than bill, and Kilo's catalog fallback covers a response
+that omits the field on a stream exactly as when buffered.
 
 ### Measuring what a provider actually accepts
 

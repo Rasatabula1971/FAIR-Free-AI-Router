@@ -275,8 +275,9 @@ class _Registry:
 
 
 class _FairStub:
-    def __init__(self, adapters):
+    def __init__(self, adapters, skipped=None):
         self._registry = _Registry(adapters)
+        self.skipped = skipped or {}
 
     async def close(self):
         self.closed = True
@@ -286,11 +287,17 @@ class _FairStub:
 def stub_fair(monkeypatch):
     """Replace the FAIR the CLI builds, so main() can be driven without credentials."""
 
-    def install(adapters):
+    def install(adapters, skipped=None):
         import fair as fair_package
 
-        stub = _FairStub(adapters)
-        monkeypatch.setattr(fair_package, "FAIR", lambda **kwargs: stub, raising=True)
+        stub = _FairStub(adapters, skipped)
+        stub.kwargs = []
+        monkeypatch.setattr(
+            fair_package,
+            "FAIR",
+            lambda **kwargs: (stub.kwargs.append(kwargs), stub)[1],
+            raising=True,
+        )
         return stub
 
     return install
@@ -332,3 +339,75 @@ class TestCommandLine:
     def test_no_matching_provider_is_reported_rather_than_run(self, stub_fair, tmp_path):
         stub_fair(_adapters(_Adapter()))
         assert probe.main(["--providers", "absent", "--out", str(tmp_path / "r.json")]) == 2
+
+
+class TestNothingIsSkippedSilently:
+    def test_an_unconfigured_provider_is_named(self, stub_fair, capsys, tmp_path):
+        stub_fair(_adapters(_Adapter()), skipped={"groq": "confirmation required"})
+        probe.main(["--out", str(tmp_path / "r.json")])
+        assert "groq: confirmation required" in capsys.readouterr().err
+
+    def test_confirmed_accounts_come_from_the_env_file(self, stub_fair, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "FAIR_CONFIRMED_FREE_PROVIDERS=groq,mistral\n", encoding="utf-8"
+        )
+        stub = stub_fair(_adapters(_Adapter()))
+        probe.main(["--out", str(tmp_path / "r.json")])
+        assert stub.kwargs[0]["confirmed_free_providers"] == {"groq", "mistral"}
+
+    def test_an_unknown_name_in_the_env_file_is_dropped(self, stub_fair, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "FAIR_CONFIRMED_FREE_PROVIDERS=groq,not-a-provider\n", encoding="utf-8"
+        )
+        stub = stub_fair(_adapters(_Adapter()))
+        probe.main(["--out", str(tmp_path / "r.json")])
+        assert stub.kwargs[0]["confirmed_free_providers"] == {"groq"}
+
+    def test_confirm_overrides_the_env_file(self, stub_fair, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("FAIR_CONFIRMED_FREE_PROVIDERS=groq\n", encoding="utf-8")
+        stub = stub_fair(_adapters(_Adapter()))
+        probe.main(["--confirm", "mistral", "--out", str(tmp_path / "r.json")])
+        assert stub.kwargs[0]["confirmed_free_providers"] == {"mistral"}
+
+
+class TestTheLimitsPassReachesTheProvider:
+    def test_the_ceiling_is_raised_for_the_run(self, stub_fair, tmp_path):
+        stub = stub_fair(_adapters(_Adapter()))
+        probe.main(["--limits", "--output-tokens", "16384", "--out", str(tmp_path / "r.json")])
+        assert stub.kwargs[0]["max_output_tokens_ceiling"] == 16384
+
+    def test_the_ceiling_is_left_alone_without_that_pass(self, stub_fair, tmp_path):
+        stub = stub_fair(_adapters(_Adapter()))
+        probe.main(["--streaming", "--out", str(tmp_path / "r.json")])
+        assert "max_output_tokens_ceiling" not in stub.kwargs[0]
+
+    def test_reviewed_caps_stop_deciding_the_answer(self, stub_fair, tmp_path):
+        """A reviewed 4096 made every larger request a local refusal -- the value under test."""
+        stub = stub_fair(_adapters(_Adapter()))
+        spec = stub._registry.providers["p"]
+        spec.models[0].max_output_tokens = 4096
+        probe.main(["--limits", "--output-tokens", "16384", "--out", str(tmp_path / "r.json")])
+        assert spec.models[0].max_output_tokens is None
+
+    async def test_a_refusal_says_who_refused(self):
+        from fair.providers.base import ProviderUnavailable, RequestNotSupported
+
+        local = _Adapter(error=RequestNotSupported("OUTPUT_BUDGET_INVALID"))
+        remote = _Adapter(error=ProviderUnavailable("HTTP_400"))
+        for adapter, who in ((local, "fair"), (remote, "provider")):
+            report = await probe.run(_adapters(adapter), probe.Plan(limits=True))
+            assert report["providers"][0]["models"][0]["limits"]["refused_by"] == who
+
+    async def test_a_refusal_fair_made_itself_costs_no_quota(self):
+        from fair.providers.base import RequestNotSupported
+
+        adapter = _Adapter(error=RequestNotSupported("OUTPUT_BUDGET_INVALID"))
+        report = await probe.run(_adapters(adapter), probe.Plan(limits=True, max_requests=1))
+        assert report["requests_spent"] == 0
+
+    async def test_a_rate_is_taken_from_whichever_pass_produced_one(self):
+        advice = probe.recommend(await probe.run(_adapters(_Adapter()), probe.Plan(streaming=True)))
+        assert advice["suggested_output_tokens_per_second"] >= 1

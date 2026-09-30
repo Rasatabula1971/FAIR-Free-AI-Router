@@ -453,7 +453,6 @@ class TestOpenRouter:
         }
         assert "structured_output" not in capabilities["nvidia/nemotron-3-ultra-550b-a55b:free"]
         assert "structured_output" not in capabilities["cohere/north-mini-code:free"]
-        assert "structured_output" in capabilities["nex-agi/nex-n2.5-mini:free"]
         # Every configured model still has to be routable for ordinary text work.
         assert all("reasoning" in caps for caps in capabilities.values())
 
@@ -1589,10 +1588,10 @@ class TestStreamingKeepsTheBillingProof:
         adapter = self._adapter(self._events(usage={"cost_microdollars": 0}), streaming=True)
         assert (await adapter.complete(_request(self.MODEL))).text == "hi"
 
-    async def test_the_zero_price_adapters_stay_buffered_until_that_is_verified(self):
-        """A missing usage chunk would refuse every completion, not merely slow one down."""
-        assert OpenRouterFreeAdapter.supports_streaming is False
-        assert KiloFreeAdapter.supports_streaming is False
+    async def test_every_adapter_streams_now_that_the_cost_proof_is_verified(self):
+        """Probed 2026-09-30: a streamed completion still carried the zero-cost proof."""
+        assert OpenRouterFreeAdapter.supports_streaming is True
+        assert KiloFreeAdapter.supports_streaming is True
         assert GroqAdapter.supports_streaming is True
         assert MistralAdapter.supports_streaming is True
         assert CloudflareWorkersAiAdapter.supports_streaming is True
@@ -1623,8 +1622,8 @@ class TestCompletionBudgets:
 
     def test_a_buffered_read_has_to_cover_the_whole_answer(self):
         adapter = self._adapter()
-        assert self._read(adapter, 300, False) == pytest.approx(35)
-        assert self._read(adapter, 3000, False) == pytest.approx(125)
+        assert self._read(adapter, 300, False) == pytest.approx(45)
+        assert self._read(adapter, 3000, False) == pytest.approx(225)
 
     def test_no_single_read_may_exceed_the_ceiling(self):
         adapter = self._adapter(max_completion_seconds=90)

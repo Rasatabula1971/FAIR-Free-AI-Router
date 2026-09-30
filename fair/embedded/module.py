@@ -195,9 +195,12 @@ _CLOUD_PROVIDERS = {
                 1000000,
                 _NO_STRUCTURED_OUTPUT,
             ),
-            # FAIR sends strict JSON Schema through response_format. Nex-N2.5
-            # Mini's free endpoint explicitly supports that contract.
-            ("nex-agi/nex-n2.5-mini:free", 262144),
+            # Nex-N2.5 Mini was the only OpenRouter route here that accepted a
+            # JSON Schema. Probed 2026-09-30: ABSENT_FROM_CATALOG -- OpenRouter no
+            # longer lists it, so FAIR dropped it on every solve and reported only
+            # that a reviewed model was unavailable. Left out rather than left
+            # failing; OpenRouter now has no structured-output route, which is why
+            # a schema request skips this provider entirely.
             # Keep a fast coding-specialist fallback. It does not accept
             # response_format, so it must not be selected for schema requests.
             ("cohere/north-mini-code:free", 256000, _NO_STRUCTURED_OUTPUT),
@@ -369,6 +372,7 @@ class FAIR:
         shared_quota_path: str | None = None,
         quota_pool_ids: dict[str, str] | None = None,
         provider_error_diagnostics: bool = False,
+        max_output_tokens_ceiling: int = MAX_OUTPUT_TOKENS,
         on_event: Callable[[str, dict], None] | None = None,
     ):
         self._registry = Registry()
@@ -418,7 +422,7 @@ class FAIR:
         output_tokens_per_second = (
             output_tokens_per_second
             if output_tokens_per_second is not None
-            else _positive_float(env.get("FAIR_OUTPUT_TOKENS_PER_SECOND"), 30)
+            else _positive_float(env.get("FAIR_OUTPUT_TOKENS_PER_SECOND"), 15)
         )
         confirmed = set(confirmed_free_providers or ())
         if "zai_free" in confirmed:
@@ -439,6 +443,7 @@ class FAIR:
             or _flag(env.get("FAIR_PROVIDER_ERROR_DIAGNOSTICS")),
             output_tokens_per_second=output_tokens_per_second,
             max_completion_seconds=max_timeout_seconds,
+            max_output_tokens_ceiling=max_output_tokens_ceiling,
         )
 
         for provider_id, entry in _CLOUD_PROVIDERS.items():

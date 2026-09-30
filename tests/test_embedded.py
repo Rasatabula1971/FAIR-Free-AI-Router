@@ -1322,19 +1322,26 @@ class TestOpenRouterReviewedModels:
         models = {model.model_id: model for model in _CLOUD_PROVIDERS["openrouter_free"]["models"]}
         assert set(models) == {
             "nvidia/nemotron-3-ultra-550b-a55b:free",
-            "nex-agi/nex-n2.5-mini:free",
             "cohere/north-mini-code:free",
         }
         assert models["nvidia/nemotron-3-ultra-550b-a55b:free"].context_window == 1_000_000
-        assert models["nex-agi/nex-n2.5-mini:free"].context_window == 262_144
         assert models["cohere/north-mini-code:free"].context_window == 256_000
 
         assert (
             "structured_output" not in models["nvidia/nemotron-3-ultra-550b-a55b:free"].capabilities
         )
-        assert "structured_output" in models["nex-agi/nex-n2.5-mini:free"].capabilities
         assert "structured_output" not in models["cohere/north-mini-code:free"].capabilities
         assert all(model_id.endswith(":free") for model_id in models)
+
+    def test_openrouter_currently_has_no_structured_output_route(self):
+        """Recorded, not accepted: nex-n2.5-mini carried this and left the catalog.
+
+        A request with an expected_schema needs the structured_output capability, so
+        while this holds the selector skips openrouter_free for every such request.
+        Restoring a schema-capable free model here is what changes it back.
+        """
+        models = _CLOUD_PROVIDERS["openrouter_free"]["models"]
+        assert not any("structured_output" in model.capabilities for model in models)
 
     def test_openrouter_free_account_daily_limit_is_locally_guarded(self):
         provider = _CLOUD_PROVIDERS["openrouter_free"]
@@ -1635,7 +1642,7 @@ class TestAttemptDeadline:
     def test_an_unreadable_rate_leaves_the_default(self, monkeypatch):
         monkeypatch.setenv("FAIR_OUTPUT_TOKENS_PER_SECOND", "fast")
         fair = FAIR(providers=[(_spec(), MockAdapter("a"))])
-        assert fair._router.settings.output_tokens_per_second == 30
+        assert fair._router.settings.output_tokens_per_second == 15
 
     def test_the_adapter_and_the_router_size_budgets_from_the_same_rate(self):
         fair = FAIR(providers=[(_spec(), MockAdapter("a"))], output_tokens_per_second=7)
