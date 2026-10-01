@@ -1013,17 +1013,17 @@ class TestEmbeddedRouter:
             max_verification_attempts=2,
         )
 
-        original_reserve = router.quota.reserve_async
+        original_reserve = router.quota.reserve_probe_async
         lost_once = False
 
-        async def reserve(spec, application_id=None):
+        async def reserve(spec, application_id=None, probe_timeout=None):
             nonlocal lost_once
             if spec.provider_id == "b" and not lost_once:
                 lost_once = True
-                return False
-            return await original_reserve(spec, application_id)
+                return False, 0
+            return await original_reserve(spec, application_id, probe_timeout)
 
-        router.quota.reserve_async = reserve
+        router.quota.reserve_probe_async = reserve
         result = await router.solve(
             _request(
                 task="15*23",
@@ -1245,7 +1245,7 @@ class TestFAIRModule:
         fair = FAIR(providers=[(spec, adapter)], cache_enabled=True)
         await fair.solve("15*23", validation={"kind": "arithmetic", "expression": "15*23"})
         result = fair.clear_cache()
-        assert result["entries_removed"] >= 0
+        assert result["entries_removed"] == 1
 
     @pytest.mark.asyncio
     async def test_event_callback(self):
@@ -2038,10 +2038,11 @@ class TestQuotaUnderConcurrency:
         for _ in range(settings.circuit_failures):
             governor.failure("p")
         clock.now += settings.cooldown_seconds + 1
-        assert await governor.reserve_async(spec) is True
+        granted, token = await governor.reserve_probe_async(spec)
+        assert granted is True and token
         state = governor._state("p")
         assert state.circuit_state == "HALF_OPEN"
-        governor._release_probe(state)
+        governor.release_probe("p", token)
         assert state.circuit_state == "OPEN"
 
 
@@ -2337,3 +2338,448 @@ class TestContentionIsReportedNotGuessed:
             with pytest.raises(QuotaLedgerUnavailable):
                 ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0)
         assert ledger.remaining("pool", 50, 1_000.0) == 50
+
+
+class TestSharedExhaustionSurvivesStaleObservations:
+    """An older positive observation must not undo a still-active shared block."""
+
+    def _ledger(self, tmp_path):
+        return SharedQuotaLedger(tmp_path / "quota.sqlite3")
+
+    def _reset(self, ledger, pool="pool"):
+        (row,) = ledger.report([pool], 1002.0)
+        return row["reset_at"]
+
+    def test_stale_positive_observation_does_not_clear_explicit_exhaustion(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert ledger.available("pool", None, 1002.0) is False
+        assert ledger.available("pool", 100, 1002.0) is False
+
+    def test_stale_positive_observation_cannot_shorten_the_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert self._reset(ledger) == 2000.0
+
+    def test_stale_positive_observation_cannot_extend_the_block_either(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 9000.0, 1001.0)
+        assert self._reset(ledger) == 2000.0
+
+    def test_a_later_zero_observation_keeps_the_longer_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 5000.0, 1000.0)
+        ledger.observe("pool", 100, 0, 1500.0, 1001.0)
+        assert self._reset(ledger) == 5000.0
+        assert ledger.available("pool", None, 1002.0) is False
+
+    def test_a_zero_observation_can_lengthen_the_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 0, 4000.0, 1001.0)
+        assert self._reset(ledger) == 4000.0
+
+    def test_exhaustion_is_still_recovered_at_the_trusted_reset(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert ledger.available("pool", None, 1999.0) is False
+        assert ledger.available("pool", None, 2000.0) is True
+
+    def test_a_positive_observation_still_updates_an_unexhausted_pool(self, tmp_path):
+        ledger = self._ledger(tmp_path)
+        ledger.observe("pool", 100, 40, 1500.0, 1001.0)
+        assert ledger.remaining("pool", 100, 1002.0) == 40
+        assert self._reset(ledger) == 1500.0
+
+    def test_the_block_is_visible_to_another_instance_on_the_same_file(self, tmp_path):
+        first, second, third = (self._ledger(tmp_path) for _ in range(3))
+        first.exhaust("pool", 2000.0, 1000.0)
+        second.observe("pool", 100, 99, 1500.0, 1001.0)
+        assert third.available("pool", None, 1002.0) is False
+
+
+class TestAcceptUnverifiedThroughThePublicApi:
+    """The documented call is FAIR.solve(), not EmbeddedRouter.solve(SolveRequest)."""
+
+    TASK = "Explain the trade-offs between X and Y"
+    TEXT = "A considered answer with no deterministic contract."
+
+    def _fair(self, text=None, **kwargs):
+        adapter = MockAdapter("a", text=self.TEXT if text is None else text)
+        return FAIR(providers=[(_spec(), adapter)], **kwargs), adapter
+
+    async def test_open_ended_work_still_escalates_by_default(self):
+        fair, _ = self._fair()
+        result = await fair.solve(self.TASK)
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.reason_code == "QUALITY_VERIFICATION_UNAVAILABLE"
+        assert result.output is None
+
+    async def test_the_readme_example_returns_an_unverified_answer(self):
+        fair, _ = self._fair()
+        result = await fair.solve(self.TASK, accept_unverified=True)
+        assert result.status == "ACCEPTED_UNVERIFIED"
+        assert result.verification_state == "UNVERIFIED"
+        assert result.best_quality_score is None
+        assert result.output == self.TEXT
+
+    async def test_an_answer_that_is_wrong_is_still_refused(self):
+        fair, _ = self._fair(text="   ")
+        result = await fair.solve(self.TASK, accept_unverified=True)
+        assert result.status != "ACCEPTED_UNVERIFIED"
+        assert result.output is None
+
+    async def test_a_schema_mismatch_is_still_refused(self):
+        fair, _ = self._fair(text="not json at all")
+        result = await fair.solve(
+            self.TASK,
+            accept_unverified=True,
+            expected_schema={"type": "object", "properties": {"a": {"type": "integer"}}},
+        )
+        assert result.status != "ACCEPTED_UNVERIFIED"
+        assert result.output is None
+
+    async def test_a_verifiable_answer_is_still_reported_as_verified(self):
+        fair, _ = self._fair(text="345")
+        result = await fair.solve(
+            "15*23",
+            accept_unverified=True,
+            validation={"kind": "arithmetic", "expression": "15*23"},
+        )
+        assert result.status == "ACCEPTED"
+
+    async def test_it_cannot_be_combined_with_cross_check(self):
+        fair, _ = self._fair()
+        with pytest.raises(ValidationError, match="accept_unverified"):
+            await fair.solve(self.TASK, accept_unverified=True, cross_check_required=True)
+
+    async def test_it_cannot_be_combined_with_high_impact_support(self):
+        fair, _ = self._fair(quality_level="high_impact_support")
+        with pytest.raises(ValidationError, match="accept_unverified"):
+            await fair.solve(self.TASK, accept_unverified=True)
+
+    async def test_an_instance_wide_cross_check_is_not_silently_dropped(self):
+        fair, _ = self._fair(cross_check_required=True)
+        with pytest.raises(ValidationError, match="accept_unverified"):
+            await fair.solve(self.TASK, accept_unverified=True)
+
+    async def test_unverified_answers_are_never_cached(self):
+        fair, adapter = self._fair()
+        await fair.solve(self.TASK, accept_unverified=True)
+        await fair.solve(self.TASK, accept_unverified=True)
+        assert adapter.calls == 2
+
+
+class TestHalfOpenProbeOwnsItsAttempt:
+    """A half-open probe stays exclusively owned for its real attempt deadline."""
+
+    def _tripped(self, now):
+        gov = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        state = gov.state("a")
+        state.circuit_state = "OPEN"
+        state.blocked_until = 0
+        return gov
+
+    def test_a_direct_caller_keeps_the_default_lease(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        assert gov.reserve(_spec()) is True
+        now[0] += 19
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+        now[0] += 2
+        assert gov.state("a").circuit_state == "OPEN"
+
+    def test_the_lease_covers_the_requested_attempt_deadline(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        assert gov.reserve(_spec(), probe_timeout=300) is True
+        now[0] += 120  # past the old 20 second lease, inside the attempt deadline
+        state = gov.state("a")
+        assert state.circuit_state == "HALF_OPEN"
+        assert state.blocked_until == 0
+        assert gov.reserve(_spec()) is False  # still exclusively owned
+
+    def test_an_abandoned_probe_still_expires_after_its_deadline(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        gov.reserve(_spec(), probe_timeout=300)
+        now[0] += 306
+        assert gov.state("a").circuit_state == "OPEN"
+
+    def test_releasing_a_probe_reopens_without_a_new_cooldown(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        granted, token = gov.reserve_probe(_spec(), probe_timeout=300)
+        assert granted and token
+        gov.release_probe("a", token)
+        state = gov.state("a")
+        assert state.circuit_state == "OPEN"
+        assert state.blocked_until == 0
+        assert gov.reserve(_spec()) is True  # the next probe may start at once
+
+    def test_a_stale_probe_cannot_release_a_newer_one(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        _, old = gov.reserve_probe(_spec(), probe_timeout=10)
+        now[0] += 16  # the first lease expired
+        assert gov.state("a").circuit_state == "OPEN"
+        now[0] += 1000  # well past the cooldown the expiry started
+        _, new = gov.reserve_probe(_spec(), probe_timeout=300)
+        assert new and new != old
+        gov.release_probe("a", old)
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+
+    def test_a_stale_completion_cannot_close_a_newer_probes_circuit(self):
+        now = [1000.0]
+        gov = self._tripped(now)
+        _, old = gov.reserve_probe(_spec(), probe_timeout=10)
+        now[0] += 16  # the first lease expired; observing it starts the cooldown
+        assert gov.state("a").circuit_state == "OPEN"
+        now[0] += 1000  # past that cooldown
+        _, new = gov.reserve_probe(_spec(), probe_timeout=300)
+        assert new and new != old
+        gov.success("a", probe_token=old)
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+        gov.failure("a", probe_token=old)
+        assert gov.state("a").circuit_state == "HALF_OPEN"
+        gov.success("a", probe_token=new)
+        assert gov.state("a").circuit_state == "CLOSED"
+
+
+class _GatedAdapter(MockAdapter):
+    """Holds its answer until released, so a test can act while the probe is in flight."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.started = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def complete(self, request):
+        self.started.set()
+        await self.gate.wait()
+        return await super().complete(request)
+
+
+class TestHalfOpenProbeThroughTheRouter:
+    ARITHMETIC = {"kind": "arithmetic", "expression": "15*23"}
+
+    async def _start(self):
+        adapter = _GatedAdapter("a", text="345")
+        router = _router(entries=[(_spec(), adapter)])
+        now = [1000.0]
+        router.quota.clock = lambda: now[0]
+        state = router.quota.state("a")
+        state.circuit_state = "OPEN"
+        state.blocked_until = 0
+        task = asyncio.create_task(router.solve(_request(task="15*23", validation=self.ARITHMETIC)))
+        await asyncio.wait_for(adapter.started.wait(), timeout=5)
+        return router, adapter, task, now
+
+    async def test_a_slow_probe_keeps_its_half_open_slot_past_the_old_lease(self):
+        router, adapter, task, now = await self._start()
+        assert router.quota.state("a").circuit_state == "HALF_OPEN"
+        now[0] += 30  # beyond the old 20 second lease, inside the attempt deadline
+        state = router.quota.state("a")
+        assert state.circuit_state == "HALF_OPEN"
+        assert state.blocked_until == 0
+        adapter.gate.set()
+        result = await task
+        assert result.status == "ACCEPTED"
+        assert router.quota.state("a").circuit_state == "CLOSED"
+
+    async def test_cancelling_the_probe_releases_its_slot_at_once(self):
+        router, adapter, task, now = await self._start()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            # wait_for, not a bare await: a cancellation that never lands fails
+            # the test instead of hanging it.
+            await asyncio.wait_for(task, timeout=5)
+        state = router.quota.state("a")
+        assert state.circuit_state == "OPEN"
+        assert state.blocked_until == 0
+        assert await router.quota.reserve_async(_spec()) is True
+
+
+class TestSharedLedgerClosesItsConnections:
+    """Every ledger operation closes the connection it opened, however it ends."""
+
+    @pytest.fixture
+    def opened(self, monkeypatch):
+        import sqlite3
+
+        connections = []
+        real = sqlite3.connect
+
+        class Tracked(sqlite3.Connection):
+            # close() is recorded on the object, so the check also works for a
+            # connection opened in a worker thread, which SQLite will not let the
+            # test thread query.
+            was_closed = False
+
+            def close(self):
+                self.was_closed = True
+                super().close()
+
+        def spy(*args, **kwargs):
+            connection = real(*args, factory=Tracked, **kwargs)
+            connections.append(connection)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", spy)
+        return connections
+
+    @staticmethod
+    def _is_closed(connection):
+        return getattr(connection, "was_closed", False)
+
+    def _assert_all_closed(self, connections):
+        assert connections, "the operation should have opened a connection"
+        assert all(self._is_closed(c) for c in connections)
+
+    def test_initialisation_closes_its_connection(self, tmp_path, opened):
+        SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        self._assert_all_closed(opened)
+
+    @pytest.mark.parametrize(
+        "call",
+        [
+            lambda ledger: ledger.remaining("pool", 10, 1000.0),
+            lambda ledger: ledger.available("pool", 10, 1000.0),
+            lambda ledger: ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1000.0),
+            lambda ledger: ledger.observe("pool", 10, 4, 1500.0, 1000.0),
+            lambda ledger: ledger.exhaust("pool", 2000.0, 1000.0),
+            lambda ledger: ledger.report(["pool"], 1000.0),
+            lambda ledger: ledger.release("pool", "corp", 1000.0),
+        ],
+    )
+    def test_every_operation_closes_its_connection(self, tmp_path, opened, call):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        opened.clear()
+        call(ledger)
+        self._assert_all_closed(opened)
+
+    def test_a_denied_reservation_closes_its_connection(self, tmp_path, opened):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        opened.clear()
+        assert ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1001.0) is False
+        self._assert_all_closed(opened)
+
+    def test_a_failed_transaction_rolls_back_and_closes(self, tmp_path, opened):
+        import sqlite3
+
+        path = tmp_path / "quota.sqlite3"
+        ledger = SharedQuotaLedger(path)
+
+        def boom(database, pool_id, now):
+            database.execute("INSERT INTO quota_pool_state(pool_id) VALUES (?)", (pool_id,))
+            raise RuntimeError("mid-transaction failure")
+
+        ledger._recover = boom
+        opened.clear()
+        with pytest.raises(RuntimeError):
+            ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1000.0)
+        self._assert_all_closed(opened)
+        with sqlite3.connect(path) as check:
+            count = check.execute(
+                "SELECT COUNT(*) FROM quota_pool_state WHERE pool_id = 'pool'"
+            ).fetchone()[0]
+        check.close()
+        assert count == 0  # rolled back, not committed
+
+    def test_a_connection_that_fails_during_setup_is_closed(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        path = tmp_path / "quota.sqlite3"
+        ledger = SharedQuotaLedger(path)
+        real_connections = []
+        real = sqlite3.connect
+
+        class Flaky(sqlite3.Connection):
+            was_closed = False
+
+            def execute(self, sql, *args):
+                if "foreign_keys" in sql:
+                    raise sqlite3.OperationalError("setup failed")
+                return super().execute(sql, *args)
+
+            def close(self):
+                self.was_closed = True
+                super().close()
+
+        def spy(*args, **kwargs):
+            connection = real(*args, factory=Flaky, **kwargs)
+            real_connections.append(connection)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", spy)
+        with pytest.raises(sqlite3.OperationalError):
+            ledger.available("pool", 10, 1000.0)
+        assert real_connections
+        assert all(self._is_closed(c) for c in real_connections)
+
+    def test_a_concurrent_burst_leaves_no_open_connections(self, tmp_path, opened):
+        from concurrent.futures import ThreadPoolExecutor
+
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        opened.clear()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(
+                pool.map(
+                    lambda i: ledger.reserve("pool", f"app-{i % 4}", 1000, "DAILY_UTC", 1000.0),
+                    range(200),
+                )
+            )
+        assert all(results)
+        assert len(opened) >= 200
+        assert all(self._is_closed(c) for c in opened)
+
+
+class TestClearCacheDefaultIdentity:
+    """clear_cache() with no argument clears the identity solve() caches under."""
+
+    ARITHMETIC = {"kind": "arithmetic", "expression": "15*23"}
+
+    def _fair(self, **kwargs):
+        adapter = MockAdapter("a", text="345")
+        fair = FAIR(providers=[(_spec(), adapter)], cache_enabled=True, **kwargs)
+        return fair, adapter
+
+    async def _solve(self, fair, **kwargs):
+        return await fair.solve("15*23", validation=self.ARITHMETIC, **kwargs)
+
+    async def test_a_named_application_clears_its_own_entries_by_default(self):
+        fair, adapter = self._fair(application_id="corp")
+        await self._solve(fair)
+        assert fair.clear_cache() == {"entries_removed": 1}
+        await self._solve(fair)
+        assert adapter.calls == 2  # the cleared answer was not served from cache
+
+    async def test_an_unnamed_instance_still_clears_the_embedded_identity(self):
+        fair, adapter = self._fair()
+        await self._solve(fair)
+        assert fair.clear_cache() == {"entries_removed": 1}
+        await self._solve(fair)
+        assert adapter.calls == 2
+
+    async def test_an_explicit_client_id_clears_only_that_client(self):
+        fair, adapter = self._fair(application_id="corp")
+        await self._solve(fair)
+        await self._solve(fair, client_id="video")
+        assert fair.clear_cache("video") == {"entries_removed": 1}
+        await self._solve(fair)
+        assert adapter.calls == 2  # corp's entry survived; video's did not
+
+    async def test_the_old_embedded_default_does_not_clear_a_named_application(self):
+        fair, _ = self._fair(application_id="corp")
+        await self._solve(fair)
+        assert fair.clear_cache("embedded") == {"entries_removed": 0}
+        assert fair.clear_cache() == {"entries_removed": 1}
+
+    async def test_clearing_an_empty_cache_removes_nothing(self):
+        fair, _ = self._fair(application_id="corp")
+        assert fair.clear_cache() == {"entries_removed": 0}

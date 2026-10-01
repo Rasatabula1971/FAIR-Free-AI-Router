@@ -136,7 +136,13 @@ class EmbeddedRouter:
     async def _attempt(self, request_id, request, profile, route, number, role):
         score, spec, model = route
         remaining = await self.quota.remaining_async(spec)
-        if not await self.quota.reserve_async(spec, request.client_id):
+        # A half-open probe is owned for the attempt's real deadline, not a fixed default.
+        reserved, probe = await self.quota.reserve_probe_async(
+            spec,
+            request.client_id,
+            probe_timeout=self.settings.attempt_deadline(request.max_output_tokens),
+        )
+        if not reserved:
             return None, None, False
         start = monotonic()
         quality = response = error_type = error_detail = None
@@ -170,7 +176,7 @@ class EmbeddedRouter:
                 raise MalformedResponse("PROVIDER_IDENTITY_MISMATCH")
             if response.quota is not None:
                 await self.quota.observe_async(spec, response.quota)
-            self.quota.success(spec.provider_id)
+            self.quota.success(spec.provider_id, probe_token=probe)
         except BillingViolation as error:
             # Fail closed on this provider only. One uncertain/nonzero cost report
             # must not take unrelated free providers or local Ollama offline.
@@ -195,19 +201,20 @@ class EmbeddedRouter:
         except RequestNotSupported as error:
             # Raised by the adapter's own budget and capability checks, before any
             # request is sent, so the reservation bought nothing and is given back.
-            await self.quota.release_async(spec, request.client_id)
+            await self.quota.release_async(spec, request.client_id, probe_token=probe)
             disposition, error_type = "CAPABILITY_MISMATCH", "REQUEST_NOT_SUPPORTED_BY_ROUTE"
             error_detail = _failure_detail(error)
         except ModelUnavailable as error:
             # The model was gone from the live catalog, so no completion was sent.
             # Without this, a model delisted upstream spends a free request on every
             # solve that still has it in the registry.
-            await self.quota.release_async(spec, request.client_id)
+            await self.quota.release_async(spec, request.client_id, probe_token=probe)
             disposition, error_type = "INFRA_FAILURE", "MODEL_UNAVAILABLE"
             error_detail = _failure_detail(error)
         except AccessDenied as error:
             # 403 can be request/model-specific. Do not let one application's
             # denied request throttle this provider for every other client.
+            self.quota.release(spec, request.client_id, refund=False, probe_token=probe)
             disposition, error_type = "CAPABILITY_MISMATCH", "ACCESS_DENIED"
             error_detail = _failure_detail(error)
         except AuthenticationFailed as error:
@@ -222,7 +229,7 @@ class EmbeddedRouter:
             # fresh cooldown, having been told nothing about it. The request itself
             # is not refunded -- cancellation can tear down a call already in
             # flight, and over-counting is the safe direction.
-            self.quota.release(spec, request.client_id, refund=False)
+            self.quota.release(spec, request.client_id, refund=False, probe_token=probe)
             cancelled = True
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
         except _DEFECTS as error:
@@ -233,7 +240,7 @@ class EmbeddedRouter:
             disposition, error_type = "INFRA_FAILURE", "ROUTER_INTERNAL_DEFECT"
             error_detail = _failure_detail(error)
         except Exception as error:
-            self.quota.failure(spec.provider_id)
+            self.quota.failure(spec.provider_id, probe_token=probe)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
             error_detail = _failure_detail(error)
         else:

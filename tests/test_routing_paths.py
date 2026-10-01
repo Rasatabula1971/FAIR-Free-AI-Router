@@ -633,7 +633,9 @@ class TestAFaultIsAttributedToWhoeverOwnsIt:
     @pytest.mark.asyncio
     async def test_an_escape_from_an_attempt_is_not_a_validation_failure(self):
         class Broken(MemoryQuotaGovernor):
-            async def reserve_async(self, spec, application_id=None):
+            # What _attempt reserves through; the selector's own call is
+            # remaining_async, which must keep working or nothing is attempted.
+            async def reserve_probe_async(self, spec, application_id=None, probe_timeout=None):
                 raise RuntimeError("governor defect")
 
         registry = Registry()

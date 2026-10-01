@@ -149,6 +149,24 @@ class TestServiceEndpoints:
             )
         assert response.status_code == 422
 
+    def test_regex_bearing_schema_is_refused_and_the_service_stays_responsive(self):
+        app = create_app(_fair(), {"corp": CORP_KEY})
+        schema = {
+            "type": "object",
+            "properties": {"value": {"type": "string", "pattern": "^(a+)+$"}},
+            "required": ["value"],
+        }
+        with TestClient(app) as client:
+            response = client.post(
+                "/v1/fair/solve",
+                headers=_headers(),
+                json={"task": "return json", "expected_schema": schema},
+            )
+            health = client.get("/health")
+        assert response.status_code == 422
+        assert response.json()["reason_code"] == "INVALID_FAIR_REQUEST"
+        assert health.status_code == 200
+
     def test_authenticated_callers_get_separate_quota_attribution(self, tmp_path):
         path = str(tmp_path / "quota.sqlite3")
         app = create_app(
