@@ -838,6 +838,43 @@ class TestEmbeddedRouter:
         assert router.performance._stats == {}
 
     @pytest.mark.asyncio
+    async def test_a_low_ceiling_route_answers_a_request_wanting_more_headroom(self):
+        """End to end: wanted 32768, needed 2000, route caps at 4096. The single
+        dial dropped this route from selection; the floor keeps it and asks it for
+        4096."""
+        spec = _spec("a")
+        spec.models[0].max_output_tokens = 4096
+        router = _router(entries=[(spec, MockAdapter("a", text="345"))])
+        result = await router.solve(
+            _request(
+                task="15*23",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+                max_output_tokens=32768,
+                min_output_tokens=2000,
+            )
+        )
+        assert result.status == "ACCEPTED"
+        assert result.provider_id == "a"
+
+    @pytest.mark.asyncio
+    async def test_the_same_route_is_unreachable_without_a_declared_floor(self):
+        """The behaviour every existing caller keeps: no floor means the whole
+        budget is the floor, so a 4096 route cannot serve a 32768 request."""
+        spec = _spec("a")
+        spec.models[0].max_output_tokens = 4096
+        router = _router(entries=[(spec, MockAdapter("a", text="345"))])
+        result = await router.solve(
+            _request(
+                task="15*23",
+                validation={"kind": "arithmetic", "expression": "15*23"},
+                max_output_tokens=32768,
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert result.reason_code == "NO_ELIGIBLE_FREE_MODELS"
+        assert result.attempts == []
+
+    @pytest.mark.asyncio
     async def test_access_denied_is_not_treated_as_bad_credentials(self):
         router = _router(
             entries=[

@@ -14,6 +14,7 @@ from fair.schemas.domain import (
     BenchmarkCheck,
     Capability,
     CrossCheckReport,
+    OutputBudget,
     Priority,
     PrivacyClass,
     QualityReport,
@@ -22,13 +23,12 @@ from fair.schemas.domain import (
 )
 
 
-class SolveRequest(DTO):
+class SolveRequest(OutputBudget):
     cache_mode: Literal["default", "bypass", "refresh"] = "default"
     cache_ttl_seconds: int | None = Field(default=None, ge=1, le=SECONDS_IN_DAY, strict=True)
     client_id: str = Field(min_length=1, max_length=128)
     priority: Priority = "P2"
     task: str = Field(min_length=1, max_length=100_000)
-    max_output_tokens: int = Field(default=1024, ge=1, le=65536, strict=True)
     task_type: str | None = Field(default=None, max_length=64)
     quality_level: Literal["commodity", "standard", "advanced", "high_impact_support"] = "standard"
     privacy_class: PrivacyClass = "PUBLIC"

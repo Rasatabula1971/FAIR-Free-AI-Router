@@ -56,7 +56,7 @@ def profile_task(request: SolveRequest, thresholds: dict[str, float]) -> TaskPro
         # a request fits. A schema is counted too: the provider is sent it.
         context_tokens_estimate=estimated_tokens(model_task(request))
         + (estimated_tokens(json.dumps(request.expected_schema)) if request.expected_schema else 0)
-        + request.max_output_tokens
+        + request.output_floor
         + 512,
         minimum_quality_score=thresholds[request.quality_level],
         requires_grounding=grounding,

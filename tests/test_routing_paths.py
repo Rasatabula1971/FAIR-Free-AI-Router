@@ -10,6 +10,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from fair.config import RoutingSettings
 from fair.embedded.performance import MemoryPerformanceRegistry
@@ -67,6 +68,37 @@ def _router(entries=None, **settings_kw):
         registry.register(spec, adapter)
     thresholds = {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}
     return EmbeddedRouter(registry, RoutingSettings(**settings_kw), thresholds)
+
+
+class TestOutputBudgetResolution:
+    """max_output_tokens is headroom wanted; min_output_tokens is the floor."""
+
+    def test_no_floor_means_the_whole_budget_is_the_floor(self):
+        request = _request(max_output_tokens=4096)
+        assert request.output_floor == 4096
+        assert request.output_budget(4096) == 4096
+        # Exactly the refusal every route faced before the field existed.
+        assert request.output_budget(4095) is None
+
+    def test_a_route_at_or_above_the_floor_is_asked_for_what_it_can_give(self):
+        request = _request(max_output_tokens=32768, min_output_tokens=4096)
+        assert request.output_floor == 4096
+        assert request.output_budget(4096) == 4096
+        assert request.output_budget(16384) == 16384
+        assert request.output_budget(32768) == 32768
+        # Never more than was asked for, however large the route's ceiling.
+        assert request.output_budget(131072) == 32768
+
+    def test_a_route_below_the_floor_cannot_do_the_work(self):
+        request = _request(max_output_tokens=32768, min_output_tokens=4096)
+        assert request.output_budget(4095) is None
+
+    def test_a_floor_above_the_budget_is_refused(self):
+        with pytest.raises(ValidationError, match="min_output_tokens cannot exceed"):
+            _request(max_output_tokens=1024, min_output_tokens=2048)
+
+    def test_a_floor_equal_to_the_budget_is_allowed(self):
+        assert _request(max_output_tokens=1024, min_output_tokens=1024).output_floor == 1024
 
 
 def _request(**overrides):
@@ -283,6 +315,25 @@ class TestSelectorEligibility:
         selector, _ = self._selector([(spec, MockAdapter("a"))])
         request = _request(max_output_tokens=65)
         assert selector.candidates(request, self._profile(max_output_tokens=65), set()) == []
+
+    def test_a_model_below_the_floor_is_not_offered(self):
+        """A declared floor is the one budget a route really must reach."""
+        spec = _spec()
+        spec.models[0].max_output_tokens = 64
+        selector, _ = self._selector([(spec, MockAdapter("a"))])
+        overrides = {"max_output_tokens": 4096, "min_output_tokens": 65}
+        request = _request(**overrides)
+        assert selector.candidates(request, self._profile(**overrides), set()) == []
+
+    def test_a_model_under_the_wanted_budget_but_over_the_floor_is_offered(self):
+        """The case the single dial could not express: headroom wanted is 4096, the
+        answer needs 64, and a 64-token route can give exactly that."""
+        spec = _spec()
+        spec.models[0].max_output_tokens = 64
+        selector, _ = self._selector([(spec, MockAdapter("a"))])
+        overrides = {"max_output_tokens": 4096, "min_output_tokens": 64}
+        request = _request(**overrides)
+        assert len(selector.candidates(request, self._profile(**overrides), set())) == 1
 
     def test_a_task_beyond_the_context_window_is_not_offered(self):
         spec = _spec()

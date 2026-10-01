@@ -137,6 +137,7 @@ class EmbeddedRouter:
                         task_class=profile.task_class,
                         expected_json_schema=request.expected_schema,
                         max_output_tokens=request.max_output_tokens,
+                        min_output_tokens=request.min_output_tokens,
                     )
                 ),
                 timeout=self.settings.attempt_deadline(request.max_output_tokens),
