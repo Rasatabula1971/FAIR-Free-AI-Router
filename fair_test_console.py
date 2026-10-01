@@ -357,7 +357,6 @@ def _show_provider_configuration() -> None:
     print("----------------------")
     for number, entry in LIVE_PROVIDERS.items():
         configured, reason = _provider_status(entry)
-        provider_id = str(entry["provider_id"])
         if bool(entry["confirmation_required"]):
             confirmation = (
                 "confirmed in FAIR_CONFIRMED_FREE_PROVIDERS"

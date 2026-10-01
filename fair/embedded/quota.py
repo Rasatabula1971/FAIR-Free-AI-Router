@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,25 @@ def _identity(value, label, maximum=128):
     if any(ord(character) < 32 for character in value):
         raise ValueError(f"{label} contains control characters")
     return value.strip()
+
+
+def _ledger_failure(error):
+    """A fixed code for a SQLite failure, since its message can name the path."""
+    if isinstance(error, sqlite3.OperationalError) and "locked" in str(error):
+        return "LEDGER_LOCKED"
+    return "LEDGER_UNAVAILABLE"
+
+
+class QuotaLedgerUnavailable(Exception):
+    """The shared ledger could not be read or written.
+
+    FAIR then cannot know whether a free request is still available, and the
+    two ways of guessing are not symmetrical: guessing low wastes a free
+    request, guessing high exceeds a free tier, which is the one outcome this
+    ledger exists to prevent. So routing stops and says which it was, rather
+    than proceeding on an assumption. Carries a fixed code, never SQLite's
+    message, which can name the database path.
+    """
 
 
 class SharedQuotaLedger:
@@ -93,6 +113,11 @@ class SharedQuotaLedger:
         try:
             with database:
                 yield database
+        except sqlite3.Error as error:
+            # A fixed code, never SQLite's message, which can name the database
+            # path. Contention is a real answer about the ledger and has to be
+            # distinguishable from a defect, which is what it used to look like.
+            raise QuotaLedgerUnavailable(_ledger_failure(error)) from None
         finally:
             database.close()
 
@@ -293,6 +318,10 @@ class MemoryQuotaGovernor:
             _identity(pool_id, "quota pool id", 256)
         self._states: dict[str, QuotaState] = {}
         self._probe_sequence = 0
+        # Monotonic count of ledger operations that failed. Read before and
+        # after a solve to tell a busy ledger from an exhausted quota.
+        self.ledger_failures = 0
+        self._failure_lock = threading.Lock()
 
     def pool_id(self, provider_id):
         return self.quota_pool_ids.get(provider_id, provider_id)
@@ -320,11 +349,26 @@ class MemoryQuotaGovernor:
         return self._state(provider_id)
 
     def _ledger(self, operation, *args, failed):
-        """Run a ledger operation fail-closed; never leak sqlite errors to callers."""
+        """Run a ledger operation fail-closed; never leak sqlite errors to callers.
+
+        Treating an unreadable ledger as an unavailable pool is the right
+        direction -- the alternative is dispatching a request FAIR cannot
+        account for -- but it is indistinguishable from a spent quota to
+        everything upstream. So the failure is counted as well as logged, and
+        the router reads that count rather than reporting a busy ledger as
+        though no free model had been eligible.
+        """
         try:
             return operation(*args)
-        except sqlite3.Error:
-            logger.warning("Shared quota ledger unavailable; treating pool as unavailable")
+        except (QuotaLedgerUnavailable, sqlite3.Error) as error:
+            code = (
+                str(error) if isinstance(error, QuotaLedgerUnavailable) else _ledger_failure(error)
+            )
+            with self._failure_lock:
+                self.ledger_failures += 1
+            logger.warning(
+                "Shared quota ledger unavailable (%s); treating pool as unavailable", code
+            )
             return failed
 
     async def _ledger_async(self, operation, *args, failed):
