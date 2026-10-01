@@ -151,6 +151,25 @@ prices, so it does not satisfy FAIR's recurring-zero-cost requirement. NVIDIA's 
 preview API is also excluded because its hosted access is credit-based for new accounts.
 Local Ollama remains fully supported.
 
+## When a reservation is given back
+
+A reservation buys one request from a provider. Where FAIR raises the failure
+itself before anything is sent — its own budget and capability checks, or a model
+that has left the live catalog — no request was made and the reservation is
+refunded. Without that, a model delisted upstream spends a free request on every
+solve that still carries it, which on a 50-a-day allowance is not a rounding error.
+
+A provider that was called keeps the charge however badly it answered: a 403, a
+5xx and a malformed body all mean a request was made. A cancelled solve keeps it
+too, since cancellation can tear down a call already in flight. Over-counting
+costs a free request; under-counting exceeds a free tier, which is the thing the
+governor exists to prevent.
+
+A half-open probe is always released, cancellation included. It is claimed to test
+a provider, and an attempt that never called one tested nothing — left held, it
+makes a healthy provider unavailable for the probe window and then a full fresh
+cooldown after it.
+
 ## Shared quota across applications
 
 Separate API keys are useful for isolation, but they do **not** necessarily create

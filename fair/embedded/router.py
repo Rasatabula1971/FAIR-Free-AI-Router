@@ -170,9 +170,16 @@ class EmbeddedRouter:
             disposition, error_type = "QUALITY_FAILURE", "PROVIDER_SCHEMA_VALIDATION_FAILED"
             error_detail = _failure_detail(error)
         except RequestNotSupported as error:
+            # Raised by the adapter's own budget and capability checks, before any
+            # request is sent, so the reservation bought nothing and is given back.
+            await self.quota.release_async(spec, request.client_id)
             disposition, error_type = "CAPABILITY_MISMATCH", "REQUEST_NOT_SUPPORTED_BY_ROUTE"
             error_detail = _failure_detail(error)
         except ModelUnavailable as error:
+            # The model was gone from the live catalog, so no completion was sent.
+            # Without this, a model delisted upstream spends a free request on every
+            # solve that still has it in the registry.
+            await self.quota.release_async(spec, request.client_id)
             disposition, error_type = "INFRA_FAILURE", "MODEL_UNAVAILABLE"
             error_detail = _failure_detail(error)
         except AccessDenied as error:
@@ -186,7 +193,13 @@ class EmbeddedRouter:
             error_detail = _failure_detail(error)
         except asyncio.CancelledError:
             # Caller cancellation says nothing about provider health. Penalizing
-            # the provider here lets one client open a shared circuit breaker.
+            # the provider here lets one client open a shared circuit breaker, and
+            # a half-open probe left claimed does exactly that by another route:
+            # the provider stays unavailable for the probe window and then a full
+            # fresh cooldown, having been told nothing about it. The request itself
+            # is not refunded -- cancellation can tear down a call already in
+            # flight, and over-counting is the safe direction.
+            self.quota.release(spec, request.client_id, refund=False)
             cancelled = True
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
         except Exception as error:
