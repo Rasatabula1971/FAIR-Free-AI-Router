@@ -118,7 +118,7 @@ def _describe(node):
         parts.append("must be an empty array")
     elif low is not None and high is not None:
         parts.append(f"{low} to {high} items")
-    elif low is not None:
+    elif low:
         parts.append(f"at least {low} items")
     elif high is not None:
         parts.append(f"at most {high} items")
@@ -144,6 +144,13 @@ def _describe(node):
         parts.append(f"at least {_number(low)}")
     elif high is not None:
         parts.append(f"at most {_number(high)}")
+    low, high = node.get("exclusiveMinimum"), node.get("exclusiveMaximum")
+    if low is not None:
+        parts.append(f"greater than {_number(low)}")
+    if high is not None:
+        parts.append(f"less than {_number(high)}")
+    if node.get("multipleOf") is not None:
+        parts.append(f"a multiple of {_number(node['multipleOf'])}")
     return ", ".join(parts) or None
 
 
