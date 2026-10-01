@@ -40,6 +40,8 @@ from fair.schemas.domain import DTO, NormalizedModelResponse, ProviderHealth, Qu
 from fair.security.credentials import ProviderCredentials
 
 TEXT_CAPABILITIES = {"reasoning", "coding", "structured_output"}
+# Largest error body FAIR will buffer; a provider error needs a status and a message.
+_MAX_ERROR_BODY_BYTES = 1_000_000
 # The output cap a model keeps until its endpoint has been asked for more. It is the
 # descriptor default for an unreviewed model, not a ceiling on a reviewed one.
 MAX_OUTPUT_TOKENS = 4096
@@ -439,7 +441,12 @@ class TextAdapter:
                 "POST", url, headers=headers, json=payload, timeout=timeout
             ) as response:
                 if response.status_code != 200:
-                    raw = await response.aread()
+                    raw = await self._read_error_body(response)
+                    if raw is None:
+                        # Compressed or oversized: the body is not trusted, so the
+                        # status code alone classifies the failure.
+                        self._error(response.status_code, response.headers)
+                        raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                     if self.settings.provider_error_diagnostics:
                         self._record_error_diagnostic(response.status_code, path, raw)
                     body = self._maybe_json(raw)
@@ -480,6 +487,25 @@ class TextAdapter:
         if not chunks:
             raise MalformedResponse("EMPTY_COMPLETION_STREAM")
         return chunks
+
+    @staticmethod
+    async def _read_error_body(response):
+        """An error body, read under a byte cap; None when it cannot be trusted.
+
+        A compressed body is never decoded (decompression can amplify a small
+        download into a large allocation) and a body past the cap is abandoned
+        without reading the rest. Only a status code and a short message are ever
+        taken from an error body, so None degrades to status-only classification.
+        """
+        if response.headers.get("content-encoding", "identity") != "identity":
+            return None
+        parts, size = [], 0
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > _MAX_ERROR_BODY_BYTES:
+                return None
+            parts.append(chunk)
+        return b"".join(parts)
 
     @staticmethod
     def _maybe_json(raw):
@@ -1437,7 +1463,15 @@ class OllamaLocalAdapter(TextAdapter):
             payload["format"] = schema
         if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
-        data = await self._json("POST", "/api/chat", payload)
+        # A buffered answer arrives all at once, so the read timeout has to cover the
+        # whole generation, sized by the requested budget like every other adapter.
+        # Catalog and metadata reads keep the short default.
+        data = await self._json(
+            "POST",
+            "/api/chat",
+            payload,
+            timeout=self._completion_timeout(request, streaming=False),
+        )
         try:
             message = data["message"]
             if (

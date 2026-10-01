@@ -21,6 +21,7 @@ from fair.schemas.domain import (
     SourcePolicyReport,
     VerificationState,
 )
+from fair.schemas.schema_policy import find_regex_keyword
 
 
 class SolveRequest(OutputBudget):
@@ -87,6 +88,12 @@ class SolveRequest(OutputBudget):
             if len(encoded) > 20000 or '"$ref"' in encoded or '"$dynamicRef"' in encoded:
                 raise ValueError(
                     "Schema references and schemas over 20000 characters are unsupported"
+                )
+            keyword = find_regex_keyword(self.expected_schema)
+            if keyword is not None:
+                raise ValueError(
+                    f"Schemas using '{keyword}' are unsupported: regular-expression "
+                    "matching cannot be time-bounded in the shared service"
                 )
         return self
 

@@ -8,6 +8,9 @@ version = "0.2.0"
 description = "Embeddable, free-only AI routing with quality validation"
 requires-python = ">=3.12"
 dependencies = [
+    # Windows (and stripped Linux images) ship no IANA time-zone database, and
+    # FAIR builds ZoneInfo("America/Los_Angeles") at import time.
+    "tzdata>=2024.1",
     "pydantic>=2.10,<3",
     "httpx>=0.28,<1",
     "jsonschema>=4.23,<5",

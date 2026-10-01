@@ -1927,3 +1927,73 @@ class TestAnErrorInsideAStreamIsStillAnError:
             ]
         )
         assert (await adapter.complete(_request(self.MODEL))).text == "fine"
+
+
+class _CountingStream(httpx.AsyncByteStream):
+    """An upstream body far larger than any cap, that records how much was pulled."""
+
+    CHUNK = 64 * 1024
+
+    def __init__(self, total=50 * 1024 * 1024):
+        self.total = total
+        self.sent = 0
+
+    async def __aiter__(self):
+        while self.sent < self.total:
+            self.sent += self.CHUNK
+            yield b"x" * self.CHUNK
+
+
+class TestStreamingErrorBodyBound:
+    """An error body is read under a byte cap, like every other provider body."""
+
+    MODEL = "openai/gpt-oss-20b"
+    CAP = 1_000_000
+
+    def _adapter(self, post_response):
+        def handler(request):
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                )
+            return post_response()
+
+        return GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=httpx.MockTransport(handler),
+        )
+
+    async def test_an_oversized_error_body_is_abandoned_at_the_cap(self):
+        stream = _CountingStream()
+        adapter = self._adapter(lambda: httpx.Response(500, stream=stream))
+        with pytest.raises(ProviderUnavailable, match="HTTP_500"):
+            await adapter.complete(_request(self.MODEL))
+        assert stream.sent <= self.CAP + _CountingStream.CHUNK
+
+    async def test_an_oversized_429_body_is_still_classified_by_status(self):
+        stream = _CountingStream()
+        adapter = self._adapter(
+            lambda: httpx.Response(429, headers={"retry-after": "7"}, stream=stream)
+        )
+        with pytest.raises(RateLimited):
+            await adapter.complete(_request(self.MODEL))
+        assert stream.sent <= self.CAP + _CountingStream.CHUNK
+
+    async def test_a_compressed_error_body_is_never_decoded(self):
+        import gzip
+
+        adapter = self._adapter(
+            lambda: httpx.Response(
+                401, headers={"content-encoding": "gzip"}, content=gzip.compress(b"{}" * 10)
+            )
+        )
+        with pytest.raises(AuthenticationFailed):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_an_ordinary_small_error_body_keeps_its_classification(self):
+        adapter = self._adapter(lambda: httpx.Response(403, json={"error": {"message": "no"}}))
+        with pytest.raises(AccessDenied):
+            await adapter.complete(_request(self.MODEL))

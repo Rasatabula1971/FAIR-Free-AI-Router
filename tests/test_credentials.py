@@ -6,6 +6,7 @@ confused with another client's, or leak between providers. The module was at
 """
 
 import json
+import sys
 
 import pytest
 from pydantic import SecretStr
@@ -77,6 +78,14 @@ class TestSecretConfig:
         with pytest.raises(CredentialConfigurationError):
             secret_config("FAIR_TEST_VALUE", "FAIR_TEST_FILE", {})
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "Windows caps an environment variable at 32,767 characters, so a value over "
+            "the 65,536-byte limit cannot be set there; the file path below covers the "
+            "same limit on every platform"
+        ),
+    )
     def test_an_oversized_value_is_refused(self, monkeypatch):
         monkeypatch.setenv("FAIR_TEST_VALUE", '{"k": "' + "x" * 65536 + '"}')
         monkeypatch.delenv("FAIR_TEST_FILE", raising=False)

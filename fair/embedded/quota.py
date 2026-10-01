@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -45,7 +46,7 @@ class SharedQuotaLedger:
     def __init__(self, path):
         self.path = str(Path(path).expanduser().resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("PRAGMA journal_mode=WAL")
             database.execute(
                 """
@@ -72,9 +73,28 @@ class SharedQuotaLedger:
 
     def _connect(self):
         database = sqlite3.connect(self.path, timeout=5)
-        database.execute("PRAGMA busy_timeout=5000")
-        database.execute("PRAGMA foreign_keys=ON")
+        try:
+            database.execute("PRAGMA busy_timeout=5000")
+            database.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            database.close()
+            raise
         return database
+
+    @contextmanager
+    def _transaction(self):
+        """One transaction on a connection that is always closed afterwards.
+
+        ``with connection:`` only commits or rolls back; it does not close. Leaving
+        the connection to the garbage collector ties its file handle to object
+        lifetime, so this owns it explicitly on success, early return and error.
+        """
+        database = self._connect()
+        try:
+            with database:
+                yield database
+        finally:
+            database.close()
 
     def _recover(self, database, pool_id, now):
         row = database.execute(
@@ -102,14 +122,14 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if limit is None:
             return None
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, _, _ = self._recover(database, pool_id, now)
             return max(0, limit - used)
 
     def available(self, pool_id, limit, now):
         pool_id = _identity(pool_id, "quota pool id", 256)
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, exhausted, _ = self._recover(database, pool_id, now)
             return not exhausted and (limit is None or used < limit)
@@ -117,7 +137,7 @@ class SharedQuotaLedger:
     def reserve(self, pool_id, application_id, limit, window, now):
         pool_id = _identity(pool_id, "quota pool id", 256)
         application_id = _identity(application_id, "application id")
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, exhausted, reset_at = self._recover(database, pool_id, now)
             if exhausted or (limit is not None and used >= limit):
@@ -148,7 +168,7 @@ class SharedQuotaLedger:
         """
         pool_id = _identity(pool_id, "quota pool id", 256)
         application_id = _identity(application_id, "application id")
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, _exhausted, reset_at = self._recover(database, pool_id, now)
             database.execute(
@@ -168,17 +188,27 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if remaining is None or observed_limit is None or remaining > observed_limit:
             return
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
-            used, _, current_reset = self._recover(database, pool_id, now)
+            used, exhausted, current_reset = self._recover(database, pool_id, now)
             used = max(used, observed_limit - remaining)
             if reset_at is not None and now < reset_at <= now + 86400:
-                current_reset = reset_at
+                if not exhausted:
+                    current_reset = reset_at
+                elif remaining == 0 and current_reset is not None:
+                    # Another exhaustion signal: the block lasts until the later reset.
+                    current_reset = max(current_reset, reset_at)
+                # Otherwise an already-exhausted pool keeps its established
+                # reset. A positive observation can arrive late (a request that
+                # began before the exhaustion was seen) and must neither shorten
+                # nor extend the block.
             # Persist exhaustion only when the ledger knows how it will
             # recover. A provider can report zero remaining without a reset
             # timestamp; storing that forever would strand every application
-            # until the SQLite file was manually edited.
-            shared_exhausted = remaining == 0 and current_reset is not None
+            # until the SQLite file was manually edited. An exhaustion that is
+            # already recorded is never cleared here: it ends only at its reset,
+            # which _recover applies.
+            shared_exhausted = exhausted or (remaining == 0 and current_reset is not None)
             database.execute(
                 "UPDATE quota_pool_state SET used = ?, exhausted = ?, reset_at = ? "
                 "WHERE pool_id = ?",
@@ -189,7 +219,7 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if reset_at is None or not isfinite(reset_at) or reset_at <= now:
             return
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             self._recover(database, pool_id, now)
             database.execute(
@@ -199,7 +229,7 @@ class SharedQuotaLedger:
 
     def report(self, pool_ids, now):
         pool_ids = sorted({_identity(value, "quota pool id", 256) for value in pool_ids})
-        with self._connect() as database:
+        with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             for pool_id in pool_ids:
                 self._recover(database, pool_id, now)
@@ -237,6 +267,9 @@ class QuotaState:
     reset_at: float | None = None
     circuit_state: str = "CLOSED"
     probe_until: float = 0
+    # Identifies who owns the half-open slot, so a stale attempt cannot release it
+    # or close the circuit on behalf of a newer probe. 0 means no probe.
+    probe_token: int = 0
     failures: list[float] = field(default_factory=list)
 
 
@@ -259,6 +292,7 @@ class MemoryQuotaGovernor:
             _identity(provider_id, "provider id")
             _identity(pool_id, "quota pool id", 256)
         self._states: dict[str, QuotaState] = {}
+        self._probe_sequence = 0
 
     def pool_id(self, provider_id):
         return self.quota_pool_ids.get(provider_id, provider_id)
@@ -280,6 +314,7 @@ class MemoryQuotaGovernor:
             state.circuit_state = "OPEN"
             state.blocked_until = now + self.settings.cooldown_seconds
             state.probe_until = 0
+            state.probe_token = 0
 
     def state(self, provider_id):
         return self._state(provider_id)
@@ -357,11 +392,20 @@ class MemoryQuotaGovernor:
             failed=False,
         )
 
-    def reserve(self, spec, application_id=None):
+    def reserve(self, spec, application_id=None, probe_timeout=None):
+        return self.reserve_probe(spec, application_id, probe_timeout)[0]
+
+    def reserve_probe(self, spec, application_id=None, probe_timeout=None):
+        """Reserve one request; also returns the half-open probe token, or 0.
+
+        ``probe_timeout`` is how long the caller's attempt may legitimately run. A
+        half-open probe is owned for that long, not for a fixed default, so a large
+        completion is not declared abandoned while it is still generating.
+        """
         state = self._state(spec.provider_id)
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
-            return False
-        probing = self._claim_probe(state)
+            return False, 0
+        token = self._claim_probe(state, probe_timeout)
         if self.shared_ledger is not None:
             if not self._ledger(
                 self.shared_ledger.reserve,
@@ -372,9 +416,8 @@ class MemoryQuotaGovernor:
                 self.clock(),
                 failed=False,
             ):
-                if probing:
-                    self._release_probe(state)
-                return False
+                self._release_probe(state, token)
+                return False, 0
             state.used += 1
         else:
             state.used += 1
@@ -384,15 +427,18 @@ class MemoryQuotaGovernor:
                 and spec.request_limit_window is not None
             ):
                 state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
-        return True
+        return True, token
 
-    async def reserve_async(self, spec, application_id=None):
+    async def reserve_async(self, spec, application_id=None, probe_timeout=None):
+        return (await self.reserve_probe_async(spec, application_id, probe_timeout))[0]
+
+    async def reserve_probe_async(self, spec, application_id=None, probe_timeout=None):
         state = self._state(spec.provider_id)
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
-            return False
+            return False, 0
         # Claim the half-open slot before awaiting SQLite. Otherwise several
         # concurrent coroutines can all observe OPEN and dispatch probe calls.
-        probing = self._claim_probe(state)
+        token = self._claim_probe(state, probe_timeout)
         if self.shared_ledger is not None:
             if not await self._ledger_async(
                 self.shared_ledger.reserve,
@@ -403,9 +449,8 @@ class MemoryQuotaGovernor:
                 self.clock(),
                 failed=False,
             ):
-                if probing:
-                    self._release_probe(state)
-                return False
+                self._release_probe(state, token)
+                return False, 0
             state.used += 1
         else:
             state.used += 1
@@ -415,16 +460,18 @@ class MemoryQuotaGovernor:
                 and spec.request_limit_window is not None
             ):
                 state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
-        return True
+        return True, token
 
-    def release(self, spec, application_id=None, *, refund=True):
+    def release(self, spec, application_id=None, *, refund=True, probe_token=0):
         """Undo what a reservation claimed when no request reached the provider.
 
         Two things are given back, and they are separable because FAIR is certain
         of one more often than the other. The half-open probe is always released:
         it was claimed to test a provider, and an attempt that never called one
         tested nothing, so leaving it held sidelines a healthy provider for the
-        probe window and then a fresh cooldown on top.
+        probe window and then a fresh cooldown on top. ``probe_token`` names which
+        probe this attempt owns; an attempt that owns none (0) releases nothing, and
+        a stale token cannot release a newer probe.
 
         The request itself is refunded only when FAIR raised the failure before
         dispatch and so knows the provider was never asked. Where that is
@@ -434,7 +481,7 @@ class MemoryQuotaGovernor:
         governor exists to prevent.
         """
         state = self._state(spec.provider_id)
-        self._release_probe(state)
+        self._release_probe(state, probe_token)
         if not refund:
             return
         if self.shared_ledger is not None:
@@ -447,9 +494,9 @@ class MemoryQuotaGovernor:
             )
         state.used = max(state.used - 1, 0)
 
-    async def release_async(self, spec, application_id=None, *, refund=True):
+    async def release_async(self, spec, application_id=None, *, refund=True, probe_token=0):
         state = self._state(spec.provider_id)
-        self._release_probe(state)
+        self._release_probe(state, probe_token)
         if not refund:
             return
         if self.shared_ledger is not None:
@@ -462,22 +509,44 @@ class MemoryQuotaGovernor:
             )
         state.used = max(state.used - 1, 0)
 
-    def _claim_probe(self, state):
+    def _claim_probe(self, state, probe_timeout=None):
+        """Take the half-open slot; returns its ownership token, or 0 if not a probe."""
         if state.circuit_state != "OPEN":
-            return False
+            return 0
+        self._probe_sequence += 1
         state.circuit_state = "HALF_OPEN"
-        state.probe_until = self.clock() + self.settings.timeout_seconds + 5
-        return True
+        state.probe_token = self._probe_sequence
+        lease = self.settings.timeout_seconds if probe_timeout is None else probe_timeout
+        state.probe_until = self.clock() + lease + 5
+        return state.probe_token
 
-    def _release_probe(self, state):
-        if state.circuit_state == "HALF_OPEN":
+    def _release_probe(self, state, token):
+        """Give the slot back, only if ``token`` still owns it."""
+        if token and state.circuit_state == "HALF_OPEN" and state.probe_token == token:
             state.circuit_state = "OPEN"
             state.probe_until = 0
+            state.probe_token = 0
+
+    def release_probe(self, provider_id, token):
+        """Release a probe whose outcome is not a verdict on the provider's health.
+
+        The circuit returns to OPEN with no new cooldown, so the next request may
+        probe at once. A token that no longer owns the slot is ignored, so a stale
+        attempt cannot release a newer probe.
+        """
+        self._release_probe(self._state(provider_id), token)
 
     def _open(self, state):
         state.circuit_state = "OPEN"
         state.blocked_until = self.clock() + self.settings.cooldown_seconds
         state.probe_until = 0
+        state.probe_token = 0
+
+    def _stale_probe_outcome(self, state, probe_token):
+        """A completion from a probe that no longer owns the half-open slot."""
+        return bool(probe_token) and (
+            state.circuit_state == "HALF_OPEN" and state.probe_token != probe_token
+        )
 
     def throttle(self, provider_id, retry_after=None):
         state = self._state(provider_id)
@@ -625,8 +694,10 @@ class MemoryQuotaGovernor:
         state.blocked_until = 0
         state.throttled_until = 0
 
-    def failure(self, provider_id):
+    def failure(self, provider_id, probe_token=0):
         state = self._state(provider_id)
+        if self._stale_probe_outcome(state, probe_token):
+            return
         now = self.clock()
         state.failures = [
             t for t in state.failures if t >= now - self.settings.circuit_window_seconds
@@ -637,11 +708,14 @@ class MemoryQuotaGovernor:
         ):
             self._open(state)
 
-    def success(self, provider_id):
+    def success(self, provider_id, probe_token=0):
         state = self._state(provider_id)
+        if self._stale_probe_outcome(state, probe_token):
+            return
         state.failures = []
         state.circuit_state = "CLOSED"
         state.probe_until = 0
+        state.probe_token = 0
         state.blocked_until = 0
 
     def effective_status(self, spec):
