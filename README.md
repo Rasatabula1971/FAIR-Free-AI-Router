@@ -541,6 +541,27 @@ were rate-limited and OpenRouter refused on its data policy, so neither endpoint
 actually answered. `MAX_OUTPUT_TOKENS_CEILING` bounds what any reviewed descriptor may reach;
 raising it alone changes nothing, because a descriptor declaring less still governs.
 
+### Asking for headroom without losing routes
+
+`max_output_tokens` is the most any route will be asked for. `min_output_tokens` is
+the least the answer can be complete within. They are different questions and used to
+share one dial, so a request for 32768 dropped every route whose own ceiling was lower
+— refused for not reaching a budget the task never needed.
+
+A route is offered when its ceiling reaches the **floor**, and is then asked for
+`min(max_output_tokens, its own ceiling)`. For the concept request that needed about
+3300 tokens:
+
+| request | routes offered | sent |
+|---|---|---|
+| `max_output_tokens=4096` | 10 | 4096 to every route, truncating the large ones |
+| `max_output_tokens=32768` | 8 | 32768; the 16384 and 4096 routes are dropped |
+| `max_output_tokens=32768, min_output_tokens=4096` | 10 | 32768, 16384 or 4096 per route |
+
+Leaving `min_output_tokens` unset makes the floor equal the whole budget, which is
+what every route had to meet before the field existed — so callers that say nothing
+keep exactly the behaviour they had.
+
 ### Published output limits
 
 Where a provider publishes its own completion-token ceiling in the live catalog,
@@ -732,7 +753,8 @@ await fair.solve(
     evidence=None,                # source documents for grounded contracts
     source_policy=None,           # constraints on which evidence may be relied on
     cross_check_required=None,    # per-request override
-    max_output_tokens=1024,
+    max_output_tokens=1024,       # headroom wanted: the most any route is asked for
+    min_output_tokens=None,       # floor: the least the answer can be complete within
     client_id="embedded",
     priority="P2",
     cache_mode="default",         # default|bypass|refresh

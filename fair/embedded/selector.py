@@ -36,7 +36,7 @@ class MemorySelector:
                     continue
                 if (
                     model.max_output_tokens is not None
-                    and request.max_output_tokens > model.max_output_tokens
+                    and request.output_floor > model.max_output_tokens
                 ):
                     continue
                 if eligible is not None and not eligible(spec, model):
@@ -79,7 +79,7 @@ class MemorySelector:
                     continue
                 if (
                     model.max_output_tokens is not None
-                    and request.max_output_tokens > model.max_output_tokens
+                    and request.output_floor > model.max_output_tokens
                 ):
                     continue
                 if eligible is not None and not eligible(spec, model):

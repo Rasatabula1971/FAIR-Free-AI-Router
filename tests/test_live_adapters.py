@@ -17,6 +17,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    StructuredOutputRejected,
 )
 from fair.providers.live import (
     CloudflareWorkersAiAdapter,
@@ -671,6 +672,106 @@ class TestGroq:
         payload = json.loads(seen[-1].content)
         assert payload["max_completion_tokens"] == 64
         assert "max_tokens" not in payload
+
+
+def _sse_error(model, error, *, status=200):
+    """Groq's shape: a reasoning chunk, then the error, all under one status."""
+    frames = [
+        {"model": model, "choices": [{"delta": {"role": "assistant"}}]},
+        {"model": model, "choices": [{"delta": {"reasoning": "thinking"}}]},
+        {"error": error},
+    ]
+    content = "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
+    return httpx.Response(
+        status, content=content.encode(), headers={"content-type": "text/event-stream"}
+    )
+
+
+class TestSchemaRejectionClassification:
+    """A provider refusing the model's JSON is a verdict on the answer.
+
+    Observed live from Groq on 2026-09-30: openai/gpt-oss-20b and -120b were sent a
+    json_schema response_format, wrote an object missing required properties, and
+    Groq's own validator refused it with json_validate_failed -- in-stream, under a
+    200. The code is a string, and the classifier's fallback for a non-integer code
+    is 500, so it surfaced as PROVIDER_UNAVAILABLE / HTTP_500: the provider was
+    charged a failure toward its circuit breaker, and the unanswered budget was
+    spent on a model that had answered.
+    """
+
+    MODEL = "openai/gpt-oss-20b"
+    REJECTION = {
+        "message": "Generated JSON does not match the expected schema.",
+        "type": "invalid_request_error",
+        "code": "json_validate_failed",
+        "failed_generation": '{"concepts": [{}]}',
+    }
+
+    def _adapter(self, completion):
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): completion,
+            }
+        )
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        return adapter, seen
+
+    async def test_a_rejection_inside_a_200_stream_is_not_a_provider_failure(self):
+        adapter, _ = self._adapter(lambda request: _sse_error(self.MODEL, self.REJECTION))
+        with pytest.raises(StructuredOutputRejected) as caught:
+            await adapter.complete(_request(self.MODEL))
+        assert str(caught.value) == "PROVIDER_REJECTED_GENERATED_SCHEMA"
+        assert not isinstance(caught.value, ProviderUnavailable)
+
+    async def test_a_rejection_on_a_failing_status_is_classified_the_same_way(self):
+        """The finding does not change because the provider chose a different status.
+
+        A non-200 carries an ordinary JSON error body rather than event framing, so
+        this exercises the other classification site with the same code.
+        """
+        adapter, _ = self._adapter(
+            lambda request: httpx.Response(400, json={"error": self.REJECTION})
+        )
+        with pytest.raises(StructuredOutputRejected):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_numeric_provider_code_is_never_read_as_a_schema_rejection(self):
+        """Cloudflare's 3036 is a quota code. Only a string code may match."""
+        adapter, _ = self._adapter(
+            lambda request: _sse_error(self.MODEL, {"code": 3036, "message": "neurons spent"})
+        )
+        with pytest.raises(ProviderUnavailable) as caught:
+            await adapter.complete(_request(self.MODEL))
+        assert not isinstance(caught.value, StructuredOutputRejected)
+        # Pinned as observed, not as endorsed: an integer error code is currently
+        # passed through as though it were an HTTP status, so a quota code surfaces
+        # as "HTTP_3036". That predates this change and is left alone here; the
+        # assertion exists so altering it is a deliberate act.
+        assert str(caught.value) == "HTTP_3036"
+
+    async def test_an_unrecognised_code_keeps_its_status_based_classification(self):
+        adapter, _ = self._adapter(
+            lambda request: _sse_error(self.MODEL, {"code": "something_else", "message": "boom"})
+        )
+        with pytest.raises(ProviderUnavailable) as caught:
+            await adapter.complete(_request(self.MODEL))
+        assert str(caught.value) == "HTTP_500"
+        assert not isinstance(caught.value, StructuredOutputRejected)
+
+    async def test_a_rejection_is_refused_before_any_answer_is_assembled(self):
+        """The stream carried assistant content; none of it may be returned."""
+        adapter, _ = self._adapter(lambda request: _sse_error(self.MODEL, self.REJECTION))
+        with pytest.raises(StructuredOutputRejected):
+            await adapter.complete(_request(self.MODEL))
 
 
 class TestCloudflare:
@@ -1446,6 +1547,63 @@ class TestPublishedOutputLimit:
         assert not any(r.method == "POST" for r in seen)
         await adapter.complete(request.model_copy(update={"max_output_tokens": 100}))
         assert json.loads(seen[-1].content)["max_tokens"] == 100
+
+    async def test_a_budget_over_the_route_ceiling_is_clamped_to_it(self):
+        """With a floor the route can meet, asking for more than it can give is a
+        request for headroom, not an impossibility: it is sent the ceiling. Before
+        the floor existed this was refused outright and the route was unusable for
+        any request wanting more than 100 tokens, however little the task needed."""
+        entry = {
+            "id": self.MODEL,
+            "context_length": 262144,
+            "pricing": {"prompt": "0", "completion": "0"},
+            "top_provider": {"max_completion_tokens": 100},
+        }
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (200, {"data": [entry]}),
+                ("GET", "/key"): (200, {"data": {"is_free_tier": True}}),
+                ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
+            }
+        )
+        spec = _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL, context=262144)
+        spec.models[0].max_output_tokens = 4096
+        adapter = OpenRouterFreeAdapter(
+            spec, _settings(), credential=SecretStr("k"), transport=transport
+        )
+        await adapter.complete(
+            _request(self.MODEL).model_copy(
+                update={"max_output_tokens": 4096, "min_output_tokens": 100}
+            )
+        )
+        assert json.loads(seen[-1].content)["max_tokens"] == 100
+
+    async def test_a_route_ceiling_under_the_floor_is_still_refused(self):
+        entry = {
+            "id": self.MODEL,
+            "context_length": 262144,
+            "pricing": {"prompt": "0", "completion": "0"},
+            "top_provider": {"max_completion_tokens": 100},
+        }
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (200, {"data": [entry]}),
+                ("GET", "/key"): (200, {"data": {"is_free_tier": True}}),
+                ("POST", "/chat/completions"): (200, _completion(self.MODEL, usage={"cost": 0})),
+            }
+        )
+        spec = _spec("openrouter_free", "FREE_DYNAMIC", self.MODEL, context=262144)
+        spec.models[0].max_output_tokens = 4096
+        adapter = OpenRouterFreeAdapter(
+            spec, _settings(), credential=SecretStr("k"), transport=transport
+        )
+        with pytest.raises(RequestNotSupported, match="OUTPUT_BUDGET_INVALID"):
+            await adapter.complete(
+                _request(self.MODEL).model_copy(
+                    update={"max_output_tokens": 4096, "min_output_tokens": 101}
+                )
+            )
+        assert not any(r.method == "POST" for r in seen)
 
 
 # ── Streaming transport and scaled budgets ───────────────────────────────

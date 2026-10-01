@@ -26,6 +26,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    StructuredOutputRejected,
 )
 from fair.providers.schema_dialects import (
     GEMINI,
@@ -189,6 +190,14 @@ class TextAdapter:
     # safe_diagnostics(). No raised code and no attempt log changes either way.
     _diagnostic_max_chars = 512
     _diagnostic_parse_limit = 20_000
+    # Error codes meaning "the JSON the model wrote did not match the schema you
+    # sent", as opposed to anything about this provider's health. Only codes seen
+    # from a live free route belong here: Groq returned json_validate_failed on
+    # 2026-09-30 for openai/gpt-oss-20b and openai/gpt-oss-120b, in-stream under a
+    # 200. A list copied from documentation would be the kind of unreviewed local
+    # value the rest of this package refuses to keep, so an unrecognised code keeps
+    # its existing status-based classification rather than being guessed at.
+    schema_rejection_codes = frozenset({"json_validate_failed"})
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -294,6 +303,22 @@ class TextAdapter:
     def _error_from_body(self, status, headers, data):
         """Provider-specific structured error hook; must raise for non-200 responses."""
         self._error(status, headers)
+
+    def _refuse_schema_rejection(self, data):
+        """Raise when an error body says the model's JSON failed the sent schema.
+
+        Checked before any status-based classification, because the status carrying
+        this is not distinctive. Groq delivers it in-stream under a 200, and the
+        fallback for a non-integer error code is 500, so a model writing the wrong
+        shape arrived as PROVIDER_UNAVAILABLE / HTTP_500: it cost the provider a
+        failure toward its circuit breaker and spent the unanswered budget on a
+        model that had in fact answered. Only a string code matches, so a numeric
+        provider code such as Cloudflare's 3036 cannot be mistaken for one.
+        """
+        error = data.get("error") if isinstance(data, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if isinstance(code, str) and code in self.schema_rejection_codes:
+            raise StructuredOutputRejected("PROVIDER_REJECTED_GENERATED_SCHEMA")
 
     @staticmethod
     def _error_message(data):
@@ -417,9 +442,9 @@ class TextAdapter:
                     raw = await response.aread()
                     if self.settings.provider_error_diagnostics:
                         self._record_error_diagnostic(response.status_code, path, raw)
-                    self._error_from_body(
-                        response.status_code, response.headers, self._maybe_json(raw)
-                    )
+                    body = self._maybe_json(raw)
+                    self._refuse_schema_rejection(body)
+                    self._error_from_body(response.status_code, response.headers, body)
                     raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                 self._quota = self._observe(response.headers)
                 async for line in response.aiter_lines():
@@ -437,6 +462,7 @@ class TextAdapter:
                     ):
                         if self.settings.provider_error_diagnostics:
                             self._record_error_diagnostic(200, path, body.encode())
+                        self._refuse_schema_rejection(chunk)
                         error = chunk.get("error")
                         self._error_from_body(
                             error.get("code", 500)
@@ -501,6 +527,7 @@ class TextAdapter:
                 value = strict_json(raw.decode("utf-8"))
                 if not isinstance(value, dict):
                     raise ValueError()
+                self._refuse_schema_rejection(value)
                 if response.status_code != 200:
                     self._error_from_body(response.status_code, response.headers, value)
                     raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
@@ -662,9 +689,12 @@ class TextAdapter:
             raise ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED")
         ceiling = self.settings.max_output_tokens_ceiling
         limit = min(model.max_output_tokens or ceiling, ceiling)
-        if not 1 <= request.max_output_tokens <= limit:
+        # Asked for what this route can give, not refused for what it cannot. Only
+        # a ceiling under the request's floor means this route cannot do the work.
+        budget = request.output_budget(limit)
+        if budget is None:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
-        if estimated_tokens(request.task) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(request.task) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         schema, note = self._schema_for_transport(request)
         streaming = self.supports_streaming
@@ -672,7 +702,7 @@ class TextAdapter:
             "model": model.model_id,
             "messages": [{"role": "user", "content": self._task_text(request, note)}],
             "stream": streaming,
-            self.output_tokens_key: request.max_output_tokens,
+            self.output_tokens_key: budget,
         }
         payload.update(copy.deepcopy(self.extra_payload))
         if schema is not None:
@@ -681,7 +711,7 @@ class TextAdapter:
                 "json_schema": {"name": "fair_result", "strict": True, "schema": schema},
             }
         await self._before_completion(payload)
-        if estimated_tokens(json.dumps(payload)) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         timeout = self._completion_timeout(request, streaming)
         data = (
@@ -1236,14 +1266,15 @@ class GeminiAdapter(TextAdapter):
         )
         if model is None:
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_REQUIRED")
-        if not 1 <= request.max_output_tokens <= self.settings.gemini_max_output_tokens:
+        budget = request.output_budget(self.settings.gemini_max_output_tokens)
+        if budget is None:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         schema, note = self._schema_for_transport(request)
         payload = {
             "contents": [{"role": "user", "parts": [{"text": self._task_text(request, note)}]}],
             "generationConfig": {
                 "candidateCount": 1,
-                "maxOutputTokens": request.max_output_tokens,
+                "maxOutputTokens": budget,
             },
         }
         if schema is not None:
@@ -1257,8 +1288,15 @@ class GeminiAdapter(TextAdapter):
         metadata = await self._metadata(model)
         if metadata is None:
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_UNAVAILABLE_OR_CHANGED")
-        if request.max_output_tokens > metadata["outputTokenLimit"]:
+        # The published limit can be tighter than the configured ceiling, so the
+        # budget is resolved again against it once the metadata is known.
+        published = request.output_budget(
+            min(self.settings.gemini_max_output_tokens, metadata["outputTokenLimit"])
+        )
+        if published is None:
             raise RequestNotSupported("OUTPUT_BUDGET_EXCEEDS_MODEL_LIMIT")
+        if published != budget:
+            payload["generationConfig"]["maxOutputTokens"] = published
         streaming = self.supports_streaming
         timeout = self._completion_timeout(request, streaming)
         if streaming:
@@ -1379,27 +1417,25 @@ class OllamaLocalAdapter(TextAdapter):
         context = metadata.get(str(metadata.get("general.architecture")) + ".context_length")
         if type(context) is not int or context < model.context_window:
             raise AuthenticationFailed("LOCAL_CONTEXT_CAPACITY_NOT_CONFIRMED")
-        if (
-            not 1
-            <= request.max_output_tokens
-            <= min(
+        budget = request.output_budget(
+            min(
                 model.max_output_tokens or self.settings.max_output_tokens_ceiling,
                 self.settings.max_output_tokens_ceiling,
             )
-            or estimated_tokens(request.task) + request.max_output_tokens > model.context_window
-        ):
+        )
+        if budget is None or estimated_tokens(request.task) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
         schema, note = self._schema_for_transport(request)
         payload = {
             "model": model.model_id,
             "stream": False,
             "messages": [{"role": "user", "content": self._task_text(request, note)}],
-            "options": {"num_predict": request.max_output_tokens, "num_ctx": model.context_window},
+            "options": {"num_predict": budget, "num_ctx": model.context_window},
             "keep_alive": 0,
         }
         if schema is not None:
             payload["format"] = schema
-        if estimated_tokens(json.dumps(payload)) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/api/chat", payload)
         try:

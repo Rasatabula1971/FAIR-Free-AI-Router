@@ -125,14 +125,56 @@ class TaskProfile(DTO):
     profile_source: Literal["RULES"] = "RULES"
 
 
-class NormalizedModelRequest(DTO):
+class OutputBudget(DTO):
+    """What a request wants to be given, and the least it can be answered within.
+
+    One number cannot say both. Admission asks whether a route can do the work at
+    all; dispatch asks how much that route should be given. Conflating them meant a
+    route whose ceiling is 4096 was dropped from a request for 32768 even when the
+    answer needed 3000 -- it was refused for not reaching a budget it never had to
+    reach.
+
+    ``max_output_tokens`` is the headroom wanted. ``min_output_tokens`` is the floor
+    below which the answer cannot be complete. A route at or above the floor is
+    asked for ``min(max_output_tokens, its own ceiling)`` instead of being refused.
+    """
+
+    max_output_tokens: int = Field(default=1024, ge=1, le=65536, strict=True)
+    min_output_tokens: int | None = Field(default=None, ge=1, le=65536, strict=True)
+
+    @property
+    def output_floor(self) -> int:
+        # None means the caller named no floor, so the whole budget is the floor:
+        # exactly what every route had to meet before this field existed. Callers
+        # that say nothing keep the behaviour they already had.
+        if self.min_output_tokens is None:
+            return self.max_output_tokens
+        return self.min_output_tokens
+
+    def output_budget(self, limit: int) -> int | None:
+        """The cap to ask a route whose own ceiling is ``limit``.
+
+        None when that ceiling is under the floor, which is the one case a route
+        genuinely cannot do the work.
+        """
+        if limit < self.output_floor:
+            return None
+        return min(self.max_output_tokens, limit)
+
+    @model_validator(mode="after")
+    def floor_within_budget(self):
+        if self.min_output_tokens is not None and self.min_output_tokens > self.max_output_tokens:
+            raise ValueError("min_output_tokens cannot exceed max_output_tokens")
+        return self
+
+
+class NormalizedModelRequest(OutputBudget):
     task: str
     model_id: str
     request_id: str
     client_id: str
     task_class: str
     expected_json_schema: dict | None = None
-    max_output_tokens: int = 1024
 
 
 class Citation(DTO):

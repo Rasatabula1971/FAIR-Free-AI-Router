@@ -668,6 +668,7 @@ class FAIR:
         source_policy: dict | None = None,
         cross_check_required: bool | None = None,
         max_output_tokens: int = 1024,
+        min_output_tokens: int | None = None,
         client_id: str | None = None,
         priority: str = "P2",
         cache_mode: str = "default",
@@ -703,6 +704,7 @@ class FAIR:
                     cross_check_required if cross_check_required is not None else self._cross_check
                 ),
                 "max_output_tokens": max_output_tokens,
+                "min_output_tokens": min_output_tokens,
                 "priority": priority,
                 "cache_mode": cache_mode,
             }
