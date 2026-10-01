@@ -19,6 +19,7 @@ from fair.providers.base import (
     MalformedResponse,
     ProviderUnavailable,
     RequestNotSupported,
+    StructuredOutputRejected,
 )
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
@@ -873,6 +874,49 @@ class TestEmbeddedRouter:
         assert result.status == "ESCALATION_REQUIRED"
         assert result.reason_code == "NO_ELIGIBLE_FREE_MODELS"
         assert result.attempts == []
+
+    @pytest.mark.asyncio
+    async def test_a_schema_rejection_is_a_quality_failure_not_an_outage(self):
+        router = _router(
+            entries=[
+                (
+                    _spec("a"),
+                    MockAdapter(
+                        "a", error=StructuredOutputRejected("PROVIDER_REJECTED_GENERATED_SCHEMA")
+                    ),
+                )
+            ],
+            cooldown_seconds=1,
+        )
+        result = await router.solve(_request(task="anything"))
+        attempt = result.attempts[0]
+        assert attempt.disposition == "QUALITY_FAILURE"
+        assert attempt.error_type == "PROVIDER_SCHEMA_VALIDATION_FAILED"
+        assert result.reason_code == "ALL_FREE_MODELS_FAILED_QUALITY"
+        # The provider is not implicated: no failure recorded, circuit left closed.
+        assert router.quota.state("a").failures == []
+        assert router.quota.effective_status(_spec("a")) == "ACTIVE"
+
+    @pytest.mark.asyncio
+    async def test_a_schema_rejection_spends_the_answer_budget(self):
+        """It is an answer, so it counts against max_attempts rather than against
+        the separate budget for models that never answered."""
+        router = _router(
+            entries=[
+                (
+                    _spec(name),
+                    MockAdapter(
+                        name, error=StructuredOutputRejected("PROVIDER_REJECTED_GENERATED_SCHEMA")
+                    ),
+                )
+                for name in ("a", "b", "c", "d")
+            ],
+            max_attempts=2,
+            cooldown_seconds=1,
+        )
+        result = await router.solve(_request(task="anything"))
+        assert len(result.attempts) == 2
+        assert {a.disposition for a in result.attempts} == {"QUALITY_FAILURE"}
 
     @pytest.mark.asyncio
     async def test_access_denied_is_not_treated_as_bad_credentials(self):

@@ -16,6 +16,7 @@ from fair.providers.base import (
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
+    StructuredOutputRejected,
 )
 from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
@@ -212,6 +213,25 @@ class TestErrorTranslation:
         with pytest.raises(type(error)) as caught:
             await _guard(_Echo(error=error)).health()
         assert str(caught.value) == expected
+        assert SECRET not in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_a_schema_rejection_keeps_its_own_type(self):
+        """It subclasses MalformedResponse, so re-raising it as the parent would drop
+        the fact the router classifies on and bill the provider again."""
+        error = StructuredOutputRejected("PROVIDER_REJECTED_GENERATED_SCHEMA")
+        with pytest.raises(StructuredOutputRejected) as caught:
+            await _guard(_Echo(error=error)).health()
+        assert str(caught.value) == "PROVIDER_REJECTED_GENERATED_SCHEMA"
+
+    @pytest.mark.asyncio
+    async def test_a_schema_rejection_never_carries_upstream_text(self):
+        """failed_generation is model output and an upstream message; neither may
+        reach an attempt record."""
+        error = StructuredOutputRejected(f"failed_generation for {SECRET}")
+        with pytest.raises(StructuredOutputRejected) as caught:
+            await _guard(_Echo(error=error)).health()
+        assert str(caught.value) == "PROVIDER_REJECTED_GENERATED_SCHEMA"
         assert SECRET not in str(caught.value)
 
     @pytest.mark.asyncio

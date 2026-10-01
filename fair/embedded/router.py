@@ -18,6 +18,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    StructuredOutputRejected,
 )
 from fair.quality.consensus import compare, independent
 from fair.quality.engine import acceptable, evaluate
@@ -161,6 +162,13 @@ class EmbeddedRouter:
             self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
             error_detail = _failure_detail(error)
+        except StructuredOutputRejected as error:
+            # The provider's schema validator refused the model's JSON. That is what
+            # the quality engine reports as SCHEMA_FAILURE, not evidence the provider
+            # is down, so provider health is left alone and the attempt counts as an
+            # answer: the model answered, and the answer was the wrong shape.
+            disposition, error_type = "QUALITY_FAILURE", "PROVIDER_SCHEMA_VALIDATION_FAILED"
+            error_detail = _failure_detail(error)
         except RequestNotSupported as error:
             disposition, error_type = "CAPABILITY_MISMATCH", "REQUEST_NOT_SUPPORTED_BY_ROUTE"
             error_detail = _failure_detail(error)
@@ -297,7 +305,13 @@ class EmbeddedRouter:
             if failed:
                 report.state = "SERVICE_FAILED"
                 break
-            if attempt.disposition in {"INFRA_FAILURE", "QUOTA_FAILURE", "CAPABILITY_MISMATCH"}:
+            # A verifier that produced no text cannot be compared with the primary
+            # answer, whatever its disposition says about why.
+            if response is None or attempt.disposition in {
+                "INFRA_FAILURE",
+                "QUOTA_FAILURE",
+                "CAPABILITY_MISMATCH",
+            }:
                 continue
             try:
                 agreement, basis = compare(
