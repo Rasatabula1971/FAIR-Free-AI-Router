@@ -662,9 +662,12 @@ class TextAdapter:
             raise ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE_OR_PRICING_CHANGED")
         ceiling = self.settings.max_output_tokens_ceiling
         limit = min(model.max_output_tokens or ceiling, ceiling)
-        if not 1 <= request.max_output_tokens <= limit:
+        # Asked for what this route can give, not refused for what it cannot. Only
+        # a ceiling under the request's floor means this route cannot do the work.
+        budget = request.output_budget(limit)
+        if budget is None:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
-        if estimated_tokens(request.task) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(request.task) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         schema, note = self._schema_for_transport(request)
         streaming = self.supports_streaming
@@ -672,7 +675,7 @@ class TextAdapter:
             "model": model.model_id,
             "messages": [{"role": "user", "content": self._task_text(request, note)}],
             "stream": streaming,
-            self.output_tokens_key: request.max_output_tokens,
+            self.output_tokens_key: budget,
         }
         payload.update(copy.deepcopy(self.extra_payload))
         if schema is not None:
@@ -681,7 +684,7 @@ class TextAdapter:
                 "json_schema": {"name": "fair_result", "strict": True, "schema": schema},
             }
         await self._before_completion(payload)
-        if estimated_tokens(json.dumps(payload)) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         timeout = self._completion_timeout(request, streaming)
         data = (
@@ -1236,14 +1239,15 @@ class GeminiAdapter(TextAdapter):
         )
         if model is None:
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_REQUIRED")
-        if not 1 <= request.max_output_tokens <= self.settings.gemini_max_output_tokens:
+        budget = request.output_budget(self.settings.gemini_max_output_tokens)
+        if budget is None:
             raise RequestNotSupported("OUTPUT_BUDGET_INVALID")
         schema, note = self._schema_for_transport(request)
         payload = {
             "contents": [{"role": "user", "parts": [{"text": self._task_text(request, note)}]}],
             "generationConfig": {
                 "candidateCount": 1,
-                "maxOutputTokens": request.max_output_tokens,
+                "maxOutputTokens": budget,
             },
         }
         if schema is not None:
@@ -1257,8 +1261,15 @@ class GeminiAdapter(TextAdapter):
         metadata = await self._metadata(model)
         if metadata is None:
             raise ModelUnavailable("REVIEWED_GEMINI_MODEL_UNAVAILABLE_OR_CHANGED")
-        if request.max_output_tokens > metadata["outputTokenLimit"]:
+        # The published limit can be tighter than the configured ceiling, so the
+        # budget is resolved again against it once the metadata is known.
+        published = request.output_budget(
+            min(self.settings.gemini_max_output_tokens, metadata["outputTokenLimit"])
+        )
+        if published is None:
             raise RequestNotSupported("OUTPUT_BUDGET_EXCEEDS_MODEL_LIMIT")
+        if published != budget:
+            payload["generationConfig"]["maxOutputTokens"] = published
         streaming = self.supports_streaming
         timeout = self._completion_timeout(request, streaming)
         if streaming:
@@ -1379,27 +1390,25 @@ class OllamaLocalAdapter(TextAdapter):
         context = metadata.get(str(metadata.get("general.architecture")) + ".context_length")
         if type(context) is not int or context < model.context_window:
             raise AuthenticationFailed("LOCAL_CONTEXT_CAPACITY_NOT_CONFIRMED")
-        if (
-            not 1
-            <= request.max_output_tokens
-            <= min(
+        budget = request.output_budget(
+            min(
                 model.max_output_tokens or self.settings.max_output_tokens_ceiling,
                 self.settings.max_output_tokens_ceiling,
             )
-            or estimated_tokens(request.task) + request.max_output_tokens > model.context_window
-        ):
+        )
+        if budget is None or estimated_tokens(request.task) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_OR_OUTPUT_BUDGET_EXCEEDED")
         schema, note = self._schema_for_transport(request)
         payload = {
             "model": model.model_id,
             "stream": False,
             "messages": [{"role": "user", "content": self._task_text(request, note)}],
-            "options": {"num_predict": request.max_output_tokens, "num_ctx": model.context_window},
+            "options": {"num_predict": budget, "num_ctx": model.context_window},
             "keep_alive": 0,
         }
         if schema is not None:
             payload["format"] = schema
-        if estimated_tokens(json.dumps(payload)) + request.max_output_tokens > model.context_window:
+        if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
         data = await self._json("POST", "/api/chat", payload)
         try:
