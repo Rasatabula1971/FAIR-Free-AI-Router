@@ -17,7 +17,10 @@ from fair.providers.base import (
     AuthenticationFailed,
     BillingViolation,
     MalformedResponse,
+    ModelUnavailable,
     ProviderUnavailable,
+    QuotaExceeded,
+    RateLimited,
     RequestNotSupported,
 )
 from fair.providers.mock import MockAdapter
@@ -1952,3 +1955,196 @@ class TestQuotaUnderConcurrency:
         assert state.circuit_state == "HALF_OPEN"
         governor._release_probe(state)
         assert state.circuit_state == "OPEN"
+
+
+class _Slow(MockAdapter):
+    """Blocks in complete() so a solve can be cancelled mid-attempt."""
+
+    async def complete(self, request):
+        await asyncio.sleep(10)
+        return await super().complete(request)
+
+
+class TestFailoverUnderInjectedFailures:
+    """Every way a provider can fail must reach the next one without poisoning it."""
+
+    FAILURES = [
+        ("pre_dispatch_budget", RequestNotSupported("OUTPUT_BUDGET_INVALID"), False),
+        ("delisted_model", ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE"), False),
+        ("denied_403", AccessDenied("PROVIDER_ACCESS_DENIED"), False),
+        ("unauthenticated_401", AuthenticationFailed("AUTHENTICATION_FAILED"), True),
+        ("throttled_429", RateLimited("RATE_LIMITED"), False),
+        ("quota_spent", QuotaExceeded("QUOTA_EXHAUSTED"), True),
+        ("upstream_5xx", ProviderUnavailable("HTTP_503"), False),
+        ("malformed_answer", MalformedResponse("INVALID_CHAT_COMPLETION"), False),
+        ("nonzero_cost", BillingViolation("COST_NOT_CONFIRMED"), True),
+    ]
+
+    async def _solve(self, error):
+        broken = _spec("broken", request_limit=50, request_limit_window="DAILY_UTC")
+        healthy = _spec("healthy", request_limit=50, request_limit_window="DAILY_UTC")
+        adapter = MockAdapter("healthy", text='{"items": [1]}')
+        router = _router(entries=[(broken, MockAdapter("broken", error=error)), (healthy, adapter)])
+        before = router.quota.remaining(healthy)
+        result = await router.solve(
+            _request(task="list items", expected_schema={"type": "object", "required": ["items"]})
+        )
+        return router, broken, healthy, adapter, result, before
+
+    @pytest.mark.parametrize(
+        ("label", "error", "_sidelined"), FAILURES, ids=[f[0] for f in FAILURES]
+    )
+    async def test_every_failure_reaches_the_next_provider(self, label, error, _sidelined):
+        _router_, _b, _h, adapter, result, _before = await self._solve(error)
+        assert adapter.calls == 1, label
+        assert result.status == "ACCEPTED", label
+
+    @pytest.mark.parametrize(
+        ("label", "error", "_sidelined"), FAILURES, ids=[f[0] for f in FAILURES]
+    )
+    async def test_one_provider_failing_never_charges_another(self, label, error, _sidelined):
+        router, _b, healthy, _a, _r, before = await self._solve(error)
+        assert before - router.quota.remaining(healthy) == 1, label
+
+    @pytest.mark.parametrize(
+        ("label", "error", "sidelined"), FAILURES, ids=[f[0] for f in FAILURES]
+    )
+    async def test_only_a_failure_about_the_account_sidelines_a_provider(
+        self, label, error, sidelined
+    ):
+        """A bad key, a spent quota and an unconfirmed cost are the three that should."""
+        router, broken, _h, _a, _r, _before = await self._solve(error)
+        state = router.quota.state("broken")
+        assert (state.security_blocked or state.exhausted) is sidelined, label
+
+
+class TestQuotaIsNotSpentOnRequestsNeverSent:
+    """A reservation buys one request from a provider. If none was sent, it is owed back."""
+
+    async def _spent(self, error):
+        spec = _spec("p", request_limit=50, request_limit_window="DAILY_UTC")
+        router = _router(entries=[(spec, MockAdapter("p", error=error))])
+        before = router.quota.remaining(spec)
+        await router.solve(_request(task="t"))
+        return before - router.quota.remaining(spec)
+
+    async def test_a_budget_fair_refused_before_dispatch_costs_nothing(self):
+        assert await self._spent(RequestNotSupported("OUTPUT_BUDGET_INVALID")) == 0
+
+    async def test_a_model_delisted_upstream_costs_nothing(self):
+        """Otherwise a model gone from the catalog spends a free request every solve."""
+        assert await self._spent(ModelUnavailable("REVIEWED_MODEL_UNAVAILABLE")) == 0
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            AccessDenied("PROVIDER_ACCESS_DENIED"),
+            ProviderUnavailable("HTTP_503"),
+            MalformedResponse("INVALID_CHAT_COMPLETION"),
+        ],
+    )
+    async def test_a_provider_that_was_called_still_costs_a_request(self, error):
+        """It answered, however badly; the provider counted it and so must FAIR."""
+        assert await self._spent(error) == 1
+
+    async def test_a_refund_cannot_drive_a_count_below_zero(self):
+        governor = MemoryQuotaGovernor(RoutingSettings())
+        spec = _spec("p", request_limit=50, request_limit_window="DAILY_UTC")
+        for _ in range(5):
+            governor.release(spec)
+        assert governor.state("p").used == 0
+
+    async def test_repeated_pre_dispatch_refusals_do_not_drain_a_quota(self):
+        spec = _spec("p", request_limit=3, request_limit_window="DAILY_UTC")
+        router = _router(
+            entries=[(spec, MockAdapter("p", error=RequestNotSupported("OUTPUT_BUDGET_INVALID")))]
+        )
+        for _ in range(10):
+            await router.solve(_request(task="t"))
+        assert router.quota.remaining(spec) == 3
+
+
+class TestCancellationLeavesNoResidue:
+    """Cancelling says nothing about a provider, so it must cost the provider nothing."""
+
+    async def _cancel(self, router):
+        task = asyncio.create_task(router.solve(_request(task="t")))
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_cancelling_never_opens_a_circuit(self):
+        spec = _spec("p")
+        router = _router(entries=[(spec, _Slow("p"))], circuit_failures=2, cooldown_seconds=60)
+        for _ in range(6):
+            await self._cancel(router)
+        state = router.quota.state("p")
+        assert state.circuit_state == "CLOSED"
+        assert not state.security_blocked and not state.exhausted
+        assert router.quota.available(spec)
+
+    async def test_a_cancelled_probe_does_not_sideline_a_provider(self):
+        """A claimed probe left held costs the probe window and a fresh cooldown on top."""
+        settings = dict(circuit_failures=2, cooldown_seconds=360)
+        spec = _spec("p")
+        router = _router(entries=[(spec, _Slow("p"))], **settings)
+        for _ in range(settings["circuit_failures"]):
+            router.quota.failure("p")
+        router.quota._state("p").blocked_until = 0
+        await self._cancel(router)
+        assert router.quota.state("p").circuit_state == "OPEN"
+        assert router.quota.available(spec) is True
+
+    async def test_a_cancelled_request_still_counts_against_quota(self):
+        """It may have been torn down in flight; over-counting is the safe direction."""
+        spec = _spec("p", request_limit=50, request_limit_window="DAILY_UTC")
+        router = _router(entries=[(spec, _Slow("p"))])
+        before = router.quota.remaining(spec)
+        await self._cancel(router)
+        assert before - router.quota.remaining(spec) == 1
+
+
+class TestSharedLedgerRelease:
+    """Several FAIR processes share this counter, so a refund has to be transactional."""
+
+    def _ledger(self, tmp_path):
+        from fair.embedded.quota import SharedQuotaLedger
+
+        return SharedQuotaLedger(str(tmp_path / "quota.sqlite3"))
+
+    def test_a_release_gives_the_request_back(self, tmp_path):
+        ledger, now = self._ledger(tmp_path), 1_000_000.0
+        for _ in range(3):
+            ledger.reserve("pool", "app", 10, "DAILY_UTC", now)
+        assert ledger.remaining("pool", 10, now) == 7
+        ledger.release("pool", "app", now)
+        assert ledger.remaining("pool", 10, now) == 8
+
+    def test_releases_cannot_manufacture_requests(self, tmp_path):
+        """A window reset between reserve and release would otherwise go negative."""
+        ledger, now = self._ledger(tmp_path), 1_000_000.0
+        ledger.reserve("pool", "app", 10, "DAILY_UTC", now)
+        for _ in range(20):
+            ledger.release("pool", "app", now)
+        assert ledger.remaining("pool", 10, now) == 10
+        assert ledger.report(["pool"], now)[0]["used"] == 0
+
+    def test_per_application_usage_is_given_back_too(self, tmp_path):
+        ledger, now = self._ledger(tmp_path), 1_000_000.0
+        ledger.reserve("pool", "one", 10, "DAILY_UTC", now)
+        ledger.reserve("pool", "two", 10, "DAILY_UTC", now)
+        ledger.release("pool", "one", now)
+        applications = ledger.report(["pool"], now)[0]["applications"]
+        assert applications == {"one": 0, "two": 1}
+
+    async def test_the_governor_refunds_through_the_ledger(self, tmp_path):
+        from fair.embedded.quota import SharedQuotaLedger
+
+        ledger = SharedQuotaLedger(str(tmp_path / "quota.sqlite3"))
+        governor = MemoryQuotaGovernor(RoutingSettings(), shared_ledger=ledger)
+        spec = _spec("p", request_limit=10, request_limit_window="DAILY_UTC")
+        assert await governor.reserve_async(spec, "app") is True
+        assert governor.remaining(spec) == 9
+        await governor.release_async(spec, "app")
+        assert governor.remaining(spec) == 10

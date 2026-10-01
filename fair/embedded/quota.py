@@ -139,6 +139,31 @@ class SharedQuotaLedger:
             )
             return True
 
+    def release(self, pool_id, application_id, now):
+        """Give back a reservation whose request never reached the provider.
+
+        Floored at zero on both counters: a window reset between the reserve and
+        the release would otherwise drive a count negative and hand out free
+        requests, which is the one error this ledger exists to prevent.
+        """
+        pool_id = _identity(pool_id, "quota pool id", 256)
+        application_id = _identity(application_id, "application id")
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            used, _exhausted, reset_at = self._recover(database, pool_id, now)
+            database.execute(
+                "UPDATE quota_pool_state SET used = ? WHERE pool_id = ?",
+                (max(used - 1, 0), pool_id),
+            )
+            database.execute(
+                """
+                UPDATE quota_application_usage SET used = MAX(used - 1, 0)
+                WHERE pool_id = ? AND application_id = ?
+                """,
+                (pool_id, application_id),
+            )
+            return True
+
     def observe(self, pool_id, observed_limit, remaining, reset_at, now):
         pool_id = _identity(pool_id, "quota pool id", 256)
         if remaining is None or observed_limit is None or remaining > observed_limit:
@@ -391,6 +416,51 @@ class MemoryQuotaGovernor:
             ):
                 state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
         return True
+
+    def release(self, spec, application_id=None, *, refund=True):
+        """Undo what a reservation claimed when no request reached the provider.
+
+        Two things are given back, and they are separable because FAIR is certain
+        of one more often than the other. The half-open probe is always released:
+        it was claimed to test a provider, and an attempt that never called one
+        tested nothing, so leaving it held sidelines a healthy provider for the
+        probe window and then a fresh cooldown on top.
+
+        The request itself is refunded only when FAIR raised the failure before
+        dispatch and so knows the provider was never asked. Where that is
+        uncertain -- a cancellation, which may have been torn down with the
+        request already in flight -- the count stands. Over-counting costs a free
+        request; under-counting exceeds a free tier, which is the thing this
+        governor exists to prevent.
+        """
+        state = self._state(spec.provider_id)
+        self._release_probe(state)
+        if not refund:
+            return
+        if self.shared_ledger is not None:
+            self._ledger(
+                self.shared_ledger.release,
+                self.pool_id(spec.provider_id),
+                application_id or self.application_id,
+                self.clock(),
+                failed=None,
+            )
+        state.used = max(state.used - 1, 0)
+
+    async def release_async(self, spec, application_id=None, *, refund=True):
+        state = self._state(spec.provider_id)
+        self._release_probe(state)
+        if not refund:
+            return
+        if self.shared_ledger is not None:
+            await self._ledger_async(
+                self.shared_ledger.release,
+                self.pool_id(spec.provider_id),
+                application_id or self.application_id,
+                self.clock(),
+                failed=None,
+            )
+        state.used = max(state.used - 1, 0)
 
     def _claim_probe(self, state):
         if state.circuit_state != "OPEN":
