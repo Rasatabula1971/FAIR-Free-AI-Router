@@ -2156,7 +2156,9 @@ class TestCancellationLeavesNoResidue:
         await asyncio.sleep(0.02)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await task
+            # wait_for, not a bare await: a cancellation that never lands fails
+            # the test instead of hanging it.
+            await asyncio.wait_for(task, timeout=5)
 
     async def test_cancelling_never_opens_a_circuit(self):
         spec = _spec("p")
