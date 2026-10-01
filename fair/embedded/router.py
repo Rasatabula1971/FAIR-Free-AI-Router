@@ -13,6 +13,7 @@ from fair.providers.base import (
     AccessDenied,
     AuthenticationFailed,
     BillingViolation,
+    MalformedResponse,
     ModelUnavailable,
     ProviderError,
     QuotaExceeded,
@@ -48,6 +49,28 @@ def _returnable_unverified(request, attempt):
         "BLOCKED",
         "SERVICE_FAILED",
     }
+
+
+# A provider's own misbehaviour always arrives as a ProviderError: the adapters
+# turn a bad status, a malformed body and a refused schema into one, and convert
+# the KeyError/TypeError/ValueError/AttributeError that parsing a provider's JSON
+# can raise into MalformedResponse (see fair.providers.live). So one of these
+# reaching the router unwrapped is a defect in FAIR, not evidence about the
+# provider, and calling it PROVIDER_UNAVAILABLE did real damage twice over: it
+# opened the circuit breaker on a healthy provider, and it hid the bug. A missing
+# asyncio import in this repo's own tests read as an infrastructure outage for
+# exactly this reason.
+_DEFECTS = (
+    AssertionError,
+    AttributeError,
+    ImportError,
+    IndexError,
+    KeyError,
+    NameError,
+    NotImplementedError,
+    TypeError,
+    ZeroDivisionError,
+)
 
 
 def _failure_detail(error):
@@ -144,7 +167,7 @@ class EmbeddedRouter:
                 timeout=self.settings.attempt_deadline(request.max_output_tokens),
             )
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
-                raise ValueError("Response identity mismatch")
+                raise MalformedResponse("PROVIDER_IDENTITY_MISMATCH")
             if response.quota is not None:
                 await self.quota.observe_async(spec, response.quota)
             self.quota.success(spec.provider_id)
@@ -202,6 +225,13 @@ class EmbeddedRouter:
             self.quota.release(spec, request.client_id, refund=False)
             cancelled = True
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
+        except _DEFECTS as error:
+            # FAIR's own bug. Provider health is left strictly alone -- there is no
+            # evidence here about the provider -- but routing still moves on, since
+            # one broken route must not end a solve. The attempt says whose fault it
+            # was, which is the part that used to be missing.
+            disposition, error_type = "INFRA_FAILURE", "ROUTER_INTERNAL_DEFECT"
+            error_detail = _failure_detail(error)
         except Exception as error:
             self.quota.failure(spec.provider_id)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
@@ -215,10 +245,13 @@ class EmbeddedRouter:
                 cancelled = True
                 quality = None
                 error_type = "REQUEST_CANCELLED"
-            except Exception:
+            except Exception as error:
                 quality = None
                 validator_failed = True
                 error_type = "VALIDATION_SERVICE_FAILED"
+                # Without this the attempt recorded that validation failed and
+                # nothing about how, which is the whole of the diagnosis.
+                error_detail = _failure_detail(error)
             if cancelled:
                 disposition = "CANCELLED"
             elif acceptable(quality, profile):
@@ -364,7 +397,8 @@ class EmbeddedRouter:
         unverified_accepted = False
         reason = "NO_ELIGIBLE_FREE_MODELS"
         accepted_response = accepted_quality = None
-        validator_failed = False
+        validator_failed = internal_failure = False
+        ledger_failures = self.quota.ledger_failures
         # Two budgets (see RoutingSettings): max_attempts counts answers the
         # quality gate judged; max_unanswered_attempts bounds the models that
         # never answered (down, slow, throttled). Counting the latter against
@@ -394,8 +428,15 @@ class EmbeddedRouter:
                 )
             except (BillingViolation, asyncio.CancelledError):
                 raise
-            except Exception:
-                validator_failed = True
+            except Exception as error:
+                # _attempt handles every provider failure itself, so an escape is
+                # FAIR's own -- a route with no registered adapter, a defect in the
+                # attempt machinery. Reported as VALIDATION_SERVICE_FAILED, it sent
+                # an operator to read the quality engine looking for a bug in the
+                # router, with no attempt logged to contradict them.
+                internal_failure = True
+                reason = "ROUTER_INTERNAL_ERROR"
+                self._emit(reason, {"error_detail": _failure_detail(error)})
                 break
             if attempt is None:
                 # The reservation lost a race with the governor (the provider
@@ -449,14 +490,23 @@ class EmbeddedRouter:
             accepted_response, accepted_quality = response, attempt.quality
             reason = "QUALITY_THRESHOLD_MET"
             break
-        if accepted_response is None and reason == "NO_ELIGIBLE_FREE_MODELS" and attempts:
+        if accepted_response is None and self.quota.ledger_failures > ledger_failures:
+            # The shared ledger could not be read, so the governor treated the pools
+            # as unavailable rather than dispatch a request it could not account for.
+            # That is the safe direction, but reported as NO_ELIGIBLE_FREE_MODELS or
+            # ALL_FREE_MODELS_UNAVAILABLE it sent an operator looking for a spent
+            # quota or a provider outage, when the free tiers were untouched and
+            # every provider was up: the SQLite file was busy or unreadable.
+            internal_failure = True
+            reason = "QUOTA_LEDGER_UNAVAILABLE"
+        elif accepted_response is None and reason == "NO_ELIGIBLE_FREE_MODELS" and attempts:
             if any(a.disposition == "UNVERIFIED" for a in attempts):
                 reason = "QUALITY_VERIFICATION_UNAVAILABLE"
             elif any(a.disposition == "QUALITY_FAILURE" for a in attempts):
                 reason = "ALL_FREE_MODELS_FAILED_QUALITY"
             else:
                 reason = "ALL_FREE_MODELS_UNAVAILABLE"
-        if validator_failed:
+        if validator_failed and not internal_failure:
             reason = "VALIDATION_SERVICE_FAILED"
         scored = [
             a.quality.overall_score
@@ -472,7 +522,7 @@ class EmbeddedRouter:
         result = SolveResponse(
             request_id=request_id,
             status="FAILED"
-            if validator_failed
+            if validator_failed or internal_failure
             else "ACCEPTED_UNVERIFIED"
             if unverified_accepted
             else "ACCEPTED"

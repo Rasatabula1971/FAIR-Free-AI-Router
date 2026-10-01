@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import sqlite3
+import threading
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import isfinite
@@ -34,6 +36,25 @@ def _identity(value, label, maximum=128):
     return value.strip()
 
 
+def _ledger_failure(error):
+    """A fixed code for a SQLite failure, since its message can name the path."""
+    if isinstance(error, sqlite3.OperationalError) and "locked" in str(error):
+        return "LEDGER_LOCKED"
+    return "LEDGER_UNAVAILABLE"
+
+
+class QuotaLedgerUnavailable(Exception):
+    """The shared ledger could not be read or written.
+
+    FAIR then cannot know whether a free request is still available, and the
+    two ways of guessing are not symmetrical: guessing low wastes a free
+    request, guessing high exceeds a free tier, which is the one outcome this
+    ledger exists to prevent. So routing stops and says which it was, rather
+    than proceeding on an assumption. Carries a fixed code, never SQLite's
+    message, which can name the database path.
+    """
+
+
 class SharedQuotaLedger:
     """SQLite-backed request accounting shared by independent FAIR processes.
 
@@ -45,7 +66,7 @@ class SharedQuotaLedger:
     def __init__(self, path):
         self.path = str(Path(path).expanduser().resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as database:
+        with closing(self._connect()) as database, database:
             database.execute("PRAGMA journal_mode=WAL")
             database.execute(
                 """
@@ -76,6 +97,34 @@ class SharedQuotaLedger:
         database.execute("PRAGMA foreign_keys=ON")
         return database
 
+    @contextmanager
+    def _write(self):
+        """One immediate transaction, on a connection that is then closed.
+
+        `with sqlite3.connect(...)` commits or rolls back; it does not close.
+        Every ledger call leaked its connection -- and under WAL a reader
+        pinning the file -- until the garbage collector happened to run, so a
+        long-lived process accumulated one open handle per solve.
+
+        Contention is reported, not swallowed: BEGIN IMMEDIATE takes the write
+        lock up front, so a second process gets `database is locked` once
+        busy_timeout expires. That is a real answer about the ledger, and
+        distinguishable from a defect, which is what it used to look like.
+        """
+        database = self._connect()
+        try:
+            database.execute("BEGIN IMMEDIATE")
+            yield database
+            database.commit()
+        except sqlite3.Error as error:
+            database.rollback()
+            raise QuotaLedgerUnavailable(_ledger_failure(error)) from None
+        except BaseException:
+            database.rollback()
+            raise
+        finally:
+            database.close()
+
     def _recover(self, database, pool_id, now):
         row = database.execute(
             "SELECT used, exhausted, reset_at FROM quota_pool_state WHERE pool_id = ?",
@@ -102,23 +151,20 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if limit is None:
             return None
-        with self._connect() as database:
-            database.execute("BEGIN IMMEDIATE")
+        with self._write() as database:
             used, _, _ = self._recover(database, pool_id, now)
             return max(0, limit - used)
 
     def available(self, pool_id, limit, now):
         pool_id = _identity(pool_id, "quota pool id", 256)
-        with self._connect() as database:
-            database.execute("BEGIN IMMEDIATE")
+        with self._write() as database:
             used, exhausted, _ = self._recover(database, pool_id, now)
             return not exhausted and (limit is None or used < limit)
 
     def reserve(self, pool_id, application_id, limit, window, now):
         pool_id = _identity(pool_id, "quota pool id", 256)
         application_id = _identity(application_id, "application id")
-        with self._connect() as database:
-            database.execute("BEGIN IMMEDIATE")
+        with self._write() as database:
             used, exhausted, reset_at = self._recover(database, pool_id, now)
             if exhausted or (limit is not None and used >= limit):
                 return False
@@ -148,8 +194,7 @@ class SharedQuotaLedger:
         """
         pool_id = _identity(pool_id, "quota pool id", 256)
         application_id = _identity(application_id, "application id")
-        with self._connect() as database:
-            database.execute("BEGIN IMMEDIATE")
+        with self._write() as database:
             used, _exhausted, reset_at = self._recover(database, pool_id, now)
             database.execute(
                 "UPDATE quota_pool_state SET used = ? WHERE pool_id = ?",
@@ -168,8 +213,7 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if remaining is None or observed_limit is None or remaining > observed_limit:
             return
-        with self._connect() as database:
-            database.execute("BEGIN IMMEDIATE")
+        with self._write() as database:
             used, _, current_reset = self._recover(database, pool_id, now)
             used = max(used, observed_limit - remaining)
             if reset_at is not None and now < reset_at <= now + 86400:
@@ -189,8 +233,7 @@ class SharedQuotaLedger:
         pool_id = _identity(pool_id, "quota pool id", 256)
         if reset_at is None or not isfinite(reset_at) or reset_at <= now:
             return
-        with self._connect() as database:
-            database.execute("BEGIN IMMEDIATE")
+        with self._write() as database:
             self._recover(database, pool_id, now)
             database.execute(
                 "UPDATE quota_pool_state SET exhausted = 1, reset_at = ? WHERE pool_id = ?",
@@ -199,8 +242,7 @@ class SharedQuotaLedger:
 
     def report(self, pool_ids, now):
         pool_ids = sorted({_identity(value, "quota pool id", 256) for value in pool_ids})
-        with self._connect() as database:
-            database.execute("BEGIN IMMEDIATE")
+        with self._write() as database:
             for pool_id in pool_ids:
                 self._recover(database, pool_id, now)
             rows = database.execute(
@@ -259,6 +301,10 @@ class MemoryQuotaGovernor:
             _identity(provider_id, "provider id")
             _identity(pool_id, "quota pool id", 256)
         self._states: dict[str, QuotaState] = {}
+        # Monotonic count of ledger operations that failed. Read before and
+        # after a solve to tell a busy ledger from an exhausted quota.
+        self.ledger_failures = 0
+        self._failure_lock = threading.Lock()
 
     def pool_id(self, provider_id):
         return self.quota_pool_ids.get(provider_id, provider_id)
@@ -285,11 +331,26 @@ class MemoryQuotaGovernor:
         return self._state(provider_id)
 
     def _ledger(self, operation, *args, failed):
-        """Run a ledger operation fail-closed; never leak sqlite errors to callers."""
+        """Run a ledger operation fail-closed; never leak sqlite errors to callers.
+
+        Treating an unreadable ledger as an unavailable pool is the right
+        direction -- the alternative is dispatching a request FAIR cannot
+        account for -- but it is indistinguishable from a spent quota to
+        everything upstream. So the failure is counted as well as logged, and
+        the router reads that count rather than reporting a busy ledger as
+        though no free model had been eligible.
+        """
         try:
             return operation(*args)
-        except sqlite3.Error:
-            logger.warning("Shared quota ledger unavailable; treating pool as unavailable")
+        except (QuotaLedgerUnavailable, sqlite3.Error) as error:
+            code = (
+                str(error) if isinstance(error, QuotaLedgerUnavailable) else _ledger_failure(error)
+            )
+            with self._failure_lock:
+                self.ledger_failures += 1
+            logger.warning(
+                "Shared quota ledger unavailable (%s); treating pool as unavailable", code
+            )
             return failed
 
     async def _ledger_async(self, operation, *args, failed):

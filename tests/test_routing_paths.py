@@ -7,6 +7,8 @@ qualification.py 83%.
 """
 
 import asyncio
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -14,7 +16,7 @@ from pydantic import ValidationError
 
 from fair.config import RoutingSettings
 from fair.embedded.performance import MemoryPerformanceRegistry
-from fair.embedded.quota import MemoryQuotaGovernor
+from fair.embedded.quota import MemoryQuotaGovernor, SharedQuotaLedger
 from fair.embedded.router import EmbeddedRouter, _failure_detail
 from fair.embedded.selector import MemorySelector
 from fair.governor.qualification import qualified
@@ -550,3 +552,180 @@ class TestQualified:
     def test_a_review_dated_in_the_future_is_unqualified(self):
         spec = _spec(access_class="FREE_RECURRING", qualification=_qualification())
         assert not qualified(spec, NOW - timedelta(days=2))
+
+
+# ── Whose fault was it ───────────────────────────────────────────────────
+
+
+class TestAFaultIsAttributedToWhoeverOwnsIt:
+    """A bug in FAIR must not be recorded as a provider being down."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "defect",
+        [
+            AttributeError("'NoneType' object has no attribute 'text'"),
+            NameError("name 'asyncio' is not defined"),
+            TypeError("unsupported operand type"),
+            KeyError("provider_id"),
+        ],
+    )
+    async def test_fairs_own_defect_is_named_as_one(self, defect):
+        router = _router(entries=[(_spec(), MockAdapter("a", error=defect))])
+        result = await router.solve(_request())
+        assert result.attempts[0].error_type == "ROUTER_INTERNAL_DEFECT"
+        assert result.attempts[0].error_detail == type(defect).__name__
+
+    @pytest.mark.asyncio
+    async def test_fairs_own_defect_does_not_open_a_providers_circuit(self):
+        """The provider never misbehaved; a bug here must not take it offline."""
+        spec = _spec()
+        router = _router(
+            entries=[(spec, MockAdapter("a", error=AttributeError("boom")))],
+            circuit_failures=1,
+            cooldown_seconds=600,
+        )
+        await router.solve(_request())
+        state = router.quota.state("a")
+        assert state.circuit_state == "CLOSED"
+        assert state.failures == []
+        assert router.quota.available(spec) is True
+
+    @pytest.mark.asyncio
+    async def test_a_provider_fault_still_counts_against_the_provider(self):
+        """The contrast: an unrecognised error is the provider's until shown otherwise."""
+        spec = _spec()
+        router = _router(
+            entries=[(spec, MockAdapter("a", error=RuntimeError("connection reset")))],
+            circuit_failures=1,
+            cooldown_seconds=600,
+        )
+        result = await router.solve(_request())
+        assert result.attempts[0].error_type == "PROVIDER_UNAVAILABLE"
+        assert router.quota.state("a").circuit_state == "OPEN"
+
+    @pytest.mark.asyncio
+    async def test_a_provider_answering_for_another_model_gets_a_code(self):
+        class Impostor(MockAdapter):
+            async def complete(self, request):
+                response = await super().complete(request)
+                return response.model_copy(update={"model_id": "other"})
+
+        router = _router(entries=[(_spec(), Impostor("a", text="345"))])
+        result = await router.solve(_request())
+        # Still the provider's fault, but "ValueError" said nothing about what
+        # it had done wrong.
+        assert result.attempts[0].error_type == "PROVIDER_UNAVAILABLE"
+        assert result.attempts[0].error_detail == "PROVIDER_IDENTITY_MISMATCH"
+
+    @pytest.mark.asyncio
+    async def test_a_validator_crash_records_what_crashed(self, monkeypatch):
+        def boom(*args, **kwargs):
+            raise RuntimeError("validator exploded")
+
+        monkeypatch.setattr("fair.embedded.router.evaluate", boom)
+        router = _router(entries=[(_spec(), MockAdapter("a", text="345"))])
+        result = await router.solve(_request())
+        assert result.attempts[0].error_type == "VALIDATION_SERVICE_FAILED"
+        # The attempt used to record that validation failed and nothing about how.
+        assert result.attempts[0].error_detail == "RuntimeError"
+
+    @pytest.mark.asyncio
+    async def test_an_escape_from_an_attempt_is_not_a_validation_failure(self):
+        class Broken(MemoryQuotaGovernor):
+            async def reserve_async(self, spec, application_id=None):
+                raise RuntimeError("governor defect")
+
+        registry = Registry()
+        registry.register(_spec(), MockAdapter("a", text="345"))
+        router = EmbeddedRouter(
+            registry,
+            RoutingSettings(),
+            {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
+        )
+        router.quota.__class__ = Broken
+        result = await router.solve(_request())
+        assert result.status == "FAILED"
+        # It sent operators to read the quality engine looking for a router bug.
+        assert result.reason_code == "ROUTER_INTERNAL_ERROR"
+
+
+class _Impatient(SharedQuotaLedger):
+    """The real ledger with the wait removed, so contention is observed at once."""
+
+    def _connect(self):
+        database = sqlite3.connect(self.path, timeout=0)
+        database.execute("PRAGMA busy_timeout=0")
+        database.execute("PRAGMA foreign_keys=ON")
+        return database
+
+
+class TestABusyLedgerIsNotASpentQuota:
+    """Fail-closed is right; reporting it as an exhausted free tier is not."""
+
+    def _router_on(self, ledger):
+        registry = Registry()
+        registry.register(_spec(request_limit=50), MockAdapter("a", text="345"))
+        return EmbeddedRouter(
+            registry,
+            RoutingSettings(),
+            {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
+            quota_ledger=ledger,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_locked_ledger_is_reported_as_itself(self, tmp_path):
+        ledger = _Impatient(tmp_path / "quota.sqlite3")
+        router = self._router_on(ledger)
+        with closing(sqlite3.connect(ledger.path)) as holder:
+            holder.execute("BEGIN IMMEDIATE")
+            result = await router.solve(_request())
+        assert result.status == "FAILED"
+        assert result.reason_code == "QUOTA_LEDGER_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_a_locked_ledger_dispatches_nothing(self, tmp_path):
+        """FAIR cannot account for the request, so it must not make it."""
+        ledger = _Impatient(tmp_path / "quota.sqlite3")
+        registry = Registry()
+        adapter = MockAdapter("a", text="345")
+        registry.register(_spec(request_limit=50), adapter)
+        router = EmbeddedRouter(
+            registry,
+            RoutingSettings(),
+            {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
+            quota_ledger=ledger,
+        )
+        with closing(sqlite3.connect(ledger.path)) as holder:
+            holder.execute("BEGIN IMMEDIATE")
+            await router.solve(_request())
+        assert adapter.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_the_free_tier_is_untouched_by_the_refusal(self, tmp_path):
+        ledger = _Impatient(tmp_path / "quota.sqlite3")
+        router = self._router_on(ledger)
+        with closing(sqlite3.connect(ledger.path)) as holder:
+            holder.execute("BEGIN IMMEDIATE")
+            await router.solve(_request())
+        assert ledger.remaining("a", 50, 1_000.0) == 50
+
+    @pytest.mark.asyncio
+    async def test_a_working_ledger_still_reports_a_spent_quota_as_one(self, tmp_path):
+        """The contrast: an actually exhausted pool must not read as a broken ledger."""
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        registry = Registry()
+        registry.register(_spec(request_limit=1), MockAdapter("a", text="345"))
+        router = EmbeddedRouter(
+            registry,
+            RoutingSettings(),
+            {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
+            quota_ledger=ledger,
+        )
+        verifiable = dict(task="15*23", validation={"kind": "arithmetic", "expression": "15*23"})
+        first = await router.solve(_request(**verifiable))
+        assert first.status == "ACCEPTED"
+        result = await router.solve(_request(**verifiable, client_id="second"))
+        assert result.reason_code == "NO_ELIGIBLE_FREE_MODELS"
+        assert result.status == "ESCALATION_REQUIRED"
+        assert router.quota.ledger_failures == 0

@@ -1,6 +1,8 @@
 """Tests for the embedded FAIR module — no database, no server."""
 
 import asyncio
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -10,7 +12,12 @@ from fair.config import RoutingSettings
 from fair.embedded import FAIR, module
 from fair.embedded.module import _CLOUD_PROVIDERS
 from fair.embedded.performance import MemoryPerformanceRegistry
-from fair.embedded.quota import MemoryQuotaGovernor, SharedQuotaLedger, next_window_reset
+from fair.embedded.quota import (
+    MemoryQuotaGovernor,
+    QuotaLedgerUnavailable,
+    SharedQuotaLedger,
+    next_window_reset,
+)
 from fair.embedded.router import EmbeddedRouter
 from fair.providers.base import (
     AccessDenied,
@@ -2234,3 +2241,99 @@ class TestSharedLedgerRelease:
         assert governor.remaining(spec) == 9
         await governor.release_async(spec, "app")
         assert governor.remaining(spec) == 10
+
+
+# ── The shared ledger under contention ───────────────────────────────────
+
+
+def _is_open(database):
+    try:
+        database.execute("SELECT 1")
+    except sqlite3.ProgrammingError:
+        return False
+    return True
+
+
+class _Impatient(SharedQuotaLedger):
+    """The real ledger with the wait removed, so contention is observed at once."""
+
+    def _connect(self):
+        database = sqlite3.connect(self.path, timeout=0)
+        database.execute("PRAGMA busy_timeout=0")
+        database.execute("PRAGMA foreign_keys=ON")
+        return database
+
+
+class TestTheLedgerDoesNotLeakConnections:
+    """`with sqlite3.connect(...)` commits; it does not close."""
+
+    def test_every_call_closes_the_connection_it_opened(self, tmp_path, monkeypatch):
+        opened = []
+        real = sqlite3.connect
+
+        def tracked(*args, **kwargs):
+            database = real(*args, **kwargs)
+            opened.append(database)
+            return database
+
+        monkeypatch.setattr(sqlite3, "connect", tracked)
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        now = 1_000.0
+        ledger.reserve("pool", "app", 50, "DAILY_UTC", now)
+        ledger.remaining("pool", 50, now)
+        ledger.available("pool", 50, now)
+        ledger.release("pool", "app", now)
+        ledger.observe("pool", 50, 40, now + 60, now)
+        ledger.exhaust("pool", now + 60, now)
+        ledger.report(["pool"], now)
+        assert len(opened) >= 8
+        # A connection still open pins the WAL file; one per solve accumulated
+        # for the life of the process.
+        still_open = [database for database in opened if _is_open(database)]
+        assert still_open == []
+
+    def test_a_failed_call_closes_its_connection_too(self, tmp_path):
+        ledger = _Impatient(tmp_path / "quota.sqlite3")
+        ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0)
+        with closing(sqlite3.connect(ledger.path)) as holder:
+            holder.execute("BEGIN IMMEDIATE")
+            with pytest.raises(QuotaLedgerUnavailable):
+                ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0)
+        # The lock is gone, so the ledger is usable again -- which it would not be
+        # if the failed call had left its own transaction open.
+        assert ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0) is True
+
+
+class TestContentionIsReportedNotGuessed:
+    """A ledger that cannot be read is not the same as a quota that is spent."""
+
+    def test_a_locked_ledger_refuses_rather_than_answering(self, tmp_path):
+        ledger = _Impatient(tmp_path / "quota.sqlite3")
+        with closing(sqlite3.connect(ledger.path)) as holder:
+            holder.execute("BEGIN IMMEDIATE")
+            for call in (
+                lambda: ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0),
+                lambda: ledger.remaining("pool", 50, 1_000.0),
+                lambda: ledger.available("pool", 50, 1_000.0),
+                lambda: ledger.release("pool", "app", 1_000.0),
+            ):
+                with pytest.raises(QuotaLedgerUnavailable, match="LEDGER_LOCKED"):
+                    call()
+
+    def test_the_failure_code_never_carries_the_database_path(self, tmp_path):
+        ledger = _Impatient(tmp_path / "quota.sqlite3")
+        with closing(sqlite3.connect(ledger.path)) as holder:
+            holder.execute("BEGIN IMMEDIATE")
+            with pytest.raises(QuotaLedgerUnavailable) as caught:
+                ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0)
+        assert str(caught.value) == "LEDGER_LOCKED"
+        assert str(tmp_path) not in str(caught.value)
+
+    def test_a_reserve_that_could_not_be_recorded_is_not_counted(self, tmp_path):
+        """Failing closed: the refusal must not also spend the request."""
+        ledger = _Impatient(tmp_path / "quota.sqlite3")
+        with closing(sqlite3.connect(ledger.path)) as holder:
+            holder.execute("BEGIN IMMEDIATE")
+            with pytest.raises(QuotaLedgerUnavailable):
+                ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0)
+        assert ledger.remaining("pool", 50, 1_000.0) == 50
