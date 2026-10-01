@@ -2122,6 +2122,9 @@ class TestQuotaIsNotSpentOnRequestsNeverSent:
             AccessDenied("PROVIDER_ACCESS_DENIED"),
             ProviderUnavailable("HTTP_503"),
             MalformedResponse("INVALID_CHAT_COMPLETION"),
+            # The model generated and the provider's own validator refused the shape,
+            # which is an answer, not an unsent request.
+            StructuredOutputRejected("PROVIDER_SCHEMA_REJECTED"),
         ],
     )
     async def test_a_provider_that_was_called_still_costs_a_request(self, error):
