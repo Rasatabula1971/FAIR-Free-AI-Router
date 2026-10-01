@@ -15,6 +15,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    StructuredOutputRejected,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,13 @@ class CredentialedAdapter:
         except RequestNotSupported as error:
             code = _safe_code(error, "REQUEST_NOT_SUPPORTED")
             raise RequestNotSupported(code) from None
+        except StructuredOutputRejected as error:
+            # Must precede MalformedResponse: re-raised as its parent, the subclass
+            # the router classifies on is lost and a model's wrong-shaped JSON is
+            # charged to the provider again.
+            code = _safe_code(error, "PROVIDER_REJECTED_GENERATED_SCHEMA")
+            logger.info("Provider %s rejected a generated schema: %s", self.provider_id, code)
+            raise StructuredOutputRejected(code) from None
         except MalformedResponse as error:
             # FAIR's own adapters compose these codes; they distinguish a bad
             # envelope from an oversized body from a budget violation, which

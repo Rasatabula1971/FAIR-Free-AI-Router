@@ -45,6 +45,15 @@ class RequestNotSupported(MalformedResponse):
     """The request cannot use this route; provider health is not implicated."""
 
 
+class StructuredOutputRejected(MalformedResponse):
+    """A provider's own schema validator refused the model's generation.
+
+    The route works and the credential is good: the model wrote JSON that does not
+    match the schema it was sent, which is the finding fair.quality.engine reports
+    as SCHEMA_FAILURE. Provider health is not implicated.
+    """
+
+
 class ModelUnavailable(AuthenticationFailed):
     """A reviewed model is absent or changed; the provider credential is not implicated."""
 
