@@ -21,7 +21,7 @@ from fair.schemas.domain import (
     SourcePolicyReport,
     VerificationState,
 )
-from fair.schemas.schema_policy import find_regex_keyword
+from fair.schemas.schema_policy import REGEX_KEYWORDS, find_unbounded_keyword
 
 
 class SolveRequest(OutputBudget):
@@ -89,11 +89,19 @@ class SolveRequest(OutputBudget):
                 raise ValueError(
                     "Schema references and schemas over 20000 characters are unsupported"
                 )
-            keyword = find_regex_keyword(self.expected_schema)
+            keyword = find_unbounded_keyword(self.expected_schema)
             if keyword is not None:
+                why = (
+                    "regular-expression matching cannot be time-bounded"
+                    if keyword in REGEX_KEYWORDS
+                    # Annotation collection re-evaluates every subschema beneath
+                    # it, so nesting multiplies the work while the text does not:
+                    # 677 bytes of this took 10.4 seconds, on the event loop every
+                    # other client shares.
+                    else "its cost grows with nesting rather than with schema size"
+                )
                 raise ValueError(
-                    f"Schemas using '{keyword}' are unsupported: regular-expression "
-                    "matching cannot be time-bounded in the shared service"
+                    f"Schemas using '{keyword}' are unsupported: {why} in the shared service"
                 )
         return self
 
