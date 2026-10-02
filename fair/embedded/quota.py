@@ -166,13 +166,14 @@ class SharedQuotaLedger:
             database.execute("BEGIN IMMEDIATE")
             used, exhausted, reset_at = self._recover(database, pool_id, now)
             if exhausted or (limit is not None and used >= limit):
-                return False
+                return False, None
             if reset_at is None and limit is not None and window is not None:
                 reset_at = next_window_reset(window, now)
             database.execute(
                 "UPDATE quota_pool_state SET used = ?, reset_at = ? WHERE pool_id = ?",
                 (used + 1, reset_at, pool_id),
             )
+            granted_window = reset_at
             database.execute(
                 """
                 INSERT INTO quota_application_usage(pool_id, application_id, used)
@@ -182,20 +183,30 @@ class SharedQuotaLedger:
                 """,
                 (pool_id, application_id),
             )
-            return True
+            return True, granted_window
 
-    def release(self, pool_id, application_id, now):
+    def release(self, pool_id, application_id, now, window=None):
         """Give back a reservation whose request never reached the provider.
 
-        Floored at zero on both counters: a window reset between the reserve and
-        the release would otherwise drive a count negative and hand out free
-        requests, which is the one error this ledger exists to prevent.
+        Only while the reservation's own window is still current. ``window`` is
+        the reset this pool carried when the request was counted; if the pool has
+        rolled over since, that consumption was already cleared by the reset and
+        the counter now holds the *new* window's usage. Subtracting from it would
+        invent a free request the tier never gave, which is exactly the error
+        this ledger exists to prevent -- and flooring at zero does not catch it,
+        because the new window's count is positive.
+
+        A refund with no stamp is refused for the same reason: an unidentified
+        reservation cannot be shown to belong to the window it would be taken
+        from.
         """
         pool_id = _identity(pool_id, "quota pool id", 256)
         application_id = _identity(application_id, "application id")
         with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
             used, _exhausted, reset_at = self._recover(database, pool_id, now)
+            if reset_at != window:
+                return False
             database.execute(
                 "UPDATE quota_pool_state SET used = ? WHERE pool_id = ?",
                 (max(used - 1, 0), pool_id),
@@ -246,7 +257,13 @@ class SharedQuotaLedger:
             return
         with self._transaction() as database:
             database.execute("BEGIN IMMEDIATE")
-            self._recover(database, pool_id, now)
+            _used, exhausted, established = self._recover(database, pool_id, now)
+            if exhausted and established is not None:
+                # A second exhaustion report for a pool already known to be spent.
+                # Reports can arrive out of order, and the earlier reset is not
+                # news that the block ended sooner -- it is an older view of the
+                # same block. The later reset is the one that holds.
+                reset_at = max(reset_at, established)
             database.execute(
                 "UPDATE quota_pool_state SET exhausted = 1, reset_at = ? WHERE pool_id = ?",
                 (reset_at, pool_id),
@@ -279,6 +296,26 @@ class SharedQuotaLedger:
             for pool_id, used, exhausted, reset_at in rows
             if pool_id in selected
         ]
+
+
+@dataclass(frozen=True)
+class Reservation:
+    """What an attempt hands back to undo what its reservation claimed.
+
+    ``probe_token`` names the half-open slot the attempt owns, 0 for none.
+
+    The two window stamps are the accounting windows the request was counted
+    in, one per counter. A refund is applied only while its window is still
+    current: a reset clears the old window's consumption outright, so a refund
+    arriving afterwards would subtract from the *new* window and hand back a
+    request the free tier never spent. Over-counting costs one free request;
+    under-counting exceeds the tier, which is what this governor exists to
+    prevent.
+    """
+
+    probe_token: int = 0
+    local_window: float | None = None
+    pool_window: float | None = None
 
 
 @dataclass
@@ -448,20 +485,22 @@ class MemoryQuotaGovernor:
         """
         state = self._state(spec.provider_id)
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
-            return False, 0
+            return False, Reservation()
         token = self._claim_probe(state, probe_timeout)
+        pool_window = None
         if self.shared_ledger is not None:
-            if not self._ledger(
+            granted, pool_window = self._ledger(
                 self.shared_ledger.reserve,
                 self.pool_id(spec.provider_id),
                 application_id or self.application_id,
                 spec.request_limit,
                 spec.request_limit_window,
                 self.clock(),
-                failed=False,
-            ):
+                failed=(False, None),
+            )
+            if not granted:
                 self._release_probe(state, token)
-                return False, 0
+                return False, Reservation()
             state.used += 1
         else:
             state.used += 1
@@ -471,7 +510,7 @@ class MemoryQuotaGovernor:
                 and spec.request_limit_window is not None
             ):
                 state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
-        return True, token
+        return True, Reservation(token, state.reset_at, pool_window)
 
     async def reserve_async(self, spec, application_id=None, probe_timeout=None):
         return (await self.reserve_probe_async(spec, application_id, probe_timeout))[0]
@@ -479,22 +518,32 @@ class MemoryQuotaGovernor:
     async def reserve_probe_async(self, spec, application_id=None, probe_timeout=None):
         state = self._state(spec.provider_id)
         if not self._available_local(state, spec, include_limit=self.shared_ledger is None):
-            return False, 0
+            return False, Reservation()
         # Claim the half-open slot before awaiting SQLite. Otherwise several
         # concurrent coroutines can all observe OPEN and dispatch probe calls.
         token = self._claim_probe(state, probe_timeout)
+        pool_window = None
         if self.shared_ledger is not None:
-            if not await self._ledger_async(
-                self.shared_ledger.reserve,
-                self.pool_id(spec.provider_id),
-                application_id or self.application_id,
-                spec.request_limit,
-                spec.request_limit_window,
-                self.clock(),
-                failed=False,
-            ):
+            try:
+                granted, pool_window = await self._ledger_async(
+                    self.shared_ledger.reserve,
+                    self.pool_id(spec.provider_id),
+                    application_id or self.application_id,
+                    spec.request_limit,
+                    spec.request_limit_window,
+                    self.clock(),
+                    failed=(False, None),
+                )
+            except BaseException:
+                # Cancelled with the slot already claimed. The claim happened
+                # before this await precisely so concurrent callers cannot all
+                # probe, which means nothing downstream exists to give it back:
+                # the attempt this would have belonged to is never created.
                 self._release_probe(state, token)
-                return False, 0
+                raise
+            if not granted:
+                self._release_probe(state, token)
+                return False, Reservation()
             state.used += 1
         else:
             state.used += 1
@@ -504,18 +553,18 @@ class MemoryQuotaGovernor:
                 and spec.request_limit_window is not None
             ):
                 state.reset_at = next_window_reset(spec.request_limit_window, self.clock())
-        return True, token
+        return True, Reservation(token, state.reset_at, pool_window)
 
-    def release(self, spec, application_id=None, *, refund=True, probe_token=0):
+    def release(self, spec, application_id=None, *, refund=True, reservation=None):
         """Undo what a reservation claimed when no request reached the provider.
 
         Two things are given back, and they are separable because FAIR is certain
         of one more often than the other. The half-open probe is always released:
         it was claimed to test a provider, and an attempt that never called one
         tested nothing, so leaving it held sidelines a healthy provider for the
-        probe window and then a fresh cooldown on top. ``probe_token`` names which
-        probe this attempt owns; an attempt that owns none (0) releases nothing, and
-        a stale token cannot release a newer probe.
+        probe window and then a fresh cooldown on top. The reservation names which
+        probe this attempt owns; an attempt that owns none releases nothing, and a
+        stale handle cannot release a newer probe.
 
         The request itself is refunded only when FAIR raised the failure before
         dispatch and so knows the provider was never asked. Where that is
@@ -523,9 +572,14 @@ class MemoryQuotaGovernor:
         request already in flight -- the count stands. Over-counting costs a free
         request; under-counting exceeds a free tier, which is the thing this
         governor exists to prevent.
+
+        A refund is withheld once its window has rolled over, for the same
+        reason: the reset already cleared that consumption, so giving it back
+        again would be taken from the new window's allowance.
         """
+        held = reservation or Reservation()
         state = self._state(spec.provider_id)
-        self._release_probe(state, probe_token)
+        self._release_probe(state, held.probe_token)
         if not refund:
             return
         if self.shared_ledger is not None:
@@ -534,13 +588,16 @@ class MemoryQuotaGovernor:
                 self.pool_id(spec.provider_id),
                 application_id or self.application_id,
                 self.clock(),
+                held.pool_window,
                 failed=None,
             )
-        state.used = max(state.used - 1, 0)
+        if state.reset_at == held.local_window:
+            state.used = max(state.used - 1, 0)
 
-    async def release_async(self, spec, application_id=None, *, refund=True, probe_token=0):
+    async def release_async(self, spec, application_id=None, *, refund=True, reservation=None):
+        held = reservation or Reservation()
         state = self._state(spec.provider_id)
-        self._release_probe(state, probe_token)
+        self._release_probe(state, held.probe_token)
         if not refund:
             return
         if self.shared_ledger is not None:
@@ -549,9 +606,11 @@ class MemoryQuotaGovernor:
                 self.pool_id(spec.provider_id),
                 application_id or self.application_id,
                 self.clock(),
+                held.pool_window,
                 failed=None,
             )
-        state.used = max(state.used - 1, 0)
+        if state.reset_at == held.local_window:
+            state.used = max(state.used - 1, 0)
 
     def _claim_probe(self, state, probe_timeout=None):
         """Take the half-open slot; returns its ownership token, or 0 if not a probe."""
@@ -587,10 +646,15 @@ class MemoryQuotaGovernor:
         state.probe_token = 0
 
     def _stale_probe_outcome(self, state, probe_token):
-        """A completion from a probe that no longer owns the half-open slot."""
-        return bool(probe_token) and (
-            state.circuit_state == "HALF_OPEN" and state.probe_token != probe_token
-        )
+        """An outcome from an attempt that does not own the half-open slot.
+
+        Token 0 means the attempt is not a probe at all: an ordinary request that
+        was already in flight when the circuit opened. Its completion is evidence
+        about a call made before the outage, so letting it close the circuit
+        declares a provider recovered on the strength of a reply that predates
+        the probe -- and admits full traffic while the real probe is still out.
+        """
+        return state.circuit_state == "HALF_OPEN" and state.probe_token != probe_token
 
     def throttle(self, provider_id, retry_after=None):
         state = self._state(provider_id)
@@ -615,6 +679,10 @@ class MemoryQuotaGovernor:
         if remaining is None or observed_limit is None or remaining > observed_limit:
             return
         state = self._state(spec.provider_id)
+        # Whether the pool was *already* known spent before this report. A report
+        # that establishes the exhaustion is fresh news and sets its own reset; one
+        # arriving afterwards is a second opinion on a block FAIR already holds.
+        was_exhausted = state.exhausted
         if spec.request_limit is not None:
             state.used = max(state.used, spec.request_limit - min(remaining, spec.request_limit))
         if remaining == 0:
@@ -629,7 +697,21 @@ class MemoryQuotaGovernor:
             observation.reset_at is not None
             and self.clock() < observation.reset_at <= self.clock() + 86400
         ):
-            state.reset_at = observation.reset_at
+            if not was_exhausted or state.reset_at is None:
+                # The provider knows its own window better than FAIR's
+                # conservative guess, so a first report overrides it in either
+                # direction -- including sooner, which is how a tier that resets
+                # hourly stops being treated as daily.
+                state.reset_at = observation.reset_at
+            elif remaining == 0:
+                # A second exhaustion report for a block already held. Reports can
+                # arrive out of order, so an earlier reset is an older view of the
+                # same block, not news that it ends sooner.
+                state.reset_at = max(state.reset_at, observation.reset_at)
+            # A positive report during a known exhaustion is stale by
+            # construction: it describes the pool before it was spent. Letting it
+            # move the reset lets _recover clear the block early and send requests
+            # to a tier that has none left.
         if self.shared_ledger is not None:
             self._ledger(
                 self.shared_ledger.observe,
@@ -649,13 +731,31 @@ class MemoryQuotaGovernor:
         if remaining is None or observed_limit is None or remaining > observed_limit:
             return
         state = self._state(spec.provider_id)
+        # Whether the pool was *already* known spent before this report. A report
+        # that establishes the exhaustion is fresh news and sets its own reset; one
+        # arriving afterwards is a second opinion on a block FAIR already holds.
+        was_exhausted = state.exhausted
         if spec.request_limit is not None:
             state.used = max(state.used, spec.request_limit - min(remaining, spec.request_limit))
         if (
             observation.reset_at is not None
             and self.clock() < observation.reset_at <= self.clock() + 86400
         ):
-            state.reset_at = observation.reset_at
+            if not was_exhausted or state.reset_at is None:
+                # The provider knows its own window better than FAIR's
+                # conservative guess, so a first report overrides it in either
+                # direction -- including sooner, which is how a tier that resets
+                # hourly stops being treated as daily.
+                state.reset_at = observation.reset_at
+            elif remaining == 0:
+                # A second exhaustion report for a block already held. Reports can
+                # arrive out of order, so an earlier reset is an older view of the
+                # same block, not news that it ends sooner.
+                state.reset_at = max(state.reset_at, observation.reset_at)
+            # A positive report during a known exhaustion is stale by
+            # construction: it describes the pool before it was spent. Letting it
+            # move the reset lets _recover clear the block early and send requests
+            # to a tier that has none left.
         if remaining == 0:
             state.exhausted = True
             if state.reset_at is None:
