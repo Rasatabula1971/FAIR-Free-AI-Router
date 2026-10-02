@@ -137,7 +137,7 @@ class EmbeddedRouter:
         score, spec, model = route
         remaining = await self.quota.remaining_async(spec)
         # A half-open probe is owned for the attempt's real deadline, not a fixed default.
-        reserved, probe = await self.quota.reserve_probe_async(
+        reserved, held = await self.quota.reserve_probe_async(
             spec,
             request.client_id,
             probe_timeout=self.settings.attempt_deadline(request.max_output_tokens),
@@ -176,7 +176,7 @@ class EmbeddedRouter:
                 raise MalformedResponse("PROVIDER_IDENTITY_MISMATCH")
             if response.quota is not None:
                 await self.quota.observe_async(spec, response.quota)
-            self.quota.success(spec.provider_id, probe_token=probe)
+            self.quota.success(spec.provider_id, probe_token=held.probe_token)
         except BillingViolation as error:
             # Fail closed on this provider only. One uncertain/nonzero cost report
             # must not take unrelated free providers or local Ollama offline.
@@ -201,20 +201,20 @@ class EmbeddedRouter:
         except RequestNotSupported as error:
             # Raised by the adapter's own budget and capability checks, before any
             # request is sent, so the reservation bought nothing and is given back.
-            await self.quota.release_async(spec, request.client_id, probe_token=probe)
+            await self.quota.release_async(spec, request.client_id, reservation=held)
             disposition, error_type = "CAPABILITY_MISMATCH", "REQUEST_NOT_SUPPORTED_BY_ROUTE"
             error_detail = _failure_detail(error)
         except ModelUnavailable as error:
             # The model was gone from the live catalog, so no completion was sent.
             # Without this, a model delisted upstream spends a free request on every
             # solve that still has it in the registry.
-            await self.quota.release_async(spec, request.client_id, probe_token=probe)
+            await self.quota.release_async(spec, request.client_id, reservation=held)
             disposition, error_type = "INFRA_FAILURE", "MODEL_UNAVAILABLE"
             error_detail = _failure_detail(error)
         except AccessDenied as error:
             # 403 can be request/model-specific. Do not let one application's
             # denied request throttle this provider for every other client.
-            self.quota.release(spec, request.client_id, refund=False, probe_token=probe)
+            self.quota.release(spec, request.client_id, refund=False, reservation=held)
             disposition, error_type = "CAPABILITY_MISMATCH", "ACCESS_DENIED"
             error_detail = _failure_detail(error)
         except AuthenticationFailed as error:
@@ -229,7 +229,7 @@ class EmbeddedRouter:
             # fresh cooldown, having been told nothing about it. The request itself
             # is not refunded -- cancellation can tear down a call already in
             # flight, and over-counting is the safe direction.
-            self.quota.release(spec, request.client_id, refund=False, probe_token=probe)
+            self.quota.release(spec, request.client_id, refund=False, reservation=held)
             cancelled = True
             disposition, error_type = "CANCELLED", "REQUEST_CANCELLED"
         except _DEFECTS as error:
@@ -240,7 +240,7 @@ class EmbeddedRouter:
             disposition, error_type = "INFRA_FAILURE", "ROUTER_INTERNAL_DEFECT"
             error_detail = _failure_detail(error)
         except Exception as error:
-            self.quota.failure(spec.provider_id, probe_token=probe)
+            self.quota.failure(spec.provider_id, probe_token=held.probe_token)
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_UNAVAILABLE"
             error_detail = _failure_detail(error)
         else:
@@ -267,6 +267,16 @@ class EmbeddedRouter:
                 disposition = "QUALITY_FAILURE"
             else:
                 disposition = "UNVERIFIED"
+        finally:
+            # Whatever happened, this attempt stops owning the half-open slot.
+            # Branches that resolve the circuit themselves -- success, failure,
+            # throttle, the refunding releases -- have already cleared the token,
+            # so this is a no-op for them. It is the branches that deliberately
+            # say nothing about provider health, a schema rejection or a defect of
+            # ours, that would otherwise strand the slot: the provider stays
+            # unreachable for the probe lease and then a fresh cooldown, on the
+            # strength of an attempt that was never evidence against it.
+            self.quota.release_probe(spec.provider_id, held.probe_token)
         attempt = Attempt(
             attempt_number=number,
             provider_id=spec.provider_id,

@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
@@ -436,7 +437,7 @@ class TestSharedQuotaLedger:
                 with self.lock:
                     self.calls += 1
                 time.sleep(0.05)
-                return True
+                return True, None
 
         ledger = SlowLedger()
         gov = MemoryQuotaGovernor(
@@ -2038,11 +2039,11 @@ class TestQuotaUnderConcurrency:
         for _ in range(settings.circuit_failures):
             governor.failure("p")
         clock.now += settings.cooldown_seconds + 1
-        granted, token = await governor.reserve_probe_async(spec)
-        assert granted is True and token
+        granted, held = await governor.reserve_probe_async(spec)
+        assert granted is True and held.probe_token
         state = governor._state("p")
         assert state.circuit_state == "HALF_OPEN"
-        governor.release_probe("p", token)
+        governor.release_probe("p", held.probe_token)
         assert state.circuit_state == "OPEN"
 
 
@@ -2210,25 +2211,25 @@ class TestSharedLedgerRelease:
     def test_a_release_gives_the_request_back(self, tmp_path):
         ledger, now = self._ledger(tmp_path), 1_000_000.0
         for _ in range(3):
-            ledger.reserve("pool", "app", 10, "DAILY_UTC", now)
+            window = ledger.reserve("pool", "app", 10, "DAILY_UTC", now)[1]
         assert ledger.remaining("pool", 10, now) == 7
-        ledger.release("pool", "app", now)
+        ledger.release("pool", "app", now, window)
         assert ledger.remaining("pool", 10, now) == 8
 
     def test_releases_cannot_manufacture_requests(self, tmp_path):
         """A window reset between reserve and release would otherwise go negative."""
         ledger, now = self._ledger(tmp_path), 1_000_000.0
-        ledger.reserve("pool", "app", 10, "DAILY_UTC", now)
+        window = ledger.reserve("pool", "app", 10, "DAILY_UTC", now)[1]
         for _ in range(20):
-            ledger.release("pool", "app", now)
+            ledger.release("pool", "app", now, window)
         assert ledger.remaining("pool", 10, now) == 10
         assert ledger.report(["pool"], now)[0]["used"] == 0
 
     def test_per_application_usage_is_given_back_too(self, tmp_path):
         ledger, now = self._ledger(tmp_path), 1_000_000.0
-        ledger.reserve("pool", "one", 10, "DAILY_UTC", now)
+        window = ledger.reserve("pool", "one", 10, "DAILY_UTC", now)[1]
         ledger.reserve("pool", "two", 10, "DAILY_UTC", now)
-        ledger.release("pool", "one", now)
+        ledger.release("pool", "one", now, window)
         applications = ledger.report(["pool"], now)[0]["applications"]
         assert applications == {"one": 0, "two": 1}
 
@@ -2238,9 +2239,10 @@ class TestSharedLedgerRelease:
         ledger = SharedQuotaLedger(str(tmp_path / "quota.sqlite3"))
         governor = MemoryQuotaGovernor(RoutingSettings(), shared_ledger=ledger)
         spec = _spec("p", request_limit=10, request_limit_window="DAILY_UTC")
-        assert await governor.reserve_async(spec, "app") is True
+        granted, held = await governor.reserve_probe_async(spec, "app")
+        assert granted is True
         assert governor.remaining(spec) == 9
-        await governor.release_async(spec, "app")
+        await governor.release_async(spec, "app", reservation=held)
         assert governor.remaining(spec) == 10
 
 
@@ -2280,10 +2282,10 @@ class TestTheLedgerDoesNotLeakConnections:
         monkeypatch.setattr(sqlite3, "connect", tracked)
         ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
         now = 1_000.0
-        ledger.reserve("pool", "app", 50, "DAILY_UTC", now)
+        window = ledger.reserve("pool", "app", 50, "DAILY_UTC", now)[1]
         ledger.remaining("pool", 50, now)
         ledger.available("pool", 50, now)
-        ledger.release("pool", "app", now)
+        ledger.release("pool", "app", now, window)
         ledger.observe("pool", 50, 40, now + 60, now)
         ledger.exhaust("pool", now + 60, now)
         ledger.report(["pool"], now)
@@ -2302,7 +2304,7 @@ class TestTheLedgerDoesNotLeakConnections:
                 ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0)
         # The lock is gone, so the ledger is usable again -- which it would not be
         # if the failed call had left its own transaction open.
-        assert ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0) is True
+        assert ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0)[0] is True
 
 
 class TestContentionIsReportedNotGuessed:
@@ -2316,7 +2318,7 @@ class TestContentionIsReportedNotGuessed:
                 lambda: ledger.reserve("pool", "app", 50, "DAILY_UTC", 1_000.0),
                 lambda: ledger.remaining("pool", 50, 1_000.0),
                 lambda: ledger.available("pool", 50, 1_000.0),
-                lambda: ledger.release("pool", "app", 1_000.0),
+                lambda: ledger.release("pool", "app", 1_000.0, None),
             ):
                 with pytest.raises(QuotaLedgerUnavailable, match="LEDGER_LOCKED"):
                     call()
@@ -2513,7 +2515,8 @@ class TestHalfOpenProbeOwnsItsAttempt:
     def test_releasing_a_probe_reopens_without_a_new_cooldown(self):
         now = [1000.0]
         gov = self._tripped(now)
-        granted, token = gov.reserve_probe(_spec(), probe_timeout=300)
+        granted, held = gov.reserve_probe(_spec(), probe_timeout=300)
+        token = held.probe_token
         assert granted and token
         gov.release_probe("a", token)
         state = gov.state("a")
@@ -2525,10 +2528,12 @@ class TestHalfOpenProbeOwnsItsAttempt:
         now = [1000.0]
         gov = self._tripped(now)
         _, old = gov.reserve_probe(_spec(), probe_timeout=10)
+        old = old.probe_token
         now[0] += 16  # the first lease expired
         assert gov.state("a").circuit_state == "OPEN"
         now[0] += 1000  # well past the cooldown the expiry started
         _, new = gov.reserve_probe(_spec(), probe_timeout=300)
+        new = new.probe_token
         assert new and new != old
         gov.release_probe("a", old)
         assert gov.state("a").circuit_state == "HALF_OPEN"
@@ -2537,10 +2542,12 @@ class TestHalfOpenProbeOwnsItsAttempt:
         now = [1000.0]
         gov = self._tripped(now)
         _, old = gov.reserve_probe(_spec(), probe_timeout=10)
+        old = old.probe_token
         now[0] += 16  # the first lease expired; observing it starts the cooldown
         assert gov.state("a").circuit_state == "OPEN"
         now[0] += 1000  # past that cooldown
         _, new = gov.reserve_probe(_spec(), probe_timeout=300)
+        new = new.probe_token
         assert new and new != old
         gov.success("a", probe_token=old)
         assert gov.state("a").circuit_state == "HALF_OPEN"
@@ -2666,7 +2673,7 @@ class TestSharedLedgerClosesItsConnections:
         ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
         ledger.exhaust("pool", 2000.0, 1000.0)
         opened.clear()
-        assert ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1001.0) is False
+        assert ledger.reserve("pool", "corp", 10, "DAILY_UTC", 1001.0)[0] is False
         self._assert_all_closed(opened)
 
     def test_a_failed_transaction_rolls_back_and_closes(self, tmp_path, opened):
@@ -2783,3 +2790,252 @@ class TestClearCacheDefaultIdentity:
     async def test_clearing_an_empty_cache_removes_nothing(self):
         fair, _ = self._fair(application_id="corp")
         assert fair.clear_cache() == {"entries_removed": 0}
+
+
+# ── A refund belongs to the window that counted it ───────────────────────
+
+
+class TestARefundCannotCrossAWindowBoundary:
+    """Flooring at zero stops a negative count; it does not prove ownership.
+
+    A pre-dispatch refusal can arrive after the window it belonged to has reset.
+    By then that window's consumption is already cleared, so decrementing again
+    takes the request out of the *new* window's allowance -- a free request the
+    tier never granted, which is the one error this governor exists to prevent.
+    """
+
+    def _spec(self):
+        return _spec("p", request_limit=1, request_limit_window="HOURLY")
+
+    def _governor(self, now, ledger=None):
+        return MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0], shared_ledger=ledger)
+
+    @pytest.mark.parametrize("shared", [False, True])
+    def test_a_refund_after_the_reset_does_not_fund_the_new_window(self, tmp_path, shared):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3") if shared else None
+        now = [1000.0]
+        governor, spec = self._governor(now, ledger), self._spec()
+        granted, old = governor.reserve_probe(spec, "old")
+        assert granted
+        now[0] = 4601.0  # past the hourly reset
+        assert governor.reserve_probe(spec, "new")[0] is True
+        governor.release(spec, "old", reservation=old)
+        assert governor.reserve_probe(spec, "third")[0] is False
+
+    @pytest.mark.parametrize("shared", [False, True])
+    def test_a_refund_inside_its_own_window_still_works(self, tmp_path, shared):
+        """The guard must not cost a legitimate pre-dispatch refund."""
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3") if shared else None
+        now = [1000.0]
+        governor, spec = self._governor(now, ledger), self._spec()
+        granted, held = governor.reserve_probe(spec, "app")
+        assert granted and governor.reserve_probe(spec, "other")[0] is False
+        governor.release(spec, "app", reservation=held)
+        assert governor.reserve_probe(spec, "other")[0] is True
+
+    def test_an_unidentified_refund_is_refused(self, tmp_path):
+        """Nothing proves which window it came from, so it buys nothing back."""
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        assert ledger.reserve("pool", "app", 1, "HOURLY", 1000.0)[0] is True
+        assert ledger.release("pool", "app", 1000.0, None) is False
+        assert ledger.remaining("pool", 1, 1000.0) == 0
+
+    def test_the_ledger_refuses_a_refund_stamped_for_a_dead_window(self, tmp_path):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        _, window = ledger.reserve("pool", "app", 1, "HOURLY", 1000.0)
+        ledger.reserve("pool", "app", 1, "HOURLY", 4601.0)  # new window
+        assert ledger.release("pool", "app", 4601.0, window) is False
+        assert ledger.remaining("pool", 1, 4601.0) == 0
+
+
+# ── Only the owner of a half-open slot may resolve it ────────────────────
+
+
+class TestOnlyTheProbeOwnerResolvesTheCircuit:
+    def _tripped(self, now):
+        governor = MemoryQuotaGovernor(
+            RoutingSettings(circuit_failures=2, cooldown_seconds=60), clock=lambda: now[0]
+        )
+        for _ in range(2):
+            governor.failure("p")
+        now[0] += 61
+        return governor
+
+    def test_an_ordinary_request_cannot_close_a_newer_probe(self):
+        """Token 0 is not a probe: it was in flight before the outage began.
+
+        Letting its reply close the circuit declares the provider recovered on
+        evidence that predates the probe, and admits full traffic while the real
+        probe is still outstanding.
+        """
+        now = [1000.0]
+        governor = self._tripped(now)
+        assert governor.reserve_probe(_spec("p"))[0] is True
+        assert governor.state("p").circuit_state == "HALF_OPEN"
+        governor.success("p")  # the old, non-probe request finishes
+        assert governor.state("p").circuit_state == "HALF_OPEN"
+
+    def test_an_ordinary_failure_cannot_reopen_a_newer_probe(self):
+        now = [1000.0]
+        governor = self._tripped(now)
+        governor.reserve_probe(_spec("p"))
+        governor.failure("p")
+        assert governor.state("p").circuit_state == "HALF_OPEN"
+
+    def test_the_owner_still_closes_its_own_circuit(self):
+        """The guard must not strand every probe it was meant to protect."""
+        now = [1000.0]
+        governor = self._tripped(now)
+        _, held = governor.reserve_probe(_spec("p"))
+        governor.success("p", probe_token=held.probe_token)
+        assert governor.state("p").circuit_state == "CLOSED"
+
+    def test_an_ordinary_request_is_unaffected_by_a_closed_circuit(self):
+        governor = MemoryQuotaGovernor(RoutingSettings())
+        governor.reserve_probe(_spec("p"))
+        governor.success("p")
+        assert governor.state("p").circuit_state == "CLOSED"
+
+
+class TestCancellationDuringReservationReleasesTheSlot:
+    """The slot is claimed before the ledger await, so nothing downstream owns it.
+
+    The attempt that would have released it is never created: `reserve_probe_async`
+    has not returned, so the router has no reservation to finalize.
+    """
+
+    class _Gate:
+        path = "gate.sqlite3"
+
+        def __init__(self):
+            self.entered = threading.Event()
+            self.proceed = threading.Event()
+
+        def reserve(self, *args):
+            self.entered.set()
+            self.proceed.wait(5)
+            return True, None
+
+    async def test_a_cancelled_reservation_does_not_strand_the_probe(self):
+        gate = self._Gate()
+        governor = MemoryQuotaGovernor(
+            RoutingSettings(circuit_failures=2, cooldown_seconds=60), shared_ledger=gate
+        )
+        spec = _spec("p", request_limit=10)
+        state = governor.state("p")
+        state.circuit_state, state.blocked_until = "OPEN", 0
+        task = asyncio.create_task(governor.reserve_probe_async(spec, "app"))
+        await asyncio.to_thread(gate.entered.wait, 5)
+        assert governor._state("p").circuit_state == "HALF_OPEN"
+        task.cancel()
+        gate.proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert governor._state("p").circuit_state == "OPEN"
+
+
+class TestEveryOutcomeFinalizesItsProbe:
+    """A branch that says nothing about provider health must still give the slot back."""
+
+    async def _circuit_after(self, error):
+        spec = _spec("p")
+        registry = Registry()
+        registry.register(spec, MockAdapter("p", error=error))
+        router = EmbeddedRouter(
+            registry,
+            RoutingSettings(circuit_failures=2, cooldown_seconds=60),
+            {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
+        )
+        for _ in range(2):
+            router.quota.failure("p")
+        router.quota._state("p").blocked_until = 0
+        await router.solve(_request(task="t"))
+        return router.quota.state("p").circuit_state
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            # The provider answered and its validator refused the shape: a verdict
+            # on the answer, not on the provider's health.
+            StructuredOutputRejected("PROVIDER_SCHEMA_REJECTED"),
+            # FAIR's own defect. It is not evidence against the provider either,
+            # and holding the slot sidelines a provider that did nothing wrong.
+            AttributeError("'NoneType' object has no attribute 'text'"),
+            KeyError("provider_id"),
+        ],
+    )
+    async def test_an_outcome_that_judges_nothing_releases_the_slot(self, error):
+        assert await self._circuit_after(error) == "OPEN"
+
+    async def test_a_real_provider_failure_still_opens_the_circuit(self):
+        assert await self._circuit_after(ProviderUnavailable("HTTP_503")) == "OPEN"
+
+    async def test_a_released_slot_can_be_probed_again_at_once(self):
+        """Released, not re-cooled: the provider was never shown to be unhealthy."""
+        spec = _spec("p")
+        registry = Registry()
+        registry.register(spec, MockAdapter("p", error=StructuredOutputRejected("X")))
+        router = EmbeddedRouter(
+            registry,
+            RoutingSettings(circuit_failures=2, cooldown_seconds=60),
+            {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92},
+        )
+        for _ in range(2):
+            router.quota.failure("p")
+        router.quota._state("p").blocked_until = 0
+        await router.solve(_request(task="t"))
+        assert router.quota.available(spec) is True
+
+
+# ── A stale report cannot shorten an established exhaustion ──────────────
+
+
+class TestAnEstablishedExhaustionIsNotShortened:
+    def test_a_late_positive_report_does_not_reopen_a_spent_pool(self):
+        now = [1000.0]
+        governor = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        spec = _spec("p", request_limit=10, request_limit_window="HOURLY")
+        governor.exhaust(spec, reset_at=2000.0)
+        governor.observe(
+            spec,
+            QuotaSnapshot(
+                provider_id="p", quota_limit=10, quota_remaining_estimate=5, reset_at=1100.0
+            ),
+        )
+        now[0] = 1101.0
+        assert governor.available(spec) is False
+
+    async def test_the_async_path_agrees_with_the_sync_one(self):
+        now = [1000.0]
+        governor = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        spec = _spec("p", request_limit=10, request_limit_window="HOURLY")
+        governor.exhaust(spec, reset_at=2000.0)
+        await governor.observe_async(
+            spec,
+            QuotaSnapshot(
+                provider_id="p", quota_limit=10, quota_remaining_estimate=5, reset_at=1100.0
+            ),
+        )
+        now[0] = 1101.0
+        assert governor.available(spec) is False
+
+    def test_a_reordered_exhaustion_keeps_the_later_reset(self, tmp_path):
+        ledger = SharedQuotaLedger(tmp_path / "quota.sqlite3")
+        ledger.exhaust("pool", 2000.0, 1000.0)
+        ledger.exhaust("pool", 1100.0, 1001.0)  # delivered late, earlier reset
+        assert ledger.available("pool", None, 1101.0) is False
+        assert ledger.available("pool", None, 2001.0) is True
+
+    def test_a_first_report_still_overrides_fairs_guess(self):
+        """The provider knows its own window; only *stale* reports are ignored."""
+        now = [1000.0]
+        governor = MemoryQuotaGovernor(RoutingSettings(), clock=lambda: now[0])
+        spec = _spec("p", request_limit=5, request_limit_window="DAILY_UTC")
+        governor.reserve_probe(spec)
+        governor.observe(
+            spec,
+            QuotaSnapshot(
+                provider_id="p", quota_limit=5, quota_remaining_estimate=0, reset_at=1100.0
+            ),
+        )
+        assert governor.state("p").reset_at == 1100.0
