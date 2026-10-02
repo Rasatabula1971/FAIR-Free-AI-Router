@@ -1,5 +1,6 @@
 """Transport-level tests for the live adapters — no network, no credentials leave the process."""
 
+import gzip
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -27,6 +28,7 @@ from fair.providers.live import (
     LiveSettings,
     MistralAdapter,
     OpenRouterFreeAdapter,
+    TextAdapter,
     ZaiFreeAdapter,
 )
 from fair.schemas.domain import NormalizedModelRequest, ProviderSpec
@@ -1997,3 +1999,224 @@ class TestStreamingErrorBodyBound:
         adapter = self._adapter(lambda: httpx.Response(403, json={"error": {"message": "no"}}))
         with pytest.raises(AccessDenied):
             await adapter.complete(_request(self.MODEL))
+
+
+# ── The stream is bounded as it arrives, not once it is lines ───────────
+
+
+def _streaming(response_factory, model="openai/gpt-oss-20b"):
+    transport, seen = _transport(
+        {
+            ("GET", "/models"): (
+                200,
+                {"data": [{"id": model, "context_window": 131072, "active": True}]},
+            ),
+            ("POST", "/chat/completions"): lambda request: response_factory(),
+        }
+    )
+    adapter = GroqAdapter(
+        _spec("groq", "FREE_RECURRING", model),
+        _settings(),
+        credential=SecretStr("k"),
+        transport=transport,
+    )
+    return adapter, seen
+
+
+async def _read_lines(response_factory):
+    """Drive the reader directly and report what it pulled off the wire."""
+    pulled = 0
+
+    def handler(request):
+        nonlocal pulled
+        source, size = response_factory()
+
+        async def counted():
+            nonlocal pulled
+            async for part in source:
+                pulled += len(part)
+                yield part
+
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=counted())
+
+    lines = []
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with client.stream("POST", "https://example.invalid/x") as response:
+            async for line in TextAdapter._stream_lines(response):
+                lines.append(line)
+    return lines, pulled
+
+
+class TestAStreamIsBoundedBeforeItIsBuffered:
+    """aiter_lines() buffers to a terminator; a body that sends none went unchecked.
+
+    The cap was only consulted once a whole line existed, so a stream with no
+    newline was fully materialised first -- the check fired at EOF, which is the
+    one place a size limit is no use.
+    """
+
+    async def test_a_stream_with_no_terminator_stops_near_the_cap(self):
+        chunk, sent = 65_536, 0
+
+        async def forever():
+            nonlocal sent
+            while sent < 50_000_000:
+                sent += chunk
+                yield b"x" * chunk
+
+        pulled = 0
+
+        def handler(request):
+            nonlocal pulled
+
+            async def counted():
+                nonlocal pulled
+                async for part in forever():
+                    pulled += len(part)
+                    yield part
+
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=counted()
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with client.stream("POST", "https://example.invalid/x") as response:
+                with pytest.raises(MalformedResponse, match="PROVIDER_RESPONSE_TOO_LARGE"):
+                    async for _ in TextAdapter._stream_lines(response):
+                        pass
+        # One transport chunk of overshoot is unavoidable: a chunk's size is not
+        # known until it has arrived. What matters is that it is not 50 MB.
+        assert pulled <= 4_000_000 + chunk
+
+    async def test_a_compressed_success_body_is_refused_not_decoded(self):
+        """Decompression can turn a small download into a large allocation.
+
+        The non-200 and buffered paths already refuse it; this one decoded.
+        """
+
+        packed = gzip.compress(b"data: {}\n\n")
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream", "content-encoding": "gzip"},
+                content=packed,
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with client.stream("POST", "https://example.invalid/x") as response:
+                with pytest.raises(MalformedResponse, match="COMPRESSED"):
+                    async for _ in TextAdapter._stream_lines(response):
+                        pass
+
+
+class TestTheReaderStillParsesRealStreams:
+    """A bound that mangles ordinary traffic has not helped anyone."""
+
+    async def _lines(self, parts):
+        async def source():
+            for part in parts:
+                yield part
+
+        def handler(request):
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=source()
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with client.stream("POST", "https://example.invalid/x") as response:
+                return [line async for line in TextAdapter._stream_lines(response)]
+
+    async def test_an_event_split_across_chunks_is_rejoined(self):
+        assert await self._lines([b"data: {", b'"a": 1}', b"\n\n"]) == ['data: {"a": 1}', ""]
+
+    @pytest.mark.parametrize("cut", [10, 13, 14])
+    async def test_a_multibyte_character_split_across_chunks_survives(self, cut):
+        """Decoding per chunk would mangle a character cut in half mid-stream.
+
+        The cuts land *inside* a character, not between two: byte 10 splits the
+        two-byte 'é' and 13/14 split the three-byte em dash. A split on a
+        boundary proves nothing, which is how the first version of this test
+        passed against a per-chunk decoder.
+        """
+        text = "data: café — ok\n".encode()
+        assert text[cut] & 0xC0 == 0x80  # a continuation byte: the cut is mid-character
+        assert await self._lines([text[:cut], text[cut:]]) == ["data: café — ok"]
+
+    async def test_crlf_line_endings_are_handled(self):
+        assert await self._lines([b"data: a\r\ndata: b\r\n"]) == ["data: a", "data: b"]
+
+    async def test_a_final_line_without_a_terminator_is_still_yielded(self):
+        assert await self._lines([b"data: a\n", b"data: b"]) == ["data: a", "data: b"]
+
+    async def test_invalid_utf8_is_a_provider_fault(self):
+        def handler(request):
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=b"data: \xff\xfe\n"
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with client.stream("POST", "https://example.invalid/x") as response:
+                with pytest.raises(MalformedResponse, match="MALFORMED_PROVIDER_RESPONSE"):
+                    async for _ in TextAdapter._stream_lines(response):
+                        pass
+
+    async def test_the_adapter_itself_reads_through_the_bounded_reader(self):
+        """The call site, not just the reader: a revert there restores the bug.
+
+        Driving _stream_lines directly cannot see which reader the adapter
+        actually calls, so this goes through complete().
+        """
+        pulled = 0
+        chunk = 65_536
+
+        def unterminated():
+            async def body():
+                nonlocal pulled
+                while pulled < 50_000_000:
+                    pulled += chunk
+                    yield b"x" * chunk
+
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, content=body()
+            )
+
+        adapter, _ = _streaming(unterminated)
+        with pytest.raises(MalformedResponse, match="PROVIDER_RESPONSE_TOO_LARGE"):
+            await adapter.complete(
+                NormalizedModelRequest(
+                    task="t",
+                    model_id="openai/gpt-oss-20b",
+                    request_id="r",
+                    client_id="c",
+                    task_class="commodity",
+                )
+            )
+        assert pulled <= 4_000_000 + chunk
+
+    async def test_an_ordinary_completion_still_streams(self):
+        """End to end through the adapter, not just the reader."""
+        adapter, _ = _streaming(
+            lambda: _sse(
+                [
+                    {
+                        "model": "openai/gpt-oss-20b",
+                        "choices": [{"delta": {"content": "hello"}}],
+                    },
+                    {
+                        "model": "openai/gpt-oss-20b",
+                        "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    },
+                ]
+            )
+        )
+        response = await adapter.complete(
+            NormalizedModelRequest(
+                task="t",
+                model_id="openai/gpt-oss-20b",
+                request_id="r",
+                client_id="c",
+                task_class="commodity",
+            )
+        )
+        assert response.text == "hello"

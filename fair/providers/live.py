@@ -1,5 +1,6 @@
 """Opt-in text adapters with fixed transports and conservative provider observations."""
 
+import codecs
 import copy
 import ipaddress
 import json
@@ -42,6 +43,7 @@ from fair.security.credentials import ProviderCredentials
 TEXT_CAPABILITIES = {"reasoning", "coding", "structured_output"}
 # Largest error body FAIR will buffer; a provider error needs a status and a message.
 _MAX_ERROR_BODY_BYTES = 1_000_000
+_MAX_STREAM_BYTES = 4_000_000
 # The output cap a model keeps until its endpoint has been asked for more. It is the
 # descriptor default for an unreviewed model, not a ceiling on a reviewed one.
 MAX_OUTPUT_TOKENS = 4096
@@ -454,9 +456,9 @@ class TextAdapter:
                     self._error_from_body(response.status_code, response.headers, body)
                     raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                 self._quota = self._observe(response.headers)
-                async for line in response.aiter_lines():
+                async for line in self._stream_lines(response):
                     size += len(line)
-                    if size > 4_000_000 or len(chunks) > 100_000:
+                    if size > _MAX_STREAM_BYTES or len(chunks) > 100_000:
                         raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
                     if not line.startswith("data:"):
                         continue
@@ -487,6 +489,44 @@ class TextAdapter:
         if not chunks:
             raise MalformedResponse("EMPTY_COMPLETION_STREAM")
         return chunks
+
+    @staticmethod
+    async def _stream_lines(response):
+        """SSE lines, bounded as the bytes arrive rather than once they are lines.
+
+        ``aiter_lines()`` buffers until it finds a terminator, so a body that
+        sends none is fully materialised before any cap applied to the lines it
+        yields can see it: six 1 MB chunks passed a 4 MB cap untouched, because
+        the cap was never consulted until the whole 6 MB had been read. Counting
+        bytes off the wire stops the read at the budget instead of at EOF.
+
+        Compression is refused rather than decoded, matching the error and
+        buffered paths: a small download can expand into a large allocation, and
+        the request asks for ``identity`` in the first place.
+
+        Bytes are also the right unit. The old count was of characters, which
+        under-counts any multi-byte text -- the cap was looser than it read.
+        """
+        if response.headers.get("content-encoding", "identity") != "identity":
+            raise MalformedResponse("COMPRESSED_PROVIDER_RESPONSE_UNSUPPORTED")
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        pending, size = "", 0
+        try:
+            async for data in response.aiter_bytes():
+                size += len(data)
+                if size > _MAX_STREAM_BYTES:
+                    raise MalformedResponse("PROVIDER_RESPONSE_TOO_LARGE")
+                # Incremental, so an event split across chunks mid-character is
+                # held rather than mangled.
+                pending += decoder.decode(data)
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    yield line.rstrip("\r")
+            pending += decoder.decode(b"", True)
+        except UnicodeDecodeError:
+            raise MalformedResponse("MALFORMED_PROVIDER_RESPONSE") from None
+        if pending:
+            yield pending.rstrip("\r")
 
     @staticmethod
     async def _read_error_body(response):
