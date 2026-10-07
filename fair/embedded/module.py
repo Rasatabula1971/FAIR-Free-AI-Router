@@ -659,23 +659,27 @@ class FAIR:
             self.skipped[_GATEWAY_PROVIDER] = "gateway review is missing or invalid"
             return
         try:
-            self._register_gateway(api_key, _loopback(url).removesuffix("/v1"), review, settings)
+            # Validated on its own, before the shared settings used by cloud adapters
+            # are touched, so that only a bad address is ever reported as one.
+            url = _loopback(url).removesuffix("/v1")
+            LiveSettings(freellmapi_url=url)
         except ValueError:
             self.skipped[_GATEWAY_PROVIDER] = "FreeLLMAPI requires a literal loopback HTTP endpoint"
+            return
+        try:
+            self._register_gateway(api_key, url, review, settings)
         except AdmissionDenied:
             self.skipped[_GATEWAY_PROVIDER] = (
                 "gateway review is expired or post-dated; re-verify every route, then "
                 "update reviewed_at"
             )
-        except (AuthenticationFailed, CredentialConfigurationError):
+        except AuthenticationFailed:
             self.skipped[_GATEWAY_PROVIDER] = (
                 "gateway adapter refused admission; a reviewed model must be a concrete "
                 "catalog id, never auto or fusion"
             )
 
     def _register_gateway(self, api_key, url, review, settings):
-        # Validate before mutating the shared settings used by cloud adapters.
-        LiveSettings(freellmapi_url=url)
         models = [
             ModelDescriptor(
                 model_id=entry.model_id,

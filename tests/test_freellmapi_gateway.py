@@ -495,8 +495,11 @@ class TestRegistration:
         fair = _fair(freellmapi_review=_review(reviewed_at=_today() - timedelta(days=age_days)))
         assert "expired or post-dated" in fair.skipped["freellmapi"]
 
-    def test_a_gateway_off_this_host_is_skipped(self):
-        fair = _fair(freellmapi_url="http://192.168.1.20:3001")
+    @pytest.mark.parametrize(
+        "url", ["http://192.168.1.20:3001", "http://[::1", "http://127.0.0.1:port"]
+    )
+    def test_a_gateway_off_this_host_or_at_no_address_is_skipped(self, url):
+        fair = _fair(freellmapi_url=url)
         assert "literal loopback" in fair.skipped["freellmapi"]
 
     @pytest.mark.parametrize("url", ["http://localhost:3001/v1", "http://127.0.0.1:3001/"])
