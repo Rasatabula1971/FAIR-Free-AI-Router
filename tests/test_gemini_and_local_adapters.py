@@ -313,6 +313,63 @@ class TestGemini:
         with pytest.raises(QuotaExceeded):
             await adapter.complete(_request(GEMINI_MODEL))
 
+    def _violating(self, *quota_ids, error=None):
+        """A 429 naming the quotas Google says were violated."""
+        body = error or {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaId": quota_id} for quota_id in quota_ids],
+                }
+            ],
+        }
+        adapter, _ = self._adapter(
+            {
+                ("GET", f"/models/{GEMINI_MODEL}"): (200, _metadata()),
+                ("POST", ":generateContent"): (429, {"error": body}),
+            }
+        )
+        return adapter
+
+    async def test_a_per_model_daily_quota_is_spent_for_that_model_alone(self):
+        adapter = self._violating("GenerateRequestsPerDayPerProjectPerModel-FreeTier")
+        with pytest.raises(QuotaExceeded) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert raised.value.model_scoped is True
+        # Not a statement about the provider, so the provider-wide snapshot is left.
+        assert (await adapter.quota()).quota_remaining_estimate is None
+
+    async def test_a_per_model_minute_quota_limits_that_model_alone(self):
+        adapter = self._violating("GenerateRequestsPerMinutePerProjectPerModel-FreeTier")
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert raised.value.model_scoped is True
+
+    @pytest.mark.parametrize(
+        "quota_ids",
+        [
+            ("GenerateRequestsPerDayPerProject-FreeTier",),
+            (
+                "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+                "GenerateRequestsPerDayPerProject-FreeTier",
+            ),
+        ],
+    )
+    async def test_a_quota_that_is_not_per_model_still_benches_the_provider(self, quota_ids):
+        adapter = self._violating(*quota_ids)
+        with pytest.raises(QuotaExceeded) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert raised.value.model_scoped is False
+        assert (await adapter.quota()).quota_remaining_estimate == 0
+
+    async def test_a_daily_refusal_that_names_no_quota_benches_the_provider(self):
+        adapter = self._violating(error={"code": "quota_exceeded", "message": "daily quota"})
+        with pytest.raises(QuotaExceeded) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert raised.value.model_scoped is False
+
     async def test_a_truncated_answer_reports_length(self):
         adapter, _ = self._adapter(
             {

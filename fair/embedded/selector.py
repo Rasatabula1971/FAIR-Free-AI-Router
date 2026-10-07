@@ -30,6 +30,9 @@ class MemorySelector:
             for model in spec.models:
                 if not model.active or (spec.provider_id, model.model_id) in tried:
                     continue
+                # A limit the provider counts per model benches that model alone.
+                if not self.quota.model_available(spec.provider_id, model.model_id):
+                    continue
                 if not profile.required_capabilities <= model.capabilities:
                     continue
                 if profile.context_tokens_estimate > model.context_window:
@@ -72,6 +75,9 @@ class MemorySelector:
                 continue
             for model in spec.models:
                 if not model.active or (spec.provider_id, model.model_id) in tried:
+                    continue
+                # A limit the provider counts per model benches that model alone.
+                if not self.quota.model_available(spec.provider_id, model.model_id):
                     continue
                 if not profile.required_capabilities <= model.capabilities:
                     continue

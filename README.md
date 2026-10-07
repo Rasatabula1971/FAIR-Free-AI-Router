@@ -170,6 +170,34 @@ a provider, and an attempt that never called one tested nothing — left held, i
 makes a healthy provider unavailable for the probe window and then a full fresh
 cooldown after it.
 
+## Limits counted per model
+
+Gemini and Groq count their free limits per model, so a refusal on one model says
+nothing about the next. FAIR benches that model alone and keeps routing to its
+siblings. Before, any rate limit benched every model at the provider for the cooldown,
+and one Gemini model reaching its daily cap took the other out until midnight Pacific.
+
+A refusal is read that way only on the provider's own word:
+
+- **Gemini** names the quota that was violated, and a free-tier one reads
+  `...PerProjectPerModel-FreeTier`. Every violation in the refusal has to be per model.
+- **Groq** names the model in the refusal itself: ``Rate limit reached for model
+  `openai/gpt-oss-120b` ...``.
+
+Anything else still benches the whole provider: a refusal that names no model or quota,
+and any allowance that really is account-wide, such as Cloudflare's daily neurons or
+OpenRouter's daily requests. An unknown scope gets the widest block.
+
+A benched model returns after the cooldown, or the provider's own wait if that is
+longer, or when its quota resets. `fair.providers()` lists them under `benched_models`
+with the time each returns, and a provider whose every model is benched reports
+`THROTTLED`. In the attempt log a per-model refusal is recorded as `MODEL_RATE_LIMITED`
+or `MODEL_QUOTA_EXHAUSTED`. Benches are local to the process, as throttles are: another
+application sharing the account learns of the limit from its own first refusal.
+
+Request counting is unchanged and still per provider. Groq's `request_limit` of 1000 a
+day is applied across both of its models, though Groq publishes that many for each.
+
 ## Shared quota across applications
 
 Separate API keys are useful for isolation, but they do **not** necessarily create
@@ -724,7 +752,7 @@ FAIR(
     timeout_seconds=15,           # base per-attempt budget, before the output allowance
     output_tokens_per_second=30,  # assumed free-tier throughput, sizing that budget
     max_timeout_seconds=600,      # hard ceiling on any one attempt
-    cooldown_seconds=360,         # provider sit-out after circuit-break/throttle (Groq's window)
+    cooldown_seconds=360,         # sit-out after circuit-break/throttle, for a provider or one model
     cache_enabled=True,           # in-memory LRU cache for deterministic tasks
     cross_check_required=False,   # require independent verification
     source_reviews="reviews.yaml", # operator-reviewed evidence snapshots (path or list)

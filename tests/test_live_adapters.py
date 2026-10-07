@@ -675,6 +675,80 @@ class TestGroq:
         assert payload["max_completion_tokens"] == 64
         assert "max_tokens" not in payload
 
+    # The refusal Groq sends, recorded from its API: the model is named in the text.
+    NAMED = (
+        "Rate limit reached for model `openai/gpt-oss-20b` in organization `org_x` "
+        "service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7313, "
+        "Requested 1024. Please try again in 2.5s."
+    )
+
+    def _refused(self, message, **headers):
+        body = {"error": {"message": message, "type": "tokens", "code": "rate_limit_exceeded"}}
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): lambda request: httpx.Response(
+                    429, json=body, headers=headers
+                ),
+            }
+        )
+        return GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+
+    async def test_a_refusal_naming_the_model_is_about_that_model_alone(self):
+        adapter = self._refused(self.NAMED, **{"retry-after": "3"})
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(self.MODEL))
+        assert raised.value.model_scoped is True
+        assert raised.value.retry_after == 3
+
+    async def test_a_spent_daily_allowance_named_for_the_model_is_that_models(self):
+        adapter = self._refused(
+            self.NAMED.replace("tokens per minute (TPM)", "requests per day (RPD)"),
+            **{
+                "x-ratelimit-limit-requests": "1000",
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "2h3m",
+            },
+        )
+        with pytest.raises(QuotaExceeded) as raised:
+            await adapter.complete(_request(self.MODEL))
+        assert raised.value.model_scoped is True
+        assert raised.value.reset_at is not None
+
+    @pytest.mark.parametrize("message", ["Rate limit exceeded", "Too many requests", ""])
+    async def test_a_refusal_that_names_no_model_still_benches_the_provider(self, message):
+        adapter = self._refused(message)
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(self.MODEL))
+        assert raised.value.model_scoped is False
+
+    async def test_naming_a_model_only_matters_on_a_rate_limit(self):
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): (503, {"error": {"message": self.NAMED}}),
+            }
+        )
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(ProviderUnavailable, match="HTTP_503"):
+            await adapter.complete(_request(self.MODEL))
+
 
 def _sse_error(model, error, *, status=200):
     """Groq's shape: a reasoning chunk, then the error, all under one status."""

@@ -184,11 +184,23 @@ class EmbeddedRouter:
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
             error_detail = _failure_detail(error)
         except QuotaExceeded as error:
-            await self.quota.exhaust_async(spec, reset_at=error.reset_at)
+            # A limit the provider counts per model says nothing about its other
+            # models. Benching them too threw away allowance that was still there:
+            # one Gemini model reaching its daily cap took the other out until
+            # midnight Pacific.
+            if error.model_scoped is True:
+                self.quota.exhaust_model(spec, model.model_id, reset_at=error.reset_at)
+            else:
+                await self.quota.exhaust_async(spec, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
             error_detail = _failure_detail(error)
         except RateLimited as error:
-            self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
+            if error.model_scoped is True:
+                self.quota.throttle_model(
+                    spec.provider_id, model.model_id, retry_after=error.retry_after
+                )
+            else:
+                self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
             error_detail = _failure_detail(error)
         except StructuredOutputRejected as error:

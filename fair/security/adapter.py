@@ -84,10 +84,22 @@ class CredentialedAdapter:
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
         except QuotaExceeded as error:
             logger.info("Quota exceeded for provider %s", self.provider_id)
-            raise QuotaExceeded("QUOTA_EXHAUSTED", reset_at=error.reset_at) from None
+            # The scope travels with the error: dropped here, a limit on one model
+            # reaches the router as a limit on the whole provider.
+            scoped = error.model_scoped is True
+            raise QuotaExceeded(
+                "MODEL_QUOTA_EXHAUSTED" if scoped else "QUOTA_EXHAUSTED",
+                reset_at=error.reset_at,
+                model_scoped=scoped,
+            ) from None
         except RateLimited as error:
             logger.info("Rate limited by provider %s", self.provider_id)
-            raise RateLimited("RATE_LIMITED", retry_after=error.retry_after) from None
+            scoped = error.model_scoped is True
+            raise RateLimited(
+                "MODEL_RATE_LIMITED" if scoped else "RATE_LIMITED",
+                retry_after=error.retry_after,
+                model_scoped=scoped,
+            ) from None
         except RequestNotSupported as error:
             code = _safe_code(error, "REQUEST_NOT_SUPPORTED")
             raise RequestNotSupported(code) from None

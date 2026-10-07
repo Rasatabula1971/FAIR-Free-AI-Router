@@ -14,9 +14,18 @@ class ProviderError(Exception):
 
 
 class RateLimited(ProviderError):
-    def __init__(self, message="", *, retry_after=None):
+    """A limit was hit and will clear by itself.
+
+    ``model_scoped`` says the provider counts this limit per model, so its other
+    models are unaffected. It is only ever set on the provider's own word -- an
+    error that names the model or a per-model quota. Anything less is False: the
+    scope is unknown, and benching the whole provider is the safe reading of that.
+    """
+
+    def __init__(self, message="", *, retry_after=None, model_scoped=False):
         super().__init__(message)
         self.retry_after = retry_after
+        self.model_scoped = model_scoped
 
 
 class BillingViolation(ProviderError):
@@ -24,9 +33,12 @@ class BillingViolation(ProviderError):
 
 
 class QuotaExceeded(ProviderError):
-    def __init__(self, message="", *, reset_at: float | None = None):
+    """An allowance is spent until it resets; ``model_scoped`` as on RateLimited."""
+
+    def __init__(self, message="", *, reset_at: float | None = None, model_scoped=False):
         super().__init__(message)
         self.reset_at = reset_at
+        self.model_scoped = model_scoped
 
 
 class ProviderUnavailable(ProviderError):

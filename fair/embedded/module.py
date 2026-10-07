@@ -738,6 +738,7 @@ class FAIR:
                 "models": [m.model_id for m in p.models],
                 "quota_pool_id": self._router.quota.pool_id(p.provider_id),
                 "quota_remaining": self._router.quota.remaining(p),
+                "benched_models": self._router.quota.benched_models(p.provider_id),
             }
             for p in self._registry.providers.values()
         ]
@@ -755,6 +756,7 @@ class FAIR:
                 "models": [model.model_id for model in provider.models],
                 "quota_pool_id": self._router.quota.pool_id(provider.provider_id),
                 "quota_remaining": remaining,
+                "benched_models": self._router.quota.benched_models(provider.provider_id),
             }
 
         return list(

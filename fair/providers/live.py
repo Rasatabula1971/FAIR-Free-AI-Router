@@ -283,7 +283,7 @@ class TextAdapter:
     def _observe(self, headers):
         return QuotaSnapshot(provider_id=self.provider_id)
 
-    def _error(self, status, headers):
+    def _error(self, status, headers, *, model_scoped=False):
         if status == 403:
             raise AccessDenied("PROVIDER_ACCESS_DENIED")
         if status == 401 or 300 <= status < 400:
@@ -294,9 +294,15 @@ class TextAdapter:
             observation = self._observe(headers)
             self._quota = observation
             if observation.quota_remaining_estimate == 0:
-                raise QuotaExceeded("REQUEST_QUOTA_EXHAUSTED", reset_at=observation.reset_at)
+                raise QuotaExceeded(
+                    "REQUEST_QUOTA_EXHAUSTED",
+                    reset_at=observation.reset_at,
+                    model_scoped=model_scoped,
+                )
             raise RateLimited(
-                "RATE_LIMITED", retry_after=retry_seconds(headers.get("retry-after"), self.clock())
+                "RATE_LIMITED",
+                retry_after=retry_seconds(headers.get("retry-after"), self.clock()),
+                model_scoped=model_scoped,
             )
         if status != 200:
             # The status code is FAIR's own observation, not upstream text, so
@@ -843,6 +849,14 @@ class GroqAdapter(TextAdapter):
         except (ValueError, KeyError):
             return QuotaSnapshot(provider_id=self.provider_id)
 
+    def _error_from_body(self, status, headers, data):
+        # Groq counts its limits per model and says so in the refusal itself: "Rate
+        # limit reached for model `openai/gpt-oss-120b` in organization ...". Its
+        # other models keep their own allowance, so only this one is benched. A
+        # refusal that does not name a model keeps the provider-wide reading.
+        named = "rate limit reached for model" in self._error_message(data).casefold()
+        self._error(status, headers, model_scoped=status == 429 and named)
+
 
 class OpenRouterFreeAdapter(TextAdapter):
     base_url = "https://openrouter.ai/api/v1"
@@ -1198,14 +1212,22 @@ class GeminiAdapter(TextAdapter):
         daily = code == "quota_exceeded" or any(
             "perday" in quota_id.casefold() for quota_id in quota_ids
         )
+        # Google names the quota that was violated, and a free-tier one reads
+        # "...PerProjectPerModel-FreeTier": counted for this model alone. Only when
+        # every violation says so is the refusal about one model; a quota that is
+        # not per model, or a refusal that names none, benches the provider.
+        per_model = bool(quota_ids) and all(
+            "permodel" in quota_id.casefold() for quota_id in quota_ids
+        )
         if daily:
             reset_at = self._daily_reset_at()
-            self._quota = QuotaSnapshot(
-                provider_id=self.provider_id,
-                quota_remaining_estimate=0,
-                reset_at=reset_at,
-            )
-            raise QuotaExceeded("DAILY_QUOTA_EXHAUSTED", reset_at=reset_at)
+            if not per_model:
+                self._quota = QuotaSnapshot(
+                    provider_id=self.provider_id,
+                    quota_remaining_estimate=0,
+                    reset_at=reset_at,
+                )
+            raise QuotaExceeded("DAILY_QUOTA_EXHAUSTED", reset_at=reset_at, model_scoped=per_model)
 
         retry_after = self._retry_delay_from_details(error)
         if (
@@ -1215,7 +1237,7 @@ class GeminiAdapter(TextAdapter):
         ):
             if retry_after is None:
                 retry_after = retry_seconds(headers.get("retry-after"), self.clock())
-            raise RateLimited("RATE_LIMITED", retry_after=retry_after)
+            raise RateLimited("RATE_LIMITED", retry_after=retry_after, model_scoped=per_model)
 
         self._error(status, headers)
 
