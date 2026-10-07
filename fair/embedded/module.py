@@ -22,6 +22,7 @@ from fair.providers.live import (
     MAX_OUTPUT_TOKENS_CEILING,
     TEXT_CAPABILITIES,
     CloudflareWorkersAiAdapter,
+    FreeLLMAPIAdapter,
     GeminiAdapter,
     GroqAdapter,
     KiloFreeAdapter,
@@ -35,6 +36,7 @@ from fair.quality.source_reviews import SourceReviewRegistry
 from fair.quality.thresholds import DEFAULT_THRESHOLDS
 from fair.schemas.api import SolveRequest, SolveResponse
 from fair.schemas.domain import Capability, ModelDescriptor, PrivacyClass, ProviderSpec
+from fair.schemas.gateway import load_gateway_review
 from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
 from fair.security.credentials import CredentialConfigurationError
@@ -60,8 +62,8 @@ def _review_reference():
     return f"builtin-provider-review-{_BUILTIN_PROVIDER_REVIEWED_AT.date().isoformat()}"
 
 
-def _make_qualification(provider_id, free_status, models, reference):
-    reviewed = _reviewed_at()
+def _make_qualification(provider_id, free_status, models, reference, reviewed=None):
+    reviewed = reviewed if reviewed is not None else _reviewed_at()
     return ProviderQualification(
         provider_id=provider_id,
         free_status=free_status,
@@ -301,6 +303,10 @@ _CLOUD_PROVIDERS = {
 
 _LOCAL_CONTEXT_CAP = 16384
 
+# A FreeLLMAPI gateway is not a built-in cloud provider: which models and provider
+# accounts sit behind it is the operator's own review, dated in its own file.
+_GATEWAY_PROVIDER = "freellmapi"
+
 
 _OFF = frozenset({"", "0", "false", "no", "off"})
 
@@ -401,6 +407,9 @@ class FAIR:
         ollama_cloud_api_key: str | None = None,
         cloudflare_api_token: str | None = None,
         cloudflare_account_id: str | None = None,
+        freellmapi_api_key: str | None = None,
+        freellmapi_url: str | None = None,
+        freellmapi_review: dict | str | None = None,
         confirmed_free_providers: set[str] | None = None,
         ollama_url: str | None = None,
         ollama_models: list[str] | None = None,
@@ -484,7 +493,7 @@ class FAIR:
                 "Z.ai has no recurring free API tier eligible for FAIR",
             )
             confirmed.discard("zai_free")
-        unknown_confirmations = confirmed - set(_CLOUD_PROVIDERS)
+        unknown_confirmations = confirmed - set(_CLOUD_PROVIDERS) - {_GATEWAY_PROVIDER}
         if unknown_confirmations:
             names = ", ".join(sorted(unknown_confirmations))
             raise ValueError(f"Unknown confirmed free provider(s): {names}")
@@ -525,6 +534,16 @@ class FAIR:
                 # provider. Only these three are expected here; a genuine
                 # programming error still surfaces.
                 self.skipped[provider_id] = _skip_reason(error)
+
+        gateway_key = freellmapi_api_key or env.get("FREELLMAPI_API_KEY")
+        if gateway_key and gateway_key.strip():
+            self._configure_gateway(
+                gateway_key.strip(),
+                freellmapi_url or env.get("FREELLMAPI_URL") or "http://127.0.0.1:3001",
+                freellmapi_review or env.get("FREELLMAPI_REVIEW"),
+                confirmed,
+                live_settings,
+            )
 
         ollama_url = ollama_url or env.get("OLLAMA_URL") or env.get("OLLAMA_HOST")
         if not ollama_url and env.get("OLLAMA_ENABLED"):
@@ -616,6 +635,92 @@ class FAIR:
         adapter = CredentialedAdapter(
             provider_id,
             entry["adapter"](spec, settings, credential=credential, **extra),
+            credential,
+        )
+        self._registry.register(spec, adapter)
+
+    def _configure_gateway(self, api_key, url, review, confirmed, settings):
+        """Register a FreeLLMAPI gateway, or record why it was left out."""
+        if _GATEWAY_PROVIDER not in confirmed:
+            self.skipped[_GATEWAY_PROVIDER] = (
+                "explicit free-tier account confirmation required for every provider key "
+                "loaded into the gateway; pass confirmed_free_providers with this provider_id"
+            )
+            return
+        if not review:
+            self.skipped[_GATEWAY_PROVIDER] = (
+                "FREELLMAPI_REVIEW is required: a dated review of each model and its routes"
+            )
+            return
+        try:
+            review = load_gateway_review(review)
+        except (OSError, ValueError):
+            # Never the exception text: a validation error quotes the file's contents.
+            self.skipped[_GATEWAY_PROVIDER] = "gateway review is missing or invalid"
+            return
+        try:
+            self._register_gateway(api_key, _loopback(url).removesuffix("/v1"), review, settings)
+        except ValueError:
+            self.skipped[_GATEWAY_PROVIDER] = "FreeLLMAPI requires a literal loopback HTTP endpoint"
+        except AdmissionDenied:
+            self.skipped[_GATEWAY_PROVIDER] = (
+                "gateway review is expired or post-dated; re-verify every route, then "
+                "update reviewed_at"
+            )
+        except (AuthenticationFailed, CredentialConfigurationError):
+            self.skipped[_GATEWAY_PROVIDER] = (
+                "gateway adapter refused admission; a reviewed model must be a concrete "
+                "catalog id, never auto or fusion"
+            )
+
+    def _register_gateway(self, api_key, url, review, settings):
+        # Validate before mutating the shared settings used by cloud adapters.
+        LiveSettings(freellmapi_url=url)
+        models = [
+            ModelDescriptor(
+                model_id=entry.model_id,
+                context_window=entry.context_window,
+                max_output_tokens=entry.max_output_tokens,
+                independence_group=entry.independence_group,
+                capabilities=set(
+                    TEXT_CAPABILITIES if entry.structured_output else _NO_STRUCTURED_OUTPUT
+                ),
+            )
+            for entry in review.models
+        ]
+        reference = f"gateway-review-{review.reviewed_at.isoformat()}:{review.reviewer_reference}"
+        spec = ProviderSpec(
+            provider_id=_GATEWAY_PROVIDER,
+            access_class="FREE_RECURRING",
+            status="ACTIVE",
+            current_access_cost_usd=0,
+            requires_paid_subscription=False,
+            requires_credit_purchase=False,
+            auto_billing_required=False,
+            programmatic_access=True,
+            production_eligibility=True,
+            terms_last_verified=review.reviewed,
+            models=models,
+            # No local request ceiling. The gateway keeps the per-key ledgers for the
+            # accounts behind it, and a second count here would only disagree with it.
+            qualification=_make_qualification(
+                _GATEWAY_PROVIDER,
+                _FREE_STATUS["FREE_RECURRING"],
+                models,
+                f"{reference}:operator-confirmed",
+                reviewed=review.reviewed,
+            ),
+        )
+        credential = SecretStr(api_key)
+        settings.freellmapi_url = url
+        adapter = CredentialedAdapter(
+            _GATEWAY_PROVIDER,
+            FreeLLMAPIAdapter(
+                spec,
+                settings,
+                credential=credential,
+                routes={entry.model_id: entry.routes for entry in review.models},
+            ),
             credential,
         )
         self._registry.register(spec, adapter)

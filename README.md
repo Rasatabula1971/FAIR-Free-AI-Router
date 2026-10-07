@@ -80,6 +80,7 @@ print(result.output)  # "345"
 | OpenRouter | `OPENROUTER_API_KEY` | Free dynamic (`:free`, $0 priced, `data_collection=deny`, 50 requests/day on a free account) | `nemotron-3-ultra-550b-a55b`†, `nex-n2.5-mini`, `north-mini-code`† |
 | Kilo | `KILO_API_KEY` | Free dynamic (`:free`, live $0 pricing; trial/preview/known limited-time routes excluded) | `qwen3.8-27b`, `inkling-small`, `north-mini-code`, `lfm-2.5-2.6b` |
 | Ollama (local) | `OLLAMA_HOST` or `OLLAMA_URL` | Free local | auto-discovered from the daemon |
+| FreeLLMAPI gateway | `FREELLMAPI_API_KEY` + `FREELLMAPI_REVIEW` | Free recurring, operator-reviewed routes | from the review file |
 
 † Nemotron 3 Ultra and North Mini Code do not accept `response_format`, so they are not
 advertised as `structured_output` capable and are never selected for a task that needs a JSON schema.
@@ -150,6 +151,70 @@ current Free plan is a starter usage-credit pool and cloud models have published
 prices, so it does not satisfy FAIR's recurring-zero-cost requirement. NVIDIA's hosted NIM
 preview API is also excluded because its hosted access is credit-based for new accounts.
 Local Ollama remains fully supported.
+
+## FreeLLMAPI as a provider
+
+[FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi) is a self-hosted gateway that
+holds provider keys and fails over between the accounts serving a model. FAIR can use an
+unmodified install as one more provider, for platforms it has no adapter of its own for:
+
+```text
+FREELLMAPI_API_KEY=freellmapi-...            # the gateway's unified key (Keys page)
+FREELLMAPI_URL=http://127.0.0.1:3001         # literal loopback only
+FREELLMAPI_REVIEW=C:\FAIR\freellmapi.review.json
+FAIR_CONFIRMED_FREE_PROVIDERS=freellmapi
+```
+
+FAIR chooses the model and the gateway chooses which account answers. FAIR always sends a
+concrete catalog id, which pins the gateway to that one model: it fails over between that
+model's providers and never to a different model. `auto`, `auto:<profile>` and `fusion`
+route across everything enabled and are refused at admission.
+
+The review file is what makes that safe. It lists each model FAIR may ask for and every
+route it may be answered from, exactly as the gateway reports it in `X-Routed-Via`:
+
+```json
+{
+  "reviewed_at": "2026-10-07",
+  "reviewer_reference": "initials-or-ticket",
+  "models": [
+    {
+      "model_id": "gpt-oss-120b",
+      "context_window": 131072,
+      "max_output_tokens": 4096,
+      "structured_output": false,
+      "routes": ["cerebras/gpt-oss-120b"]
+    }
+  ]
+}
+```
+
+- **A route is an account you checked.** `cerebras/gpt-oss-120b` says the Cerebras key in
+  the gateway is on a plan that cannot bill. An answer from any route not listed is refused
+  as a cost nobody vouched for and the gateway is blocked until an operator resumes it;
+  `safe_diagnostics()["last_route"]` names the route that was refused. Confirming
+  `freellmapi` attests this for every key loaded into the gateway, not for one of them.
+- **The review expires.** Evidence is dated from `reviewed_at` and lapses on the same
+  30-day clock as a built-in provider, so restarting renews nothing.
+- **PUBLIC only.** The hop is loopback; the request still leaves the host. Nothing above
+  `PUBLIC` is ever sent to the gateway.
+- **One account, one door.** A provider account loaded into the gateway must not also be
+  configured in FAIR directly: two quota ledgers would each spend the same allowance.
+  FAIR keeps no request count for the gateway and reacts to its refusals instead. Keep
+  OpenRouter and Kilo direct, where the adapter proves a zero cost on every response.
+- **Same weights, same group.** A gateway model that names the same weights as a direct
+  descriptor needs the same `independence_group` on both, or a cross-check can ask one
+  model twice. `gpt-oss-120b` above is Groq's `openai/gpt-oss-120b`, whose built-in
+  descriptor carries no group today: add one to both before cross-checking across them.
+- **`structured_output` stays off** until a schema request has worked on every listed
+  route. The gateway only checks that an answer parses as JSON; `expected_schema` is still
+  validated here.
+
+Run the gateway with `CATALOG_SYNC_DISABLED=1`, a pinned image tag, and its response cache
+left off. Its catalog otherwise updates itself twice a day and enables what it adds, and a
+route that appears that way is unreviewed: FAIR refuses it, which takes the gateway out of
+rotation until the review is brought up to date. A replayed answer reports its route as
+`cache` and is refused for the same reason.
 
 ## When a reservation is given back
 
@@ -710,6 +775,9 @@ FAIR(
     kilo_api_key="...",           # or env: KILO_API_KEY
     cloudflare_api_token="...",   # or env: CLOUDFLARE_API_TOKEN
     cloudflare_account_id="...",  # or env: CLOUDFLARE_ACCOUNT_ID
+    freellmapi_api_key="...",     # or env: FREELLMAPI_API_KEY (see FreeLLMAPI as a provider)
+    freellmapi_url="...",         # or env: FREELLMAPI_URL; loopback only
+    freellmapi_review="...",      # or env: FREELLMAPI_REVIEW; path or dict
     confirmed_free_providers={     # explicit account-tier confirmation where required
         "google_gemini_api",
         "groq",

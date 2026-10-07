@@ -1,6 +1,7 @@
 """Opt-in text adapters with fixed transports and conservative provider observations."""
 
 import codecs
+import contextvars
 import copy
 import ipaddress
 import json
@@ -79,14 +80,18 @@ class LiveSettings(DTO):
     # nothing. Raise both only for a route whose real ceiling has been measured.
     max_output_tokens_ceiling: int = Field(default=MAX_OUTPUT_TOKENS_CEILING, ge=1, le=131072)
     ollama_url: str = "http://127.0.0.1:11434"
+    # A FreeLLMAPI gateway run by the same operator on the same host. Loopback is
+    # where the hop ends, not where the request does: the gateway forwards to cloud
+    # providers, so FreeLLMAPIAdapter stays a remote, PUBLIC-only adapter.
+    freellmapi_url: str = "http://127.0.0.1:3001"
     confirmed_providers: set[str] = Field(default_factory=set)
     review_max_age_days: int = Field(default=30, ge=1, le=30)
 
-    @model_validator(mode="after")
-    def local_endpoint(self):
+    @staticmethod
+    def _literal_loopback(value):
         try:
-            url = urlsplit(self.ollama_url)
-            valid = (
+            url = urlsplit(value)
+            return (
                 url.scheme == "http"
                 and ipaddress.ip_address(url.hostname).is_loopback
                 and not url.username
@@ -97,9 +102,14 @@ class LiveSettings(DTO):
                 and (url.port is None or 1 <= url.port <= 65535)
             )
         except (ValueError, TypeError):
-            valid = False
-        if not valid:
+            return False
+
+    @model_validator(mode="after")
+    def local_endpoint(self):
+        if not self._literal_loopback(self.ollama_url):
             raise ValueError("Ollama requires a literal loopback HTTP endpoint")
+        if not self._literal_loopback(self.freellmapi_url):
+            raise ValueError("FreeLLMAPI requires a literal loopback HTTP endpoint")
         return self
 
     def confirmed(self, provider_id):
@@ -748,6 +758,15 @@ class TextAdapter:
     def _task_text(request, note):
         return request.task if note is None else request.task + "\n\n" + note
 
+    def _served_as(self, data, model):
+        """Whether this completion came from the model that was asked for.
+
+        A provider answers under the id it was sent, so equality is the whole check.
+        A gateway that picks the upstream itself answers under the upstream's id
+        instead, and has to prove the route some other way; see FreeLLMAPIAdapter.
+        """
+        return data["model"] == model.model_id
+
     async def complete(self, request):
         models = await self.list_models()
         model = next((item for item in models if item.model_id == request.model_id), None)
@@ -789,7 +808,7 @@ class TextAdapter:
         try:
             choices = data["choices"]
             if (
-                data["model"] != model.model_id
+                not self._served_as(data, model)
                 or not isinstance(choices, list)
                 or len(choices) != 1
             ):
@@ -1416,6 +1435,143 @@ class GeminiAdapter(TextAdapter):
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             raise MalformedResponse("INVALID_GEMINI_COMPLETION") from None
+
+
+# The route a gateway reports for the completion being read. It is per task, not per
+# adapter: one adapter serves concurrent solves, and a route check that could read
+# another request's header would be a check of nothing.
+_GATEWAY_ROUTE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "fair_gateway_route", default=None
+)
+
+
+class FreeLLMAPIAdapter(TextAdapter):
+    """An unmodified FreeLLMAPI gateway on this host, used as one FAIR provider.
+
+    FAIR picks the model and FreeLLMAPI picks which provider account serves it.
+    Sending a concrete catalog id pins the gateway to that one logical model: it
+    fails over between the providers serving it and never to a different model.
+    The virtual ids that route across the whole pool are refused at admission.
+
+    That leaves the one thing every other adapter gets for free and this one does
+    not: knowing who answered. The gateway reports it in ``X-Routed-Via`` as
+    ``<platform>/<model>``, and rewrites the body's ``model`` to that upstream id, so
+    neither names the id FAIR sent. Each reviewed model therefore lists the routes an
+    operator has checked, and a completion from any other route is refused as a cost
+    that cannot be vouched for -- a provider account nobody reviewed answered.
+
+    Loopback is where the hop ends, not where the request does. The gateway forwards
+    to cloud providers, so this stays a remote adapter and PUBLIC is the only data
+    class it may carry.
+    """
+
+    expected_provider = "freellmapi"
+    expected_access = "FREE_RECURRING"
+    # /v1/models reports the largest context among a model's providers, which says
+    # nothing about the reviewed route. The reviewed window governs.
+    context_field = None
+
+    _virtual_models = frozenset({"auto", "fusion"})
+    # What a gateway refusal says about one pinned model rather than the gateway.
+    # Read from FreeLLMAPI v0.13.6 (lib/fallback-loop.ts); its own per-client limiter
+    # answers 429 with no code and keeps the provider-wide classification.
+    _model_scoped_errors = {
+        (429, "rate_limit_exceeded"): "GATEWAY_MODEL_EXHAUSTED",
+        (429, "quota_exceeded"): "GATEWAY_MODEL_EXHAUSTED",
+        (429, "routing_exhausted"): "GATEWAY_MODEL_EXHAUSTED",
+        (404, "model_not_found"): "GATEWAY_MODEL_NOT_FOUND",
+        (503, "no_providers_configured"): "GATEWAY_MODEL_HAS_NO_KEY",
+    }
+
+    def __init__(self, spec, settings, *, routes, **kwargs):
+        self.base_url = settings.freellmapi_url.rstrip("/") + "/v1"
+        self._routes = {model_id: frozenset(allowed) for model_id, allowed in routes.items()}
+        self._route_observation: dict[str, str] | None = None
+        super().__init__(spec, settings, **kwargs)
+
+    def _admit(self):
+        super()._admit()
+        for model in self.spec.models:
+            name = model.model_id.casefold()
+            if name in self._virtual_models or name.startswith("auto:"):
+                raise AuthenticationFailed("GATEWAY_VIRTUAL_MODEL_NOT_ALLOWED")
+            if not self._routes.get(model.model_id):
+                raise AuthenticationFailed("GATEWAY_ROUTE_REVIEW_REQUIRED")
+
+    def safe_diagnostics(self):
+        record = super().safe_diagnostics()
+        if self._route_observation:
+            record["last_route"] = dict(self._route_observation)
+        return record
+
+    def _completion_timeout(self, request, streaming):
+        # The gateway holds a stream's headers until the first payload, failing over
+        # upstream in between, and holds a structured answer until it has all of it.
+        # Nothing arrives during either, so a per-chunk idle budget would cancel an
+        # answer that was being written. Stalls are the gateway's to detect.
+        return super()._completion_timeout(request, streaming=False)
+
+    def _observe(self, headers):
+        _GATEWAY_ROUTE.set(headers.get("x-routed-via"))
+        return super()._observe(headers)
+
+    def _error_from_body(self, status, headers, data):
+        error = data.get("error") if isinstance(data, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if status == 413 and code == "context_length_exceeded":
+            raise RequestNotSupported("GATEWAY_CONTEXT_EXCEEDED")
+        scoped = self._model_scoped_errors.get((status, code)) if isinstance(code, str) else None
+        if scoped is not None:
+            # One pinned model being out of quota is not the gateway being down.
+            # Classified by status alone it throttled every model behind the gateway.
+            raise ModelUnavailable(scoped)
+        self._error(status, headers)
+
+    async def _fetch_models(self):
+        entries = [
+            entry
+            for entry in self._catalog_entries(await self._json("GET", self.catalog_path))
+            if isinstance(entry, dict)
+        ]
+        result, dropped = [], {}
+        for configured in self.spec.models:
+            if not configured.active:
+                dropped[configured.model_id] = "DESCRIPTOR_INACTIVE"
+                continue
+            matches = [e for e in entries if e.get(self.catalog_id_key) == configured.model_id]
+            if len(matches) != 1:
+                dropped[configured.model_id] = (
+                    "ABSENT_FROM_CATALOG" if not matches else "AMBIGUOUS_IN_CATALOG"
+                )
+            elif matches[0].get("available") is not True:
+                dropped[configured.model_id] = "NO_USABLE_KEY_IN_GATEWAY"
+            elif matches[0].get("execution_status") == "exhausted":
+                dropped[configured.model_id] = "EXHAUSTED_IN_GATEWAY"
+            else:
+                result.append(configured.model_copy(deep=True))
+        self._catalog_drops = dropped
+        return result
+
+    def _served_as(self, data, model):
+        routed = _GATEWAY_ROUTE.get()
+        reviewed = routed is not None and routed in self._routes.get(model.model_id, ())
+        self._route_observation = {
+            "model_id": model.model_id,
+            "routed_via": (routed if routed is not None else "ABSENT")[:160],
+            "verdict": "REVIEWED" if reviewed else "UNREVIEWED",
+        }
+        if not reviewed:
+            raise BillingViolation("UNREVIEWED_GATEWAY_ROUTE")
+        # The gateway writes the upstream's id into the body and into the header from
+        # one value. A body naming anything else did not come from the reported route.
+        return data["model"] == routed.partition("/")[2]
+
+    async def complete(self, request):
+        token = _GATEWAY_ROUTE.set(None)
+        try:
+            return await super().complete(request)
+        finally:
+            _GATEWAY_ROUTE.reset(token)
 
 
 class OllamaLocalAdapter(TextAdapter):
