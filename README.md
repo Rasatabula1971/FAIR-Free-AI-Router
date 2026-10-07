@@ -210,11 +210,15 @@ route it may be answered from, exactly as the gateway reports it in `X-Routed-Vi
   route. The gateway only checks that an answer parses as JSON; `expected_schema` is still
   validated here.
 
-Run the gateway with `CATALOG_SYNC_DISABLED=1`, a pinned image tag, and its response cache
+Run the gateway with `CATALOG_SYNC_DISABLED=1`, a pinned release, and its response cache
 left off. Its catalog otherwise updates itself twice a day and enables what it adds, and a
 route that appears that way is unreviewed: FAIR refuses it, which takes the gateway out of
 rotation until the review is brought up to date. A replayed answer reports its route as
 `cache` and is refused for the same reason.
+
+Docker is not required. Built from a release tag (`npm ci`, `npm run build`,
+`node server/dist/index.js`) the gateway reads the same settings from its own `.env`, but
+it then listens on every interface unless that file also sets `HOST=127.0.0.1`.
 
 ## When a reservation is given back
 
