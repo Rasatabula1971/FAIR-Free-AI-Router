@@ -8,6 +8,27 @@ from fair.schemas.qualification import FreeStatus
 REVIEW_MAX_AGE = timedelta(days=30)
 
 
+def review_expiry(spec):
+    """When a provider's review stops admitting it by the passing of time alone.
+
+    None for a provider with no review to expire. Every dated condition in
+    ``qualified`` is read here, so the answer is the earliest of them: the
+    review's own expiry and the age limit on each active model's live test. An
+    operator needs this before it happens -- afterwards the provider is simply
+    gone from routing, and the first sign is requests that used to succeed.
+    """
+    evidence = spec.qualification
+    if evidence is None or evidence.expires_at is None:
+        return None
+    reviewed = {model.model_id: model for model in evidence.models}
+    limits = [evidence.expires_at]
+    for model in spec.models:
+        review = reviewed.get(model.model_id)
+        if model.active and review is not None and review.live_test_at is not None:
+            limits.append(review.live_test_at + REVIEW_MAX_AGE)
+    return min(limits)
+
+
 def qualified(spec, now):
     evidence = spec.qualification
     # Local transports retain their existing local-weight and cloud-exclusion controls.
