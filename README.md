@@ -227,7 +227,9 @@ way with no answer in between, the wait did not hold: another application is fil
 window, or the request can never fit it. The second refusal in a row is held for the full
 60 seconds and a third for the cooldown, so a model that keeps refusing costs three
 requests in six minutes rather than one every few seconds. Any answer from the model
-starts the count again, so a model working at its limit keeps the short waits.
+starts the count again, so a model working at its limit keeps the short waits. Refusals
+of requests that were already in flight when the window filled arrive while the first
+bench is still running; they extend it if they state a longer wait but are not counted.
 
 **A request too large for a route is not an outage.** A single request that asks for
 more than a model's whole per-minute allowance is refused outright, and no wait changes

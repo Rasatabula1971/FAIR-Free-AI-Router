@@ -935,6 +935,21 @@ class TestGroq:
         # The most recent are the ones kept.
         assert held[-1]["output_budget"] == 2900
 
+    async def test_a_larger_refusal_arriving_late_does_not_push_out_the_smaller(self):
+        """Requests in flight together are refused in any order. A larger size the
+        list already covers used to be appended anyway, and nine of them pushed the
+        smallest, the one covering them all, out of the bounded list."""
+        adapter, sent, _ = self._sized()
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(2100))
+        [held] = adapter._refused_sizes[self.MODEL]
+        for step in range(1, 12):
+            adapter._remember_refused_size(self.MODEL, held[0] + step, held[1] + step * 100)
+        assert adapter._refused_sizes[self.MODEL] == [held]
+        with pytest.raises(RequestNotSupported, match="^SIZE_ALREADY_REFUSED"):
+            await adapter.complete(self._asking(2100))
+        assert sent() == 1
+
     async def test_one_refused_size_expiring_does_not_take_the_others_with_it(self):
         adapter, sent, clock = self._sized()
         with pytest.raises(RequestTooLarge):

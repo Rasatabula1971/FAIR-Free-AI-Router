@@ -700,6 +700,14 @@ class MemoryQuotaGovernor:
         if not per_minute:
             return now + max(self.settings.cooldown_seconds, delay)
         count, until = self._minute_strikes.get(key, (0, float("-inf")))
+        if now < until:
+            # The bench this refusal would extend is still running, so the request
+            # was sent before the wait was known: several in flight at once when
+            # the window filled. It says nothing about whether the wait held, so
+            # it extends the bench without counting as another strike.
+            until = max(until, now + (delay or _PER_MINUTE_WINDOW_SECONDS))
+            self._minute_strikes[key] = (count, until)
+            return until
         # A refusal long after the last bench ended is not the same episode.
         count = count + 1 if now - until <= _PER_MINUTE_WINDOW_SECONDS else 1
         if count == 1:

@@ -449,11 +449,14 @@ class TextAdapter:
         is bounded so nothing a provider says can grow it without limit.
         """
         now = self.clock()
-        kept = [
-            size
-            for size in self._refused_sizes.get(model_id, ())
-            if now < size[2] and not (size[0] >= prompt and size[1] >= budget)
-        ]
+        live = [size for size in self._refused_sizes.get(model_id, ()) if now < size[2]]
+        if any(size[0] <= prompt and size[1] <= budget for size in live):
+            # Already covered: requests in flight together are refused in any
+            # order, and adding a larger one only pushes the smaller out of the
+            # bounded list, after which that smaller size is sent again.
+            self._refused_sizes[model_id] = live
+            return
+        kept = [size for size in live if not (size[0] >= prompt and size[1] >= budget)]
         kept.append((prompt, budget, now + self._refused_size_ttl))
         self._refused_sizes[model_id] = kept[-self._refused_size_slots :]
 

@@ -211,6 +211,29 @@ class TestAStatedWaitIsTrustedOnce:
             clock.now += holds[-1]  # asked again the moment the bench ends
         assert holds == [2, 60, 360, 360]
 
+    def test_refusals_of_requests_already_in_flight_are_not_strikes(self):
+        """Several requests to one model were out when its window filled, and all
+        come back refused at once. None was sent after the wait, so none says the
+        wait failed: found by the verification pass, where this held a healthy
+        model for the six-minute cooldown."""
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        for _ in range(3):
+            assert self._refuse(governor, clock, wait=5) == 5
+        clock.now += 1
+        # A later one in the same burst may state a longer wait; that is honoured.
+        assert self._refuse(governor, clock, wait=9) == 9
+        clock.now += 9
+        # The first refusal after the bench ended is the real second strike.
+        assert self._refuse(governor, clock, wait=5) == 60
+
+    def test_a_burst_against_the_whole_provider_is_not_strikes_either(self):
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        for _ in range(3):
+            governor.throttle("p", retry_after=5, per_minute=True)
+        assert governor.state("p").throttled_until == clock.now + 5
+
     def test_a_longer_stated_wait_is_never_cut_down(self):
         clock = Clock()
         governor = _governor(clock, cooldown_seconds=360)
