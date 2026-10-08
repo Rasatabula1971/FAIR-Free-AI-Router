@@ -20,7 +20,12 @@ from fair.providers.base import QuotaExceeded, RateLimited
 from fair.providers.registry import Registry
 from fair.quality.thresholds import DEFAULT_THRESHOLDS
 from fair.schemas.api import SolveRequest
-from fair.schemas.domain import NormalizedModelRequest, NormalizedModelResponse, ProviderSpec
+from fair.schemas.domain import (
+    NormalizedModelRequest,
+    NormalizedModelResponse,
+    ProviderSpec,
+    QuotaSnapshot,
+)
 from fair.security.adapter import CredentialedAdapter
 
 FIRST, SECOND = "alpha", "beta"
@@ -188,6 +193,140 @@ class TestGovernor:
         # Local, like a throttle: the other application still has the whole pool.
         assert two.available(spec) is True
         assert two.model_available("p", FIRST) is True
+
+
+class TestPerModelAllowance:
+    """observe_model: an allowance a provider reports for one model only."""
+
+    @staticmethod
+    def _seen(remaining, limit=1000, reset_at=None, model_id=FIRST, provider_id="p"):
+        return QuotaSnapshot(
+            provider_id=provider_id,
+            quota_limit=limit,
+            quota_remaining_estimate=remaining,
+            reset_at=reset_at,
+            model_id=model_id,
+        )
+
+    def test_none_left_benches_the_model_until_the_providers_reset(self):
+        clock = Clock()
+        governor, spec = _governor(clock), _spec(request_limit=1000)
+        governor.observe_model(spec, FIRST, self._seen(0, reset_at=clock.now + 7380))
+        assert governor.benched_models("p") == {FIRST: clock.now + 7380}
+        assert governor.model_available("p", SECOND) is True
+        assert governor.state("p").exhausted is False
+        assert governor.state("p").used == 0
+        assert governor.available(spec) is True
+
+    def test_none_left_without_a_usable_reset_falls_back_like_a_refusal(self):
+        clock = Clock()
+        governor, spec = _governor(clock), _spec(request_limit=1000)
+        governor.observe_model(spec, FIRST, self._seen(0, reset_at=None))
+        refused = _governor(clock)
+        refused.exhaust_model(spec, FIRST, reset_at=None)
+        assert governor.benched_models("p") == refused.benched_models("p")
+
+    @pytest.mark.parametrize("remaining", [1, 500, 1000])
+    def test_requests_left_change_nothing(self, remaining):
+        governor, spec = _governor(), _spec(request_limit=1000)
+        governor.reserve(spec, "c")
+        governor.observe_model(spec, FIRST, self._seen(remaining))
+        assert governor.benched_models("p") == {}
+        # Not even the provider's count: one model's figure is not the provider's.
+        assert governor.state("p").used == 1
+
+    def test_a_snapshot_without_a_limit_is_not_taken_as_spent(self):
+        governor, spec = _governor(), _spec()
+        governor.observe_model(spec, FIRST, self._seen(0, limit=None))
+        assert governor.benched_models("p") == {}
+
+    @pytest.mark.parametrize(
+        "seen", [{"model_id": SECOND}, {"model_id": None}, {"provider_id": "q"}]
+    )
+    def test_a_snapshot_for_another_model_or_provider_is_refused(self, seen):
+        governor, spec = _governor(), _spec()
+        with pytest.raises(ValueError):
+            governor.observe_model(spec, FIRST, self._seen(0, **seen))
+        assert governor.benched_models("p") == {}
+
+    async def test_the_router_hands_a_per_model_report_to_the_model(self):
+        clock = Clock()
+
+        class Reporting(PerModel):
+            async def complete(self, request):
+                response = await super().complete(request)
+                return response.model_copy(
+                    update={
+                        "quota": QuotaSnapshot(
+                            provider_id="p",
+                            quota_limit=1000,
+                            quota_remaining_estimate=0,
+                            reset_at=clock.now + 900,
+                            model_id=request.model_id,
+                        )
+                    }
+                )
+
+        spec = _spec(request_limit=1000)
+        registry = Registry()
+        registry.register(spec, Reporting("p", {FIRST: "345", SECOND: "345"}))
+        thresholds = {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}
+        router = EmbeddedRouter(registry, RoutingSettings(), thresholds)
+        router.quota.clock = clock
+        result = await router.solve(_request())
+        assert result.status == "ACCEPTED"
+        assert router.quota.benched_models("p") == {result.model_id: clock.now + 900}
+        assert router.quota.state("p").exhausted is False
+
+    async def test_a_report_for_the_provider_still_reaches_the_provider(self):
+        """Untagged, an allowance is the provider's: none left spends all of it."""
+
+        class Reporting(PerModel):
+            async def complete(self, request):
+                response = await super().complete(request)
+                return response.model_copy(
+                    update={
+                        "quota": QuotaSnapshot(
+                            provider_id="p", quota_limit=50, quota_remaining_estimate=0
+                        )
+                    }
+                )
+
+        spec = _spec(request_limit=50)
+        registry = Registry()
+        registry.register(spec, Reporting("p", {FIRST: "345", SECOND: "345"}))
+        thresholds = {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}
+        router = EmbeddedRouter(registry, RoutingSettings(), thresholds)
+        result = await router.solve(_request())
+        assert result.status == "ACCEPTED"
+        assert router.quota.state("p").exhausted is True
+        assert router.quota.benched_models("p") == {}
+
+    async def test_a_report_tagged_for_another_model_is_not_accepted(self):
+        class Mislabelled(PerModel):
+            async def complete(self, request):
+                response = await super().complete(request)
+                other = SECOND if request.model_id == FIRST else FIRST
+                return response.model_copy(
+                    update={
+                        "quota": QuotaSnapshot(
+                            provider_id="p",
+                            quota_limit=1000,
+                            quota_remaining_estimate=0,
+                            model_id=other,
+                        )
+                    }
+                )
+
+        spec = _spec()
+        registry = Registry()
+        registry.register(spec, Mislabelled("p", {FIRST: "345", SECOND: "345"}))
+        thresholds = {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}
+        router = EmbeddedRouter(registry, RoutingSettings(), thresholds)
+        result = await router.solve(_request())
+        # Neither model is benched on a report about the wrong one.
+        assert router.quota.benched_models("p") == {}
+        assert result.status != "ACCEPTED"
 
 
 class TestSelector:

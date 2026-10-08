@@ -194,6 +194,9 @@ class QuotaSnapshot(DTO):
     quota_limit: int | None = Field(default=None, ge=0)
     quota_remaining_estimate: int | None = Field(default=None, ge=0)
     reset_at: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    # Set when the provider counts this allowance per model, and only then: the
+    # figures describe that one model, never the provider. None is the provider.
+    model_id: str | None = None
 
 
 class NormalizedModelResponse(DTO):

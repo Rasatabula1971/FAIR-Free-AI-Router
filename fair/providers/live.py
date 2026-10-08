@@ -5,6 +5,7 @@ import copy
 import ipaddress
 import json
 import re
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
@@ -53,6 +54,12 @@ MAX_OUTPUT_TOKENS = 4096
 # an unprobed model stays at MAX_OUTPUT_TOKENS. Probed 2026-09-30, four routes took
 # a 32768-token request, so that is as far as a reviewed descriptor may now reach.
 MAX_OUTPUT_TOKENS_CEILING = 32768
+# The allowance the response now being read reported. It belongs to the call, not
+# the adapter: an adapter-wide snapshot read after a stream ends is whatever the
+# last response to finish reported, and with two calls in flight that is often
+# the other one's -- one model's spent allowance riding on its sibling's answer.
+# Each asyncio task sees its own value, so concurrent completions cannot mix.
+_OBSERVED: ContextVar[QuotaSnapshot | None] = ContextVar("fair_observed_quota", default=None)
 
 
 class LiveSettings(DTO):
@@ -210,6 +217,9 @@ class TextAdapter:
     # How many refused sizes are kept per model. Two already cover the shapes that
     # differ in kind, a long prompt and a large answer; the rest is headroom.
     _refused_size_slots = 8
+    # Whether this provider's request headers count each model separately. Only on
+    # the provider's own documentation: unset, a report is read as the provider's.
+    quota_per_model = False
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -303,11 +313,10 @@ class TextAdapter:
             raise QuotaExceeded("FREE_ACCESS_UNAVAILABLE")
         if status == 429:
             observation = self._observe(headers)
-            # self._quota is what the next successful response hands the governor
-            # as the provider's allowance. One model's spent allowance is not that:
-            # a completion streaming from a sibling at the same moment would carry
-            # it back and exhaust every model, which is the outcome model scope
-            # exists to prevent.
+            # self._quota is the provider's allowance as quota() reports it. One
+            # model's spent allowance is not that. (Answers no longer carry it to
+            # the governor -- each takes its own response's report, see _OBSERVED
+            # -- but a reader of quota() would still see every model spent.)
             if not model_scoped:
                 self._quota = observation
             if observation.quota_remaining_estimate == 0:
@@ -538,6 +547,7 @@ class TextAdapter:
                     self._error_from_body(response.status_code, response.headers, body)
                     raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                 self._quota = self._observe(response.headers)
+                _OBSERVED.set(self._quota)
                 async for line in self._stream_lines(response):
                     size += len(line)
                     if size > _MAX_STREAM_BYTES or len(chunks) > 100_000:
@@ -689,6 +699,7 @@ class TextAdapter:
                     )
                     raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                 self._quota = self._observe(response.headers)
+                _OBSERVED.set(self._quota)
                 return value
         except httpx.HTTPError:
             raise ProviderUnavailable("PROVIDER_TRANSPORT_FAILED") from None
@@ -705,6 +716,13 @@ class TextAdapter:
 
     async def quota(self):
         return self._quota.model_copy(deep=True)
+
+    def _response_quota(self, model_id):
+        """The allowance this call's own response reported, for the governor."""
+        observed = _OBSERVED.get()
+        if observed is not None and self.quota_per_model:
+            return observed.model_copy(update={"model_id": model_id})
+        return observed
 
     async def list_models(self):
         if self.catalog_path is None:
@@ -902,7 +920,7 @@ class TextAdapter:
                 model_id=model.model_id,
                 text=content,
                 finish_reason=choice["finish_reason"],
-                quota=self._quota,
+                quota=self._response_quota(model.model_id),
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             raise MalformedResponse("INVALID_CHAT_COMPLETION") from None
@@ -914,6 +932,12 @@ class GroqAdapter(TextAdapter):
     expected_access = "FREE_RECURRING"
     context_field = "context_window"
     output_tokens_key = "max_completion_tokens"
+    # Groq documents its limits as applying per model, and x-ratelimit-*-requests is
+    # the requests-per-day one. A 200 reporting none left says that model is spent,
+    # not Groq: read as the provider's, it benched every Groq model until the spent
+    # one reset, up to a day, and a model down to its last few requests pushed the
+    # provider's count to within as many of its cap.
+    quota_per_model = True
 
     def _observe(self, headers):
         try:
@@ -1541,7 +1565,7 @@ class GeminiAdapter(TextAdapter):
                 model_id=data["modelVersion"],
                 text=text,
                 finish_reason="stop" if candidate["finishReason"] == "STOP" else "length",
-                quota=self._quota,
+                quota=self._response_quota(model.model_id),
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             raise MalformedResponse("INVALID_GEMINI_COMPLETION") from None

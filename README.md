@@ -196,10 +196,16 @@ with the time each returns, and a provider whose every model is benched reports
 or `MODEL_QUOTA_EXHAUSTED`. Benches are local to the process, as throttles are: another
 application sharing the account learns of the limit from its own first refusal.
 
-Request counting is unchanged and still per provider. Groq's `request_limit` of 1000 a
-day is applied across both of its models, though Groq publishes that many for each. For
-the same reason a successful Groq answer whose headers report no requests left still
-marks the whole provider spent: per-model scope is applied to refusals only.
+Groq's request headers are per model too, so a successful answer whose headers report
+no requests left benches that model until the reset they give, as its refusal would
+have. Before, it marked all of Groq spent until then, up to a day.
+
+FAIR's own request count is still per provider. Groq's `request_limit` of 1000 a day is
+counted across both of its models, though Groq publishes that many for each, and Groq's
+headers no longer feed that count or move its window: a figure for one model is not the
+provider's. This over-counts, which is the safe direction. Each answer carries the
+allowance its own response reported, so two models answering at once cannot swap
+reports.
 
 ## Token limits
 

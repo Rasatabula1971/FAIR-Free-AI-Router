@@ -770,6 +770,22 @@ class MemoryQuotaGovernor:
         """Bench one model until a quota its provider counts per model resets."""
         self._bench_model(spec.provider_id, model_id, self._exhaustion_reset(spec, reset_at))
 
+    def observe_model(self, spec, model_id, observation):
+        """Take in an allowance the provider counts for this one model.
+
+        None left benches the model, exactly as a refusal saying so would. Nothing
+        else is taken from it. The provider's own count stays FAIR's: a figure for
+        one model is not the provider's, and folding it in either way is wrong --
+        a model near its cap would push the provider's count to within as many of
+        its limit, and a fresh one would say nothing about the rest.
+        """
+        if observation.provider_id != spec.provider_id or observation.model_id != model_id:
+            raise ValueError("Quota observation identity mismatch")
+        remaining = observation.quota_remaining_estimate
+        limit = observation.quota_limit
+        if remaining == 0 and limit is not None:
+            self.exhaust_model(spec, model_id, reset_at=observation.reset_at)
+
     def _exhaustion_reset(self, spec, reset_at):
         """When a spent allowance returns: the provider's own word, else FAIR's window."""
         if reset_at is not None and (not isfinite(reset_at) or reset_at <= self.clock()):

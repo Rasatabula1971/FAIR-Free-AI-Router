@@ -182,7 +182,10 @@ class EmbeddedRouter:
             )
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
                 raise MalformedResponse("PROVIDER_IDENTITY_MISMATCH")
-            if response.quota is not None:
+            if response.quota is not None and response.quota.model_id is not None:
+                # The provider counts this allowance per model; see observe_model.
+                self.quota.observe_model(spec, model.model_id, response.quota)
+            elif response.quota is not None:
                 await self.quota.observe_async(spec, response.quota)
             self.quota.success(spec.provider_id, probe_token=held.probe_token)
             self.quota.answered(spec.provider_id, model.model_id)

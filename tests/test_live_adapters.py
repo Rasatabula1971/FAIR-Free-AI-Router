@@ -1,5 +1,6 @@
 """Transport-level tests for the live adapters — no network, no credentials leave the process."""
 
+import contextvars
 import gzip
 import json
 from datetime import UTC, datetime, timedelta
@@ -616,6 +617,41 @@ class TestMistral:
             await adapter.complete(_request(self.MODEL))
         assert not any("/admin/spend-limit" in str(request.url) for request in seen)
 
+    async def test_an_answer_reports_its_allowance_as_the_providers(self):
+        """Mistral's request headers are not documented per model, so they stay the
+        provider's: an unknown scope is read as the widest."""
+
+        def chat(request):
+            served = _as_sse(_completion(self.MODEL))
+            return httpx.Response(
+                200,
+                content=served.content,
+                headers={
+                    "content-type": "text/event-stream",
+                    "x-ratelimit-limit-req-minute": "10",
+                    "x-ratelimit-remaining-req-minute": "0",
+                },
+            )
+
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "max_context_length": 262144}]},
+                ),
+                ("POST", "/chat/completions"): chat,
+            }
+        )
+        adapter = MistralAdapter(
+            _spec("mistral", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        response = await adapter.complete(_request(self.MODEL))
+        assert response.quota.model_id is None
+        assert response.quota.quota_remaining_estimate == 0
+
     async def test_per_minute_quota_headers_exhaust(self):
         def chat(request):
             return httpx.Response(
@@ -993,8 +1029,8 @@ class TestGroq:
         assert len(adapter.safe_diagnostics()["refused_sizes"][self.MODEL]) == 1
 
     async def test_one_models_spent_allowance_is_not_published_as_the_providers(self):
-        """The adapter's quota snapshot is what the next success on ANY model hands
-        the governor. A refusal about one model must not be left in it."""
+        """quota() reports the provider's allowance. A refusal about one model must
+        not be left in it as the provider's."""
         spent = {
             "x-ratelimit-limit-requests": "1000",
             "x-ratelimit-remaining-requests": "0",
@@ -1013,6 +1049,56 @@ class TestGroq:
             await unnamed.complete(_request(self.MODEL))
         assert raised.value.model_scoped is False
         assert (await unnamed.quota()).quota_remaining_estimate == 0
+
+    @pytest.mark.parametrize("streaming", [True, False])
+    async def test_an_answer_reports_its_allowance_as_its_models(self, streaming):
+        """Groq counts requests per model, so the snapshot names the model."""
+        spent = {
+            "x-ratelimit-limit-requests": "1000",
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": "2h3m",
+        }
+
+        def chat(request):
+            if not _asked_for_a_stream(request):
+                return httpx.Response(200, json=_completion(self.MODEL), headers=spent)
+            served = _as_sse(_completion(self.MODEL))
+            return httpx.Response(
+                200,
+                content=served.content,
+                headers={"content-type": "text/event-stream", **spent},
+            )
+
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (200, {"data": [{"id": self.MODEL, "context_window": 131072}]}),
+                ("POST", "/chat/completions"): chat,
+            }
+        )
+        clock = _Clock()
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+            clock=clock,
+        )
+        adapter.supports_streaming = streaming
+        response = await adapter.complete(_request(self.MODEL))
+        assert response.quota.model_id == self.MODEL
+        assert response.quota.quota_remaining_estimate == 0
+        assert response.quota.reset_at == clock.now + 7380
+
+    def test_with_nothing_observed_an_answer_reports_nothing(self):
+        """A call that read no response headers hands the governor no snapshot,
+        rather than one tagged with a model and no figures, or another call's."""
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+        )
+        assert contextvars.Context().run(adapter._response_quota, self.MODEL) is None
 
     async def test_a_rate_limit_is_not_remembered_as_a_size(self):
         adapter = self._refused(self.NAMED, **{"retry-after": "3"})

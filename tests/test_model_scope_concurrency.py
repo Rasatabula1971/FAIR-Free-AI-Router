@@ -28,7 +28,7 @@ from fair.providers.live import GroqAdapter, LiveSettings
 from fair.providers.registry import Registry
 from fair.quality.thresholds import DEFAULT_THRESHOLDS
 from fair.schemas.api import SolveRequest
-from fair.schemas.domain import ProviderSpec
+from fair.schemas.domain import NormalizedModelRequest, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
 from fair.security.adapter import CredentialedAdapter
 
@@ -260,3 +260,153 @@ async def test_a_model_benched_before_its_request_is_reserved_is_not_sent_one(tm
     # were sent, three are counted, here and in the shared ledger.
     assert router.quota.state("groq").used == 3
     assert ledger.remaining("groq", 1000, router.quota.clock()) == 997
+
+
+def _allowance(remaining, **extra):
+    """Groq's request headers, which it counts per model per day."""
+    return {
+        "content-type": "text/event-stream",
+        "x-ratelimit-limit-requests": "1000",
+        "x-ratelimit-remaining-requests": str(remaining),
+        "x-ratelimit-reset-requests": "2h3m",
+        **extra,
+    }
+
+
+def _asking(model):
+    return NormalizedModelRequest(
+        task="15*23",
+        model_id=model,
+        request_id="r",
+        client_id="c",
+        task_class="general",
+        max_output_tokens=64,
+    )
+
+
+async def test_an_answer_that_spends_its_models_requests_benches_that_model_only():
+    # Groq's request headers are per model. A successful answer saying none are
+    # left used to reach the governor as the provider's allowance, and every Groq
+    # model went dark until the spent one's reset -- up to a day.
+    sent = []
+
+    async def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=CATALOG)
+        model = json.loads(request.content)["model"]
+        sent.append(model)
+        return httpx.Response(
+            200,
+            content=b"".join(_frames(model)),
+            headers=_allowance(0 if len(sent) == 1 else 900),
+        )
+
+    router, _, spec = _routed(handler)
+    first = await router.solve(SolveRequest.model_validate(ASK))
+    second = await router.solve(SolveRequest.model_validate(ASK))
+
+    spent = sent[0]
+    other = SMALL if spent == BIG else BIG
+    assert (first.status, first.model_id) == ("ACCEPTED", spent)
+    assert router.quota.benched_models("groq") == {spent: router.quota.clock() + 7380}
+    assert router.quota.state("groq").exhausted is False
+    assert router.quota.available(spec) is True
+    assert (second.status, second.model_id) == ("ACCEPTED", other)
+    assert sent == [spent, other]
+    # Nor does one model's count stand in for the provider's: FAIR's own count of
+    # the two requests it sent is the provider-wide figure.
+    assert router.quota.state("groq").used == 2
+
+
+async def test_an_answer_with_requests_left_benches_nothing():
+    async def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=CATALOG)
+        model = json.loads(request.content)["model"]
+        return httpx.Response(200, content=b"".join(_frames(model)), headers=_allowance(1))
+
+    router, _, spec = _routed(handler)
+    result = await router.solve(SolveRequest.model_validate(ASK))
+
+    assert result.status == "ACCEPTED"
+    assert router.quota.benched_models("groq") == {}
+    assert router.quota.state("groq").used == 1
+    assert router.quota.available(spec) is True
+
+
+async def test_each_answer_carries_the_allowance_its_own_response_reported():
+    # The snapshot used to be one per adapter, read after the stream ended. An
+    # answer that finished while a sibling was still streaming handed its headers
+    # to the sibling, so the model that was fine would be benched as spent.
+    streaming, finish = asyncio.Event(), asyncio.Event()
+
+    async def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=CATALOG)
+        model = json.loads(request.content)["model"]
+        if model == BIG:
+            return httpx.Response(200, content=b"".join(_frames(BIG)), headers=_allowance(0))
+
+        async def body():
+            frames = _frames(SMALL)
+            yield frames[0]
+            streaming.set()
+            await finish.wait()
+            for frame in frames[1:]:
+                yield frame
+
+        return httpx.Response(200, headers=_allowance(900), content=body())
+
+    _, adapter, _ = _routed(handler)
+    slow = asyncio.create_task(adapter.complete(_asking(SMALL)))
+    await streaming.wait()
+    fast = await adapter.complete(_asking(BIG))
+    finish.set()
+    slow = await slow
+
+    assert (fast.quota.model_id, fast.quota.quota_remaining_estimate) == (BIG, 0)
+    assert (slow.quota.model_id, slow.quota.quota_remaining_estimate) == (SMALL, 900)
+
+
+async def test_a_sibling_finishing_mid_stream_does_not_bench_the_model_still_answering():
+    # The same race through the router. One solve streams from one model; a second
+    # solve's answer from the other model spends that model's requests and lands
+    # first. Only the spent model is benched.
+    streaming, finish = asyncio.Event(), asyncio.Event()
+    sent = []
+
+    async def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=CATALOG)
+        model = json.loads(request.content)["model"]
+        sent.append(model)
+        if len(sent) == 1:
+
+            async def body():
+                frames = _frames(model)
+                yield frames[0]
+                streaming.set()
+                await finish.wait()
+                for frame in frames[1:]:
+                    yield frame
+
+            return httpx.Response(200, headers=_allowance(900), content=body())
+        return httpx.Response(200, content=b"".join(_frames(model)), headers=_allowance(0))
+
+    router, _, _ = _routed(handler)
+    first = asyncio.create_task(router.solve(SolveRequest.model_validate(ASK)))
+    await streaming.wait()
+    streamer = sent[0]
+    sibling = SMALL if streamer == BIG else BIG
+    # A short bench of the model in flight sends the second solve to its sibling,
+    # however the selector would otherwise break the tie.
+    router.quota.throttle_model("groq", streamer, retry_after=5, per_minute=True)
+    second = await router.solve(SolveRequest.model_validate(ASK))
+    router.quota.clock.now += 10
+    finish.set()
+    first = await first
+
+    assert (second.status, second.model_id) == ("ACCEPTED", sibling)
+    assert (first.status, first.model_id) == ("ACCEPTED", streamer)
+    assert list(router.quota.benched_models("groq")) == [sibling]
+    assert router.quota.state("groq").exhausted is False
