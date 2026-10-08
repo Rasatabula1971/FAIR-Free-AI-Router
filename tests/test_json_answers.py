@@ -318,6 +318,26 @@ class TestTheQualityGate:
         assert result.verification_state == "HOST_REFERENCE_MATCH"
         assert result.attempts[0].quality.validator_results["json_wrapper"] == "PROSE_REMOVED"
 
+    @pytest.mark.parametrize("text, marked", [('Result: {"x": 1}', True), ('{"x": 1}', False)])
+    async def test_a_cached_answer_keeps_what_was_removed_from_it(self, text, marked):
+        """The cache judges the JSON it kept, which no longer has prose around it,
+        so the marker has to come from the answer as it was given."""
+        registry = Registry()
+        registry.register(_spec("p0", "m0"), MockAdapter("p0", text=text))
+        thresholds = {"commodity": 75, "standard": 82, "advanced": 88, "high_impact_support": 92}
+        router = EmbeddedRouter(registry, RoutingSettings(cache_enabled=True), thresholds)
+        request = _request(validation={"kind": "reference_json", "expected": {"x": 1}})
+        first = await router.solve(request)
+        second = await router.solve(request)
+        assert (first.cache_hit, second.cache_hit) == (False, True)
+        assert second.output == first.output == '{"x": 1}'
+        for result in (first, second):
+            checks = result.quality.validator_results
+            assert ("json_wrapper" in checks) is marked
+            if marked:
+                assert checks["json_wrapper"] == "PROSE_REMOVED"
+        assert second.quality.validator_results == first.quality.validator_results
+
     async def test_a_wrapped_answer_with_the_wrong_value_still_fails_its_reference(self):
         router, _ = _router('Result: {"x": 2}')
         result = await router.solve(
