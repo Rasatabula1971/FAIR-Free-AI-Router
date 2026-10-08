@@ -29,6 +29,23 @@ def _canonical(value):
     return value
 
 
+# Notes on the answer as the model gave it, which the stored output no longer
+# shows. A hit re-judges the JSON that was kept, with the prose already removed,
+# so these are carried from the original judgement rather than found again.
+_PROVENANCE = ("json_wrapper",)
+
+
+def _with_provenance(quality, original):
+    kept = {
+        key: original.validator_results[key]
+        for key in _PROVENANCE
+        if key in original.validator_results
+    }
+    if not kept:
+        return quality
+    return quality.model_copy(update={"validator_results": quality.validator_results | kept})
+
+
 class MemoryCache:
     def __init__(self, router, clock=time):
         self.router = router
@@ -98,6 +115,7 @@ class MemoryCache:
             if not acceptable(quality, profile):
                 del self._entries[key]
                 return None
+            quality = _with_provenance(quality, original.quality)
         except (ValueError, KeyError, AdmissionDenied, AuthenticationFailed):
             del self._entries[key]
             return None

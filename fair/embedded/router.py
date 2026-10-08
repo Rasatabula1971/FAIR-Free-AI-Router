@@ -23,7 +23,8 @@ from fair.providers.base import (
     StructuredOutputRejected,
 )
 from fair.quality.consensus import compare, independent
-from fair.quality.engine import acceptable, evaluate
+from fair.quality.engine import acceptable, evaluate, expects_json_document
+from fair.quality.json_data import json_text
 from fair.quality.thresholds import validate_thresholds
 from fair.schemas.api import SolveResponse
 from fair.schemas.domain import (
@@ -50,6 +51,22 @@ def _returnable_unverified(request, attempt):
         "BLOCKED",
         "SERVICE_FAILED",
     }
+
+
+def _output(request, response):
+    """The accepted answer as the caller should receive it.
+
+    Where the request asked for JSON, that is the JSON alone. The quality gate
+    reads through a code fence or a short wrapper to judge the document, and
+    handing back the raw text afterwards left the caller holding an answer FAIR
+    called accepted and ``json.loads`` could not read.
+    """
+    if expects_json_document(request):
+        try:
+            return json_text(response.text)
+        except (ValueError, RecursionError):
+            pass
+    return response.text
 
 
 # A provider's own misbehaviour always arrives as a ProviderError: the adapters
@@ -589,7 +606,7 @@ class EmbeddedRouter:
             attempts=attempts,
             minimum_required=profile.minimum_quality_score,
             best_quality_score=max(scored) if scored else None,
-            output=accepted_response.text if accepted_response else None,
+            output=_output(request, accepted_response) if accepted_response else None,
             provider_id=accepted_response.provider_id if accepted_response else None,
             model_id=accepted_response.model_id if accepted_response else None,
             quality=accepted_quality,

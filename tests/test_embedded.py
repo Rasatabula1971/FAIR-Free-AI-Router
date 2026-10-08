@@ -803,10 +803,11 @@ class TestEmbeddedRouter:
         assert result.attempts[0].quality.validator_results["schema"] == "PASS"
 
     @pytest.mark.asyncio
-    async def test_prose_around_json_is_still_a_schema_failure(self):
-        router = _router(
-            entries=[(_spec(), MockAdapter("a", text='Here you go:\n{"items": []}\nEnjoy!'))]
-        )
+    async def test_prose_that_is_more_than_a_wrapper_is_still_a_schema_failure(self):
+        """A short wrapper around one document is read through (test_json_answers).
+        An example ahead of the answer is two documents, and FAIR does not choose."""
+        text = 'An example would be {"items": [1]}.\nHere you go:\n{"items": []}\nEnjoy!'
+        router = _router(entries=[(_spec(), MockAdapter("a", text=text))])
         result = await router.solve(
             _request(
                 task="list them",
