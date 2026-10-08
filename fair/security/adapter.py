@@ -15,6 +15,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    RequestTooLarge,
     StructuredOutputRejected,
 )
 
@@ -84,10 +85,34 @@ class CredentialedAdapter:
             raise AuthenticationFailed("AUTHENTICATION_FAILED") from None
         except QuotaExceeded as error:
             logger.info("Quota exceeded for provider %s", self.provider_id)
-            raise QuotaExceeded("QUOTA_EXHAUSTED", reset_at=error.reset_at) from None
+            # The scope travels with the error: dropped here, a limit on one model
+            # reaches the router as a limit on the whole provider.
+            scoped = error.model_scoped is True
+            raise QuotaExceeded(
+                "MODEL_QUOTA_EXHAUSTED" if scoped else "QUOTA_EXHAUSTED",
+                reset_at=error.reset_at,
+                model_scoped=scoped,
+            ) from None
         except RateLimited as error:
             logger.info("Rate limited by provider %s", self.provider_id)
-            raise RateLimited("RATE_LIMITED", retry_after=error.retry_after) from None
+            scoped = error.model_scoped is True
+            # The window travels the same way: dropped, a limit that clears in
+            # seconds is held for the full cooldown.
+            per_minute = error.per_minute is True
+            code = "MODEL_RATE_LIMITED" if scoped else "RATE_LIMITED"
+            raise RateLimited(
+                code + "_PER_MINUTE" if per_minute else code,
+                retry_after=error.retry_after,
+                model_scoped=scoped,
+                per_minute=per_minute,
+            ) from None
+        except RequestTooLarge as error:
+            # Must precede RequestNotSupported: re-raised as its parent, a request
+            # the provider was sent and refused reads as one FAIR never sent, and
+            # the router refunds a request that was made.
+            code = _safe_code(error, "REQUEST_TOO_LARGE")
+            logger.info("Provider %s refused a request for its size: %s", self.provider_id, code)
+            raise RequestTooLarge(code) from None
         except RequestNotSupported as error:
             code = _safe_code(error, "REQUEST_NOT_SUPPORTED")
             raise RequestNotSupported(code) from None

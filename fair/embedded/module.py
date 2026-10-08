@@ -179,9 +179,9 @@ _CLOUD_PROVIDERS = {
         "env": "GROQ_API_KEY",
         "adapter": GroqAdapter,
         "access_class": "FREE_RECURRING",
-        # Groq reports x-ratelimit-reset-requests, and an observed reset always
-        # overrides this window. It only covers the case where no response has
-        # carried usable headers yet.
+        # FAIR's own count, across both models. Groq's request headers are per
+        # model, so they bench the model they describe (see observe_model) and
+        # leave this count and its window alone; it over-counts, the safe way.
         "request_limit": 1000,
         "request_limit_window": "DAILY_UTC",
         # Probed 2026-09-30: both endpoints accepted 32768, a floor rather than a
@@ -738,6 +738,7 @@ class FAIR:
                 "models": [m.model_id for m in p.models],
                 "quota_pool_id": self._router.quota.pool_id(p.provider_id),
                 "quota_remaining": self._router.quota.remaining(p),
+                "benched_models": self._router.quota.benched_models(p.provider_id),
             }
             for p in self._registry.providers.values()
         ]
@@ -755,6 +756,7 @@ class FAIR:
                 "models": [model.model_id for model in provider.models],
                 "quota_pool_id": self._router.quota.pool_id(provider.provider_id),
                 "quota_remaining": remaining,
+                "benched_models": self._router.quota.benched_models(provider.provider_id),
             }
 
         return list(

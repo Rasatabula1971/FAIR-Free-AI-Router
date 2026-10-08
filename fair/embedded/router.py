@@ -19,6 +19,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    RequestTooLarge,
     StructuredOutputRejected,
 )
 from fair.quality.consensus import compare, independent
@@ -144,6 +145,13 @@ class EmbeddedRouter:
         )
         if not reserved:
             return None, None, False
+        if not self.quota.model_available(spec.provider_id, model.model_id):
+            # Benched by another solve between selection and this reservation,
+            # which with a shared ledger is a thread hop away. A provider-wide
+            # throttle is caught inside the reservation; a model's own bench was
+            # checked only by the selector. Nothing was sent, so it is given back.
+            await self.quota.release_async(spec, request.client_id, reservation=held)
+            return None, None, False
         start = monotonic()
         quality = response = error_type = error_detail = None
         validator_failed = cancelled = False
@@ -174,9 +182,13 @@ class EmbeddedRouter:
             )
             if response.provider_id != spec.provider_id or response.model_id != model.model_id:
                 raise MalformedResponse("PROVIDER_IDENTITY_MISMATCH")
-            if response.quota is not None:
+            if response.quota is not None and response.quota.model_id is not None:
+                # The provider counts this allowance per model; see observe_model.
+                self.quota.observe_model(spec, model.model_id, response.quota)
+            elif response.quota is not None:
                 await self.quota.observe_async(spec, response.quota)
             self.quota.success(spec.provider_id, probe_token=held.probe_token)
+            self.quota.answered(spec.provider_id, model.model_id)
         except BillingViolation as error:
             # Fail closed on this provider only. One uncertain/nonzero cost report
             # must not take unrelated free providers or local Ollama offline.
@@ -184,11 +196,29 @@ class EmbeddedRouter:
             disposition, error_type = "INFRA_FAILURE", "PROVIDER_COST_POLICY_VIOLATION"
             error_detail = _failure_detail(error)
         except QuotaExceeded as error:
-            await self.quota.exhaust_async(spec, reset_at=error.reset_at)
+            # A limit the provider counts per model says nothing about its other
+            # models. Benching them too threw away allowance that was still there:
+            # one Gemini model reaching its daily cap took the other out until
+            # midnight Pacific.
+            if error.model_scoped is True:
+                self.quota.exhaust_model(spec, model.model_id, reset_at=error.reset_at)
+            else:
+                await self.quota.exhaust_async(spec, reset_at=error.reset_at)
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
             error_detail = _failure_detail(error)
         except RateLimited as error:
-            self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
+            per_minute = error.per_minute is True
+            if error.model_scoped is True:
+                self.quota.throttle_model(
+                    spec.provider_id,
+                    model.model_id,
+                    retry_after=error.retry_after,
+                    per_minute=per_minute,
+                )
+            else:
+                self.quota.throttle(
+                    spec.provider_id, retry_after=error.retry_after, per_minute=per_minute
+                )
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
             error_detail = _failure_detail(error)
         except StructuredOutputRejected as error:
@@ -197,6 +227,15 @@ class EmbeddedRouter:
             # is down, so provider health is left alone and the attempt counts as an
             # answer: the model answered, and the answer was the wrong shape.
             disposition, error_type = "QUALITY_FAILURE", "PROVIDER_SCHEMA_VALIDATION_FAILED"
+            error_detail = _failure_detail(error)
+        except RequestTooLarge as error:
+            # The provider answered: this request is bigger than the route allows.
+            # That is a fact about the request, so the provider's health and its
+            # other requests are left alone, and like any capability mismatch it
+            # spends neither attempt budget. Unlike the branch below, a request
+            # was made, so the charge stands.
+            self.quota.release(spec, request.client_id, refund=False, reservation=held)
+            disposition, error_type = "CAPABILITY_MISMATCH", "REQUEST_TOO_LARGE_FOR_ROUTE"
             error_detail = _failure_detail(error)
         except RequestNotSupported as error:
             # Raised by the adapter's own budget and capability checks, before any
@@ -292,6 +331,7 @@ class EmbeddedRouter:
         )
         if attempt.disposition != "CANCELLED" and attempt.error_type not in {
             "REQUEST_NOT_SUPPORTED_BY_ROUTE",
+            "REQUEST_TOO_LARGE_FOR_ROUTE",
             "MODEL_UNAVAILABLE",
             "ACCESS_DENIED",
         }:

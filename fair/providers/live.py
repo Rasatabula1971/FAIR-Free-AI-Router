@@ -5,6 +5,7 @@ import copy
 import ipaddress
 import json
 import re
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
@@ -27,6 +28,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    RequestTooLarge,
     StructuredOutputRejected,
 )
 from fair.providers.schema_dialects import (
@@ -52,6 +54,12 @@ MAX_OUTPUT_TOKENS = 4096
 # an unprobed model stays at MAX_OUTPUT_TOKENS. Probed 2026-09-30, four routes took
 # a 32768-token request, so that is as far as a reviewed descriptor may now reach.
 MAX_OUTPUT_TOKENS_CEILING = 32768
+# The allowance the response now being read reported. It belongs to the call, not
+# the adapter: an adapter-wide snapshot read after a stream ends is whatever the
+# last response to finish reported, and with two calls in flight that is often
+# the other one's -- one model's spent allowance riding on its sibling's answer.
+# Each asyncio task sees its own value, so concurrent completions cannot mix.
+_OBSERVED: ContextVar[QuotaSnapshot | None] = ContextVar("fair_observed_quota", default=None)
 
 
 class LiveSettings(DTO):
@@ -202,6 +210,16 @@ class TextAdapter:
     # value the rest of this package refuses to keep, so an unrecognised code keeps
     # its existing status-based classification rather than being guessed at.
     schema_rejection_codes = frozenset({"json_validate_failed"})
+    # How long a size the provider refused is remembered. The refusal is about the
+    # request against a fixed allowance, so it holds until the account's limits
+    # change; an hour is short enough to notice that they have.
+    _refused_size_ttl = 3600
+    # How many refused sizes are kept per model. Two already cover the shapes that
+    # differ in kind, a long prompt and a large answer; the rest is headroom.
+    _refused_size_slots = 8
+    # Whether this provider's request headers count each model separately. Only on
+    # the provider's own documentation: unset, a report is read as the provider's.
+    quota_per_model = False
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -213,6 +231,9 @@ class TextAdapter:
         self._catalog_error: Exception | None = None
         self._catalog_error_at = 0.0
         self._catalog_drops: dict[str, str] = {}
+        # model_id -> the (prompt estimate, output budget, until) of requests the
+        # provider refused as too large. See _refuse_known_oversize.
+        self._refused_sizes: dict[str, list[tuple[int, int, float]]] = {}
         self._client = httpx.AsyncClient(
             timeout=self._timeout(settings.read_timeout_seconds),
             trust_env=False,
@@ -283,7 +304,7 @@ class TextAdapter:
     def _observe(self, headers):
         return QuotaSnapshot(provider_id=self.provider_id)
 
-    def _error(self, status, headers):
+    def _error(self, status, headers, *, model_scoped=False, per_minute=False):
         if status == 403:
             raise AccessDenied("PROVIDER_ACCESS_DENIED")
         if status == 401 or 300 <= status < 400:
@@ -292,12 +313,30 @@ class TextAdapter:
             raise QuotaExceeded("FREE_ACCESS_UNAVAILABLE")
         if status == 429:
             observation = self._observe(headers)
-            self._quota = observation
+            # self._quota is the provider's allowance as quota() reports it. One
+            # model's spent allowance is not that. (Answers no longer carry it to
+            # the governor -- each takes its own response's report, see _OBSERVED
+            # -- but a reader of quota() would still see every model spent.)
+            if not model_scoped:
+                self._quota = observation
             if observation.quota_remaining_estimate == 0:
-                raise QuotaExceeded("REQUEST_QUOTA_EXHAUSTED", reset_at=observation.reset_at)
+                raise QuotaExceeded(
+                    "REQUEST_QUOTA_EXHAUSTED",
+                    reset_at=observation.reset_at,
+                    model_scoped=model_scoped,
+                )
             raise RateLimited(
-                "RATE_LIMITED", retry_after=retry_seconds(headers.get("retry-after"), self.clock())
+                "RATE_LIMITED",
+                retry_after=retry_seconds(headers.get("retry-after"), self.clock()),
+                model_scoped=model_scoped,
+                per_minute=per_minute,
             )
+        if status == 413:
+            # Content Too Large is a verdict on this request, not on the provider.
+            # Left to the branch below it read as an outage: three oversized
+            # requests in a minute opened the circuit on a provider that had
+            # answered every one of them, and took its small requests with it.
+            raise RequestTooLarge("HTTP_413")
         if status != 200:
             # The status code is FAIR's own observation, not upstream text, so
             # it is safe to surface; it is the difference between "overloaded
@@ -376,7 +415,59 @@ class TextAdapter:
             record["last_provider_error"] = dict(self._last_error)
         if self._catalog_drops:
             record["catalog_drops"] = dict(self._catalog_drops)
+        now = self.clock()
+        refused = {
+            model_id: [
+                {"prompt_tokens_estimate": prompt, "output_budget": budget}
+                for prompt, budget, until in sizes
+                if now < until
+            ]
+            for model_id, sizes in sorted(self._refused_sizes.items())
+        }
+        refused = {model_id: sizes for model_id, sizes in refused.items() if sizes}
+        if refused:
+            record["refused_sizes"] = refused
         return record
+
+    def _refuse_known_oversize(self, model_id, prompt, budget):
+        """Stop before dispatch when the provider already refused a request this size.
+
+        A size refusal does not clear by waiting, so without this every large
+        request is sent, refused and charged again. Nothing here is a limit FAIR
+        assumed: the only number kept is the size of a request the provider itself
+        turned away, in FAIR's own estimate, and a request is held back only when it
+        is at least that large in both prompt and output budget. That holds however
+        the provider counts the two, which FAIR does not know.
+        """
+        now = self.clock()
+        known = [size for size in self._refused_sizes.get(model_id, ()) if now < size[2]]
+        if not known:
+            self._refused_sizes.pop(model_id, None)
+            return
+        self._refused_sizes[model_id] = known
+        if any(prompt >= refused[0] and budget >= refused[1] for refused in known):
+            raise RequestNotSupported("SIZE_ALREADY_REFUSED_BY_PROVIDER")
+
+    def _remember_refused_size(self, model_id, prompt, budget):
+        """Keep a refused size beside the others still held, not in place of them.
+
+        One slot let two shapes of oversized request, a long prompt and a large
+        answer, evict each other: neither is at least as large as the other both
+        ways, so each refusal overwrote the last and both were sent and charged
+        every time. An entry the new one makes redundant is dropped, and the list
+        is bounded so nothing a provider says can grow it without limit.
+        """
+        now = self.clock()
+        live = [size for size in self._refused_sizes.get(model_id, ()) if now < size[2]]
+        if any(size[0] <= prompt and size[1] <= budget for size in live):
+            # Already covered: requests in flight together are refused in any
+            # order, and adding a larger one only pushes the smaller out of the
+            # bounded list, after which that smaller size is sent again.
+            self._refused_sizes[model_id] = live
+            return
+        kept = [size for size in live if not (size[0] >= prompt and size[1] >= budget)]
+        kept.append((prompt, budget, now + self._refused_size_ttl))
+        self._refused_sizes[model_id] = kept[-self._refused_size_slots :]
 
     async def _stream_json(self, path, payload, timeout):
         """Read an SSE completion and assemble the envelope a buffered one would have.
@@ -456,6 +547,7 @@ class TextAdapter:
                     self._error_from_body(response.status_code, response.headers, body)
                     raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                 self._quota = self._observe(response.headers)
+                _OBSERVED.set(self._quota)
                 async for line in self._stream_lines(response):
                     size += len(line)
                     if size > _MAX_STREAM_BYTES or len(chunks) > 100_000:
@@ -607,6 +699,7 @@ class TextAdapter:
                     )
                     raise MalformedResponse("PROVIDER_ERROR_ENVELOPE")
                 self._quota = self._observe(response.headers)
+                _OBSERVED.set(self._quota)
                 return value
         except httpx.HTTPError:
             raise ProviderUnavailable("PROVIDER_TRANSPORT_FAILED") from None
@@ -623,6 +716,13 @@ class TextAdapter:
 
     async def quota(self):
         return self._quota.model_copy(deep=True)
+
+    def _response_quota(self, model_id):
+        """The allowance this call's own response reported, for the governor."""
+        observed = _OBSERVED.get()
+        if observed is not None and self.quota_per_model:
+            return observed.model_copy(update={"model_id": model_id})
+        return observed
 
     async def list_models(self):
         if self.catalog_path is None:
@@ -777,14 +877,20 @@ class TextAdapter:
                 "json_schema": {"name": "fair_result", "strict": True, "schema": schema},
             }
         await self._before_completion(payload)
-        if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
+        prompt = estimated_tokens(json.dumps(payload))
+        if prompt + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
+        self._refuse_known_oversize(model.model_id, prompt, budget)
         timeout = self._completion_timeout(request, streaming)
-        data = (
-            await self._stream_json("/chat/completions", payload, timeout)
-            if streaming
-            else await self._json("POST", "/chat/completions", payload, timeout=timeout)
-        )
+        try:
+            data = (
+                await self._stream_json("/chat/completions", payload, timeout)
+                if streaming
+                else await self._json("POST", "/chat/completions", payload, timeout=timeout)
+            )
+        except RequestTooLarge:
+            self._remember_refused_size(model.model_id, prompt, budget)
+            raise
         self._after_completion(data)
         try:
             choices = data["choices"]
@@ -814,7 +920,7 @@ class TextAdapter:
                 model_id=model.model_id,
                 text=content,
                 finish_reason=choice["finish_reason"],
-                quota=self._quota,
+                quota=self._response_quota(model.model_id),
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             raise MalformedResponse("INVALID_CHAT_COMPLETION") from None
@@ -826,6 +932,12 @@ class GroqAdapter(TextAdapter):
     expected_access = "FREE_RECURRING"
     context_field = "context_window"
     output_tokens_key = "max_completion_tokens"
+    # Groq documents its limits as applying per model, and x-ratelimit-*-requests is
+    # the requests-per-day one. A 200 reporting none left says that model is spent,
+    # not Groq: read as the provider's, it benched every Groq model until the spent
+    # one reset, up to a day, and a model down to its last few requests pushed the
+    # provider's count to within as many of its cap.
+    quota_per_model = True
 
     def _observe(self, headers):
         try:
@@ -842,6 +954,28 @@ class GroqAdapter(TextAdapter):
             )
         except (ValueError, KeyError):
             return QuotaSnapshot(provider_id=self.provider_id)
+
+    def _error_from_body(self, status, headers, data):
+        message = self._error_message(data).casefold()
+        # "Request too large for model `...` on tokens per minute (TPM): Limit 8000,
+        # Requested 9000": the request asks for more tokens than the model's whole
+        # per-minute allowance. No wait makes it fit, so it is not a rate limit,
+        # whatever status carries it.
+        if "request too large for model" in message:
+            raise RequestTooLarge("REQUEST_TOO_LARGE_FOR_MODEL")
+        # Groq counts its limits per model and says so in the refusal itself: "Rate
+        # limit reached for model `openai/gpt-oss-120b` in organization ...". Its
+        # other models keep their own allowance, so only this one is benched. A
+        # refusal that does not name a model keeps the provider-wide reading.
+        named = "rate limit reached for model" in message
+        # It names the window as well: "on tokens per minute (TPM)" or "on requests
+        # per minute (RPM)", against "per day" for the daily ones.
+        self._error(
+            status,
+            headers,
+            model_scoped=status == 429 and named,
+            per_minute=status == 429 and "per minute" in message,
+        )
 
 
 class OpenRouterFreeAdapter(TextAdapter):
@@ -1198,14 +1332,22 @@ class GeminiAdapter(TextAdapter):
         daily = code == "quota_exceeded" or any(
             "perday" in quota_id.casefold() for quota_id in quota_ids
         )
+        # Google names the quota that was violated, and a free-tier one reads
+        # "...PerProjectPerModel-FreeTier": counted for this model alone. Only when
+        # every violation says so is the refusal about one model; a quota that is
+        # not per model, or a refusal that names none, benches the provider.
+        per_model = bool(quota_ids) and all(
+            "permodel" in quota_id.casefold() for quota_id in quota_ids
+        )
         if daily:
             reset_at = self._daily_reset_at()
-            self._quota = QuotaSnapshot(
-                provider_id=self.provider_id,
-                quota_remaining_estimate=0,
-                reset_at=reset_at,
-            )
-            raise QuotaExceeded("DAILY_QUOTA_EXHAUSTED", reset_at=reset_at)
+            if not per_model:
+                self._quota = QuotaSnapshot(
+                    provider_id=self.provider_id,
+                    quota_remaining_estimate=0,
+                    reset_at=reset_at,
+                )
+            raise QuotaExceeded("DAILY_QUOTA_EXHAUSTED", reset_at=reset_at, model_scoped=per_model)
 
         retry_after = self._retry_delay_from_details(error)
         if (
@@ -1215,7 +1357,18 @@ class GeminiAdapter(TextAdapter):
         ):
             if retry_after is None:
                 retry_after = retry_seconds(headers.get("retry-after"), self.clock())
-            raise RateLimited("RATE_LIMITED", retry_after=retry_after)
+            # The quota id names the window too: "...PerMinutePerProjectPerModel" for
+            # requests, "...InputTokensPerModelPerMinute" for tokens. A daily one has
+            # already left through the branch above.
+            per_minute = bool(quota_ids) and all(
+                "perminute" in quota_id.casefold() for quota_id in quota_ids
+            )
+            raise RateLimited(
+                "RATE_LIMITED",
+                retry_after=retry_after,
+                model_scoped=per_model,
+                per_minute=per_minute,
+            )
 
         self._error(status, headers)
 
@@ -1412,7 +1565,7 @@ class GeminiAdapter(TextAdapter):
                 model_id=data["modelVersion"],
                 text=text,
                 finish_reason="stop" if candidate["finishReason"] == "STOP" else "length",
-                quota=self._quota,
+                quota=self._response_quota(model.model_id),
             )
         except (KeyError, TypeError, ValueError, AttributeError):
             raise MalformedResponse("INVALID_GEMINI_COMPLETION") from None

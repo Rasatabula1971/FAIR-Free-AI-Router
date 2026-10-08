@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 _EXHAUSTION_RETRY_SECONDS = 3600
+# The longest a per-minute limit can stay full once nothing more is sent into it.
+_PER_MINUTE_WINDOW_SECONDS = 60
 _WINDOW_ZONES = {"DAILY_UTC": UTC, "DAILY_PACIFIC": ZoneInfo("America/Los_Angeles")}
 
 
@@ -354,6 +356,16 @@ class MemoryQuotaGovernor:
             _identity(provider_id, "provider id")
             _identity(pool_id, "quota pool id", 256)
         self._states: dict[str, QuotaState] = {}
+        # Models benched on their own account: (provider_id, model_id) -> when the
+        # block ends. Kept apart from QuotaState because none of it is evidence
+        # about the provider, whose other models stay routable. Like a throttle it
+        # is local to this process; another application sharing the account learns
+        # of the limit from its own first refusal, which costs it no allowance.
+        self._model_blocks: dict[tuple[str, str], float] = {}
+        # Per-minute refusals in a row with no answer between them, and when the
+        # bench each one earned ends: (provider_id, model_id or None for the whole
+        # provider) -> (count, until). See _throttle_until.
+        self._minute_strikes: dict[tuple[str, str | None], tuple[int, float]] = {}
         self._probe_sequence = 0
         # Monotonic count of ledger operations that failed. Read before and
         # after a solve to tell a busy ledger from an exhausted quota.
@@ -656,20 +668,136 @@ class MemoryQuotaGovernor:
         """
         return state.circuit_state == "HALF_OPEN" and state.probe_token != probe_token
 
-    def throttle(self, provider_id, retry_after=None):
-        state = self._state(provider_id)
-        if state.circuit_state == "HALF_OPEN":
-            self._open(state)
+    def _throttle_until(self, retry_after, per_minute=False, key=None):
+        """When a throttle ends.
+
+        The cooldown, or the provider's own wait if longer: the cooldown is FAIR's
+        guess at a window it was not told, so it only ever lengthens a block.
+
+        A limit the provider names as per-minute needs no guess. Its wait is taken
+        as stated, and with none stated the window itself is the answer. Holding it
+        for the cooldown instead left a model idle for six minutes over a limit
+        that had cleared in seconds, which is most of what a token-per-minute
+        allowance costs when the answers are large.
+
+        The stated wait is trusted once. If the very next request is refused the
+        same way, the wait did not hold -- another application is filling the
+        window, or the request can never fit it -- and every further try is a
+        request spent for nothing. So a second refusal in a row is held for the
+        whole window, and a third for the cooldown, which is where an unnamed
+        limit starts. An answer in between (see ``answered``) starts the count
+        again, so a model working at its limit keeps the short waits.
+        """
         delay = (
             retry_after
             if isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
             and isfinite(retry_after)
             and 0 < retry_after <= 86400
             else 0
         )
+        now = self.clock()
+        if not per_minute:
+            return now + max(self.settings.cooldown_seconds, delay)
+        count, until = self._minute_strikes.get(key, (0, float("-inf")))
+        if now < until:
+            # The bench this refusal would extend is still running, so the request
+            # was sent before the wait was known: several in flight at once when
+            # the window filled. It says nothing about whether the wait held, so
+            # it extends the bench without counting as another strike.
+            until = max(until, now + (delay or _PER_MINUTE_WINDOW_SECONDS))
+            self._minute_strikes[key] = (count, until)
+            return until
+        # A refusal long after the last bench ended is not the same episode.
+        count = count + 1 if now - until <= _PER_MINUTE_WINDOW_SECONDS else 1
+        if count == 1:
+            hold = delay or _PER_MINUTE_WINDOW_SECONDS
+        elif count == 2:
+            hold = max(delay, _PER_MINUTE_WINDOW_SECONDS)
+        else:
+            hold = max(delay, _PER_MINUTE_WINDOW_SECONDS, self.settings.cooldown_seconds)
+        self._minute_strikes[key] = (count, now + hold)
+        return now + hold
+
+    def answered(self, provider_id, model_id):
+        """A model answered, so whatever per-minute refusals came before it are over."""
+        self._minute_strikes.pop((provider_id, model_id), None)
+        self._minute_strikes.pop((provider_id, None), None)
+
+    def throttle(self, provider_id, retry_after=None, per_minute=False):
+        state = self._state(provider_id)
+        if state.circuit_state == "HALF_OPEN":
+            self._open(state)
         state.throttled_until = max(
-            state.throttled_until, self.clock() + max(self.settings.cooldown_seconds, delay)
+            state.throttled_until,
+            self._throttle_until(retry_after, per_minute, (provider_id, None)),
         )
+
+    def model_available(self, provider_id, model_id):
+        """Whether this one model is free of a block of its own."""
+        until = self._model_blocks.get((provider_id, model_id))
+        if until is None:
+            return True
+        if self.clock() >= until:
+            del self._model_blocks[(provider_id, model_id)]
+            return True
+        return False
+
+    def benched_models(self, provider_id):
+        """The provider's models currently benched, and when each returns."""
+        return {
+            model_id: until
+            for (owner, model_id), until in sorted(self._model_blocks.items())
+            if owner == provider_id and self.clock() < until
+        }
+
+    def _bench_model(self, provider_id, model_id, until):
+        # Never shortened: a second refusal can arrive out of order, and an earlier
+        # end is an older view of the same block, not news that it lifts sooner.
+        key = (provider_id, model_id)
+        self._model_blocks[key] = max(self._model_blocks.get(key, 0), until)
+
+    def throttle_model(self, provider_id, model_id, retry_after=None, per_minute=False):
+        """Bench one model for a rate limit its provider counts per model.
+
+        The provider itself is left alone. Its circuit is not touched either: a
+        refusal that names one model's limit came from a provider that answered.
+        """
+        until = self._throttle_until(retry_after, per_minute, (provider_id, model_id))
+        self._bench_model(provider_id, model_id, until)
+
+    def exhaust_model(self, spec, model_id, reset_at=None):
+        """Bench one model until a quota its provider counts per model resets."""
+        self._bench_model(spec.provider_id, model_id, self._exhaustion_reset(spec, reset_at))
+
+    def observe_model(self, spec, model_id, observation):
+        """Take in an allowance the provider counts for this one model.
+
+        None left benches the model, exactly as a refusal saying so would. Nothing
+        else is taken from it. The provider's own count stays FAIR's: a figure for
+        one model is not the provider's, and folding it in either way is wrong --
+        a model near its cap would push the provider's count to within as many of
+        its limit, and a fresh one would say nothing about the rest.
+        """
+        if observation.provider_id != spec.provider_id or observation.model_id != model_id:
+            raise ValueError("Quota observation identity mismatch")
+        remaining = observation.quota_remaining_estimate
+        limit = observation.quota_limit
+        if remaining == 0 and limit is not None:
+            self.exhaust_model(spec, model_id, reset_at=observation.reset_at)
+
+    def _exhaustion_reset(self, spec, reset_at):
+        """When a spent allowance returns: the provider's own word, else FAIR's window."""
+        if reset_at is not None and (not isfinite(reset_at) or reset_at <= self.clock()):
+            reset_at = None
+        if reset_at is None:
+            window = spec.request_limit_window if spec is not None else None
+            reset_at = (
+                next_window_reset(window, self.clock())
+                if window is not None
+                else self.clock() + _EXHAUSTION_RETRY_SECONDS
+            )
+        return reset_at
 
     def observe(self, spec, observation):
         if observation.provider_id != spec.provider_id:
@@ -778,15 +906,7 @@ class MemoryQuotaGovernor:
     def exhaust(self, provider, reset_at=None):
         spec = provider if hasattr(provider, "provider_id") else None
         provider_id = spec.provider_id if spec is not None else provider
-        if reset_at is not None and (not isfinite(reset_at) or reset_at <= self.clock()):
-            reset_at = None
-        if reset_at is None:
-            window = spec.request_limit_window if spec is not None else None
-            reset_at = (
-                next_window_reset(window, self.clock())
-                if window is not None
-                else self.clock() + _EXHAUSTION_RETRY_SECONDS
-            )
+        reset_at = self._exhaustion_reset(spec, reset_at)
         state = self._state(provider_id)
         state.exhausted = True
         state.reset_at = reset_at
@@ -804,15 +924,7 @@ class MemoryQuotaGovernor:
     async def exhaust_async(self, provider, reset_at=None):
         spec = provider if hasattr(provider, "provider_id") else None
         provider_id = spec.provider_id if spec is not None else provider
-        if reset_at is not None and (not isfinite(reset_at) or reset_at <= self.clock()):
-            reset_at = None
-        if reset_at is None:
-            window = spec.request_limit_window if spec is not None else None
-            reset_at = (
-                next_window_reset(window, self.clock())
-                if window is not None
-                else self.clock() + _EXHAUSTION_RETRY_SECONDS
-            )
+        reset_at = self._exhaustion_reset(spec, reset_at)
         state = self._state(provider_id)
         state.exhausted = True
         state.reset_at = reset_at
@@ -892,6 +1004,8 @@ class MemoryQuotaGovernor:
             return "OUTAGE"
         if self.clock() < max(state.blocked_until, state.throttled_until):
             return "THROTTLED"
+        if self._every_model_benched(spec):
+            return "THROTTLED"
         return spec.status
 
     async def effective_status_async(self, spec):
@@ -924,7 +1038,16 @@ class MemoryQuotaGovernor:
             return "OUTAGE"
         if self.clock() < max(state.blocked_until, state.throttled_until):
             return "THROTTLED"
+        if self._every_model_benched(spec):
+            return "THROTTLED"
         return spec.status
+
+    def _every_model_benched(self, spec):
+        """Nothing left to route to, though the provider itself is healthy."""
+        active = [model for model in spec.models if model.active]
+        return bool(active) and not any(
+            self.model_available(spec.provider_id, model.model_id) for model in active
+        )
 
     def usage_report(self, specs):
         specs = list(specs)
