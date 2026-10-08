@@ -87,8 +87,9 @@ def browser():
             if REQUIRED:
                 raise
             pytest.skip(f"Chromium is not installed for Playwright: {error}")
-        yield chromium
-        chromium.close()
+        else:
+            yield chromium
+            chromium.close()
 
 
 class _Hold:
@@ -104,9 +105,8 @@ class _Hold:
 
     def wrap(self, app):
         async def held(scope, receive, send):
-            if scope["type"] == "http" and self.holding.is_set() and self.matches(scope):
-                if self.once and self.entered.is_set():
-                    return await app(scope, receive, send)
+            held_back = scope["type"] == "http" and self.holding.is_set() and self.matches(scope)
+            if held_back and not (self.once and self.entered.is_set()):
                 self.entered.set()
                 while self.holding.is_set():
                     await asyncio.sleep(0.02)
