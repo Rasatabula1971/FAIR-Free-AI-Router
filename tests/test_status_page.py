@@ -119,9 +119,10 @@ class TestServingThePage:
     def test_it_answers_get_and_nothing_else(self):
         app, _ = _app()
         with TestClient(app) as client:
-            assert client.post("/status").status_code == 405
-            assert client.put("/status").status_code == 405
-            assert client.delete("/status").status_code == 405
+            answers = [
+                client.request(verb, "/status").status_code for verb in ("POST", "PUT", "DELETE")
+            ]
+        assert answers == [405, 405, 405]
 
     def test_the_policy_admits_exactly_the_script_and_style_that_are_shipped(self):
         """A hash that drifts from the content blocks the page in every browser."""
