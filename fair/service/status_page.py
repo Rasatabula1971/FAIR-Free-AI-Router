@@ -268,29 +268,35 @@ _SCRIPT = r"""
     return el("span", days <= 7 ? "soon" : "", text);
   }
 
-  function showSummary(health, providers) {
+  // Each view is built in full before anything on the page changes, and handed
+  // back as the one step that puts it there. If what FAIR sent cannot be drawn,
+  // the page keeps its last good state rather than half of a new one.
+  function summaryView(health, providers) {
     const total = providers ? providers.length : health.providers || 0;
     const ready = providers ? providers.filter(routable).length : health.routable_providers || 0;
-    $("headline").textContent = headline(total, ready, health.status === "stopped");
-    const detail = $("detail");
-    detail.replaceChildren();
+    const title = headline(total, ready, health.status === "stopped");
+    const parts = [];
     if (!providers) {
-      detail.append("Enter a FAIR client key to see each provider, what it has left " +
+      parts.push("Enter a FAIR client key to see each provider, what it has left " +
         "and when its review runs out.");
-      return;
+    } else {
+      const down = providers.filter((provider) => !routable(provider));
+      down.slice(0, 3).forEach((provider) => {
+        const known = STATES[provider.status];
+        parts.push(el("strong", "", provider.provider_id), " " +
+          (known ? known[2] : "reports " + provider.status) + ". ");
+      });
+      if (down.length > 3) {
+        const more = down.length - 3;
+        parts.push(count(more) + " more " + (more === 1 ? "is" : "are") + " out too. ");
+      }
+      const review = reviewLine(providers, Date.now());
+      if (review) parts.push(review);
     }
-    const down = providers.filter((provider) => !routable(provider));
-    down.slice(0, 3).forEach((provider) => {
-      const known = STATES[provider.status];
-      detail.append(el("strong", "", provider.provider_id), " " +
-        (known ? known[2] : "reports " + provider.status) + ". ");
-    });
-    if (down.length > 3) {
-      const more = down.length - 3;
-      detail.append(count(more) + " more " + (more === 1 ? "is" : "are") + " out too. ");
-    }
-    const review = reviewLine(providers, Date.now());
-    if (review) detail.append(review);
+    return () => {
+      $("headline").textContent = title;
+      $("detail").replaceChildren(...parts);
+    };
   }
 
   function stateCell(provider) {
@@ -368,11 +374,9 @@ _SCRIPT = r"""
     return cell;
   }
 
-  function showProviders(providers) {
-    const body = $("providers-body");
+  function providersView(providers) {
     const now = Date.now();
-    body.replaceChildren();
-    providers.forEach((provider) => {
+    const rows = providers.map((provider) => {
       const row = el("tr");
       const name = el("td");
       name.dataset.label = "Provider";
@@ -380,16 +384,16 @@ _SCRIPT = r"""
         el("span", "sub", ACCESS[provider.access_class] || provider.access_class));
       row.append(name, stateCell(provider), leftCell(provider), modelsCell(provider),
         reviewCell(provider, now));
-      body.append(row);
+      return row;
     });
-    $("providers").hidden = !providers.length;
+    return () => {
+      $("providers-body").replaceChildren(...rows);
+      $("providers").hidden = !rows.length;
+    };
   }
 
-  function showSkipped(skipped) {
-    const body = $("skipped-body");
-    const names = Object.keys(skipped || {}).sort();
-    body.replaceChildren();
-    names.forEach((name) => {
+  function skippedView(skipped) {
+    const rows = Object.keys(skipped || {}).sort().map((name) => {
       const row = el("tr");
       const id = el("td");
       id.dataset.label = "Provider";
@@ -397,42 +401,40 @@ _SCRIPT = r"""
       const why = el("td", "", skipped[name]);
       why.dataset.label = "Why";
       row.append(id, why);
-      body.append(row);
+      return row;
     });
-    $("skipped").hidden = !names.length;
+    return () => {
+      $("skipped-body").replaceChildren(...rows);
+      $("skipped").hidden = !rows.length;
+    };
   }
 
-  function showQuota(quota) {
-    const body = $("quota-body");
-    const note = $("quota-note");
-    body.replaceChildren();
-    $("quota").hidden = false;
+  function quotaView(quota) {
+    const commit = (title, note, rows) => () => {
+      $("quota").hidden = false;
+      $("quota-title").textContent = title;
+      $("quota-note").textContent = note;
+      $("quota-body").replaceChildren(...rows);
+      $("quota-table").hidden = !rows.length;
+    };
     if (!quota) {
       // Not the same as sharing being off: the report itself did not arrive.
-      $("quota-title").textContent = "Shared quota";
-      $("quota-table").hidden = true;
-      note.textContent = "The quota report could not be read just now.";
-      return;
+      return commit("Shared quota", "The quota report could not be read just now.", []);
     }
     if (!quota.shared) {
-      $("quota-title").textContent = "Quota sharing";
-      $("quota-table").hidden = true;
-      note.textContent = "Off. Requests are counted inside this FAIR service only, so " +
-        "other applications using the same accounts are not included.";
-      return;
+      return commit("Quota sharing", "Off. Requests are counted inside this FAIR service " +
+        "only, so other applications using the same accounts are not included.", []);
     }
-    $("quota-title").textContent = "Shared quota";
     // A pool nothing has been counted against, and that has no cap, says nothing.
     const pools = (quota.pools || []).filter((pool) =>
       pool.used > 0 || pool.exhausted || typeof pool.request_limit === "number");
-    $("quota-table").hidden = !pools.length;
-    note.textContent = quota.ledger_available === false
+    const note = quota.ledger_available === false
       ? "The shared quota file cannot be read right now, so FAIR is holding requests " +
         "rather than guessing."
       : pools.length
         ? "Counted across every application that shares this quota file."
         : "No requests have been counted in the shared quota file yet.";
-    pools.forEach((pool) => {
+    const rows = pools.map((pool) => {
       const row = el("tr");
       const id = el("td");
       id.dataset.label = "Account pool";
@@ -459,8 +461,9 @@ _SCRIPT = r"""
       });
       apps.append(names.length ? list : el("span", "sub", "None yet"));
       row.append(id, used, resets, apps);
-      body.append(row);
+      return row;
     });
+    return commit("Shared quota", note, rows);
   }
 
   function stamp(ok, message) {
@@ -510,7 +513,7 @@ _SCRIPT = r"""
     }
     if (!bearer) {
       drawn = turn;
-      showSummary(health, null);
+      summaryView(health, null)();
       stamp(true);
       return;
     }
@@ -529,7 +532,7 @@ _SCRIPT = r"""
     drawn = turn;
     if (listed.status === 401) {
       signedOut("FAIR did not accept that key.");
-      showSummary(health, null);
+      summaryView(health, null)();
       stamp(true);
       return;
     }
@@ -537,20 +540,27 @@ _SCRIPT = r"""
       stamp(false, "FAIR could not list its providers.");
       return;
     }
+    const providers = listed.body.providers || [];
+    const views = [
+      summaryView(health, providers),
+      providersView(providers),
+      skippedView(listed.body.skipped),
+      quotaView(quota.status === 200 ? quota.body : null),
+    ];
     $("key-form").hidden = true;
     $("forget").hidden = false;
     $("key-error").textContent = "";
-    showSummary(health, listed.body.providers || []);
-    showProviders(listed.body.providers || []);
-    showSkipped(listed.body.skipped);
-    showQuota(quota.status === 200 ? quota.body : null);
+    views.forEach((show) => show());
     stamp(true);
   }
 
   // Nothing above should throw on what FAIR sends. If something does, say the
   // page is stale instead of leaving old figures under a fresh-looking stamp.
   function update() {
-    refresh().catch(() => stamp(false, "This page could not show what FAIR sent."));
+    refresh().catch((error) => {
+      console.error(error);
+      stamp(false, "This page could not show what FAIR sent.");
+    });
   }
 
   $("key-form").addEventListener("submit", (event) => {

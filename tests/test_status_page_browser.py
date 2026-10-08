@@ -98,13 +98,15 @@ class _Hold:
     blocked: the page has to stay free to be clicked while its request is out.
     """
 
-    def __init__(self, matches):
-        self.matches = matches
+    def __init__(self, matches, *, once=False):
+        self.matches, self.once = matches, once
         self.holding, self.entered = threading.Event(), threading.Event()
 
     def wrap(self, app):
         async def held(scope, receive, send):
             if scope["type"] == "http" and self.holding.is_set() and self.matches(scope):
+                if self.once and self.entered.is_set():
+                    return await app(scope, receive, send)
                 self.entered.set()
                 while self.holding.is_set():
                     await asyncio.sleep(0.02)
@@ -144,10 +146,23 @@ def _served(fair=None, hold=()):
 class _Page:
     """A page on the service, with what it logged and what it asked for."""
 
-    def __init__(self, browser, origin, *, timezone=None, now=None, providers=None, quota=None):
+    def __init__(
+        self,
+        browser,
+        origin,
+        *,
+        timezone=None,
+        now=None,
+        providers=None,
+        quota=None,
+        init_script=None,
+        wait=True,
+    ):
         self.origin = origin
         options = {"timezone_id": timezone} if timezone else {}
         self.context = browser.new_context(locale="en-US", **options)
+        if init_script:
+            self.context.add_init_script(init_script)
         self.page = self.context.new_page()
         self.problems, self.requests = [], []
         self.page.on("console", self._console)
@@ -156,10 +171,15 @@ class _Page:
         if now is not None:
             self.page.clock.set_fixed_time(now)
         if providers is not None:
-            body = json.dumps({"providers": providers, "skipped": {}})
+            # A list, or a callable for an answer that changes between polls.
+            listing = providers if callable(providers) else (lambda: providers)
             self.page.route(
                 "**/v1/fair/providers",
-                lambda route: route.fulfill(status=200, content_type="application/json", body=body),
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"providers": listing(), "skipped": {}}),
+                ),
             )
         if quota is not None:
             self.page.route(
@@ -169,7 +189,12 @@ class _Page:
                 ),
             )
         self.page.goto(origin + "/status")
-        self.page.locator("#stamp", has_text="Updated").wait_for()
+        if wait:
+            self.page.locator("#stamp", has_text="Updated").wait_for()
+
+    def poll(self):
+        """What the page does when its tab is shown again: refresh now."""
+        self.page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
 
     def _console(self, message):
         if message.type in {"error", "warning"}:
@@ -379,6 +404,80 @@ class TestSigningInAndOut:
             assert not view.hidden("#providers")
             assert view.hidden("#key-form")
             assert view.text("#key-error") == ""
+
+
+class TestWhenThingsGoWrong:
+    def test_an_old_keyless_poll_answering_late_does_not_cover_the_signed_in_view(self, opened):
+        """The page's first poll, sent before any key, can come back after the key
+        has been typed and drawn."""
+        first_health = _Hold(lambda scope: scope["path"] == "/health", once=True)
+        first_health.holding.set()
+        with _served(hold=first_health) as (origin, _):
+            view = opened(origin, wait=False)
+            assert first_health.entered.wait(10)
+            view.signed_in()
+            first_health.holding.clear()
+            view.page.wait_for_timeout(600)
+            assert "Enter a FAIR client key" not in view.text("#detail")
+            assert not view.hidden("#providers")
+            assert view.text("#stamp").startswith("Updated")
+
+    def test_a_late_failure_of_an_old_poll_does_not_mark_a_fresh_view_stale(self, opened):
+        deferred = []
+        with _served() as (origin, _):
+            view = opened(origin).signed_in()
+
+            def defer_first(route):
+                if not deferred:
+                    deferred.append(route)  # answered later, by the test
+                else:
+                    route.continue_()
+
+            view.page.route("**/v1/fair/quota", defer_first)
+            view.poll()
+            view.page.wait_for_timeout(300)
+            assert deferred
+            view.poll()
+            view.page.wait_for_timeout(600)
+            assert view.text("#stamp").startswith("Updated")
+            deferred[0].abort()
+            view.page.wait_for_timeout(600)
+            assert view.text("#stamp").startswith("Updated")
+
+    def test_a_service_that_stops_answering_is_given_up_on(self, opened):
+        """The page waits 20 seconds; here the browser's timer is made short so the
+        test does not have to."""
+        quick = (
+            "AbortSignal.timeout = () => { const c = new AbortController(); "
+            "setTimeout(() => c.abort(new DOMException('timed out', 'TimeoutError')), 300); "
+            "return c.signal; };"
+        )
+        listing = _Hold(lambda scope: scope["path"] == "/v1/fair/providers")
+        with _served(hold=listing) as (origin, _):
+            view = opened(origin, init_script=quick).signed_in()
+            listing.holding.set()
+            view.poll()
+            view.page.locator("#stamp", has_text="stopped answering").wait_for()
+            assert view.page.locator("#stamp.stale").count() == 1
+            listing.holding.clear()
+            view.poll()
+            view.page.locator("#stamp", has_text="Updated").wait_for()
+
+    def test_an_answer_the_page_cannot_draw_leaves_the_last_good_view_and_says_so(self, opened):
+        rows = [_provider(provider_id="good")]
+        with _served() as (origin, _):
+            view = opened(origin, providers=lambda: rows).signed_in()
+            assert "good" in view.text("#providers-body")
+            assert view.text("#headline") == "The one provider can take requests."
+            rows = [_provider(provider_id="broken", models=7), _provider(provider_id="fine")]
+            view.poll()
+            view.page.locator("#stamp", has_text="could not show what FAIR sent").wait_for()
+            assert view.text("#providers-body").startswith("good")
+            # Not half of the new answer either: the headline still matches the table.
+            assert view.text("#headline") == "The one provider can take requests."
+            assert "broken" not in view.text("#providers-body")
+            assert "fine" not in view.text("#detail") + view.text("#providers-body")
+            assert any("models" in problem or "forEach" in problem for problem in view.problems)
 
 
 class TestWhatItSaysAboutTime:
