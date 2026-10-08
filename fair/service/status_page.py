@@ -152,6 +152,7 @@ _SCRIPT = r"""
   "use strict";
 
   const POLL_MS = 15000;
+  const TIMEOUT_MS = 20000;
   const DAY_MS = 86400000;
   const STATES = {
     ACTIVE: ["ok", "Taking requests", "is taking requests"],
@@ -176,6 +177,13 @@ _SCRIPT = r"""
   const $ = (id) => document.getElementById(id);
   let key = "";
   let lastGood = 0;
+  // Which key the page is showing, and which answer was drawn last. An answer
+  // is used only if it was asked for under the key still in force and is not
+  // older than what is already on screen: requests overlap, and they finish in
+  // whatever order the service answers them.
+  let session = 0;
+  let asked = 0;
+  let drawn = 0;
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -196,13 +204,26 @@ _SCRIPT = r"""
     return new Date(ms).toLocaleDateString([], { day: "numeric", month: "short" });
   }
 
+  // Whole days on the viewer's own calendar, so the count agrees with the date
+  // printed beside it. Elapsed time rounded up does not: midnight UTC is the
+  // evening before in the Americas, and "2 days left" stood next to tomorrow.
+  function daysUntil(ms, now) {
+    const end = new Date(ms);
+    const start = new Date(now);
+    return Math.round((Date.UTC(end.getFullYear(), end.getMonth(), end.getDate()) -
+      Date.UTC(start.getFullYear(), start.getMonth(), start.getDate())) / DAY_MS);
+  }
+
   function routable(provider) {
     return provider.status === "ACTIVE" || provider.status === "QUOTA_PRESSURE";
   }
 
-  async function read(path, withKey) {
-    const headers = withKey ? { Authorization: "Bearer " + key } : {};
-    const response = await fetch(path, { method: "GET", headers, cache: "no-store" });
+  async function read(path, bearer) {
+    const options = { method: "GET", cache: "no-store" };
+    if (bearer) options.headers = { Authorization: "Bearer " + bearer };
+    // A service that has stopped answering must not leave the page waiting forever.
+    if (window.AbortSignal && AbortSignal.timeout) options.signal = AbortSignal.timeout(TIMEOUT_MS);
+    const response = await fetch(path, options);
     let body = null;
     try {
       body = await response.json();
@@ -236,13 +257,14 @@ _SCRIPT = r"""
       .filter((value) => Number.isFinite(value));
     if (!dates.length) return null;
     const soonest = Math.min(...dates);
-    const days = Math.ceil((soonest - now) / DAY_MS);
-    if (days <= 0) {
+    if (soonest <= now) {
       return el("span", "soon", "A provider review has run out. Renew it to bring that " +
         "provider back.");
     }
-    const text = "The next provider review runs out in " + days +
-      (days === 1 ? " day" : " days") + ", on " + day(soonest) + ".";
+    const days = daysUntil(soonest, now);
+    const text = "The next provider review runs out " + (days === 0
+      ? "today at " + clock(soonest)
+      : "in " + days + (days === 1 ? " day" : " days") + ", on " + day(soonest)) + ".";
     return el("span", days <= 7 ? "soon" : "", text);
   }
 
@@ -284,7 +306,12 @@ _SCRIPT = r"""
   function leftCell(provider) {
     const cell = el("td");
     cell.dataset.label = "Requests left";
-    const left = provider.quota_remaining;
+    // FAIR's own count can sit under the cap when the provider itself says the
+    // allowance is spent. The state is the fact; the count must not contradict it.
+    const spent = provider.status === "QUOTA_EXHAUSTED";
+    const left = spent && typeof provider.quota_remaining === "number"
+      ? 0
+      : provider.quota_remaining;
     const limit = provider.request_limit;
     if (typeof left !== "number") {
       cell.append(el("span", "sub", "No request cap is counted"));
@@ -329,14 +356,15 @@ _SCRIPT = r"""
       cell.append(el("span", "sub", "None needed"));
       return cell;
     }
-    const days = Math.ceil((expires - now) / DAY_MS);
-    if (days <= 0) {
+    if (expires <= now) {
       cell.append(el("span", "word", "Ran out " + day(expires)));
       cell.className = "out";
       return cell;
     }
-    cell.append(days + (days === 1 ? " day left" : " days left"), el("span", "sub",
-      "Runs out " + day(expires)));
+    const days = daysUntil(expires, now);
+    cell.append(
+      days === 0 ? "Runs out today" : days + (days === 1 ? " day left" : " days left"),
+      el("span", "sub", "Runs out " + (days === 0 ? clock(expires) : day(expires))));
     return cell;
   }
 
@@ -379,7 +407,14 @@ _SCRIPT = r"""
     const note = $("quota-note");
     body.replaceChildren();
     $("quota").hidden = false;
-    if (!quota || !quota.shared) {
+    if (!quota) {
+      // Not the same as sharing being off: the report itself did not arrive.
+      $("quota-title").textContent = "Shared quota";
+      $("quota-table").hidden = true;
+      note.textContent = "The quota report could not be read just now.";
+      return;
+    }
+    if (!quota.shared) {
       $("quota-title").textContent = "Quota sharing";
       $("quota-table").hidden = true;
       note.textContent = "Off. Requests are counted inside this FAIR service only, so " +
@@ -443,27 +478,38 @@ _SCRIPT = r"""
       : "");
   }
 
+  function hideDetail() {
+    ["providers", "skipped", "quota"].forEach((id) => { $(id).hidden = true; });
+  }
+
   function signedOut(message) {
     key = "";
+    session += 1;
     $("key").value = "";
     $("key-form").hidden = false;
     $("forget").hidden = true;
     $("key-error").textContent = message || "";
-    ["providers", "skipped", "quota"].forEach((id) => { $(id).hidden = true; });
+    hideDetail();
   }
 
   async function refresh() {
+    const mine = session;
+    const bearer = key;
+    const turn = ++asked;
+    const superseded = () => mine !== session || turn < drawn;
     let health;
     try {
-      health = (await read("/health", false)).body;
+      health = (await read("/health", "")).body;
     } catch (error) {
       health = null;
     }
+    if (superseded()) return;
     if (!health) {
       stamp(false, "FAIR is not answering.");
       return;
     }
-    if (!key) {
+    if (!bearer) {
+      drawn = turn;
       showSummary(health, null);
       stamp(true);
       return;
@@ -472,13 +518,15 @@ _SCRIPT = r"""
     let quota;
     try {
       [listed, quota] = await Promise.all([
-        read("/v1/fair/providers", true),
-        read("/v1/fair/quota", true),
+        read("/v1/fair/providers", bearer),
+        read("/v1/fair/quota", bearer),
       ]);
     } catch (error) {
-      stamp(false, "FAIR stopped answering part-way through.");
+      if (!superseded()) stamp(false, "FAIR stopped answering part-way through.");
       return;
     }
+    if (superseded()) return;
+    drawn = turn;
     if (listed.status === 401) {
       signedOut("FAIR did not accept that key.");
       showSummary(health, null);
@@ -499,23 +547,39 @@ _SCRIPT = r"""
     stamp(true);
   }
 
+  // Nothing above should throw on what FAIR sends. If something does, say the
+  // page is stale instead of leaving old figures under a fresh-looking stamp.
+  function update() {
+    refresh().catch(() => stamp(false, "This page could not show what FAIR sent."));
+  }
+
   $("key-form").addEventListener("submit", (event) => {
     event.preventDefault();
-    key = $("key").value.trim();
+    const typed = $("key").value.trim();
     $("key").value = "";
-    refresh();
+    // A header can only carry printable Latin-1. A pasted zero-width space or
+    // smart quote makes the request throw before anything is sent, which is a key
+    // FAIR would refuse, not a service that has stopped answering.
+    if (/[^\x20-\x7e\xa0-\xff]/.test(typed)) {
+      signedOut("FAIR did not accept that key.");
+      update();
+      return;
+    }
+    session += 1;
+    key = typed;
+    update();
   });
   $("forget").addEventListener("click", () => {
     signedOut("");
-    refresh();
+    update();
   });
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refresh();
+    if (!document.hidden) update();
   });
   window.setInterval(() => {
-    if (!document.hidden) refresh();
+    if (!document.hidden) update();
   }, POLL_MS);
-  refresh();
+  update();
 })();
 """
 

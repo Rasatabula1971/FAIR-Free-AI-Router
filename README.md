@@ -300,6 +300,19 @@ talk only to the service that served it.
 `/v1/fair/providers` now also returns `request_limit` and `review_expires_at` for each
 provider, which is what the page's last two columns are built from.
 
+Days left on a review are counted on your own calendar, so the count agrees with the
+date beside it; on the last day the page says "today" and gives the time. A provider
+that is out of allowance shows none left, whatever FAIR's own count says.
+
+The page's script is tested in a real browser by `tests/test_status_page_browser.py`,
+which needs Playwright and Chromium and skips without them:
+
+```powershell
+pip install playwright
+python -m playwright install chromium
+pytest tests/test_status_page_browser.py
+```
+
 Example native request:
 
 ```powershell
