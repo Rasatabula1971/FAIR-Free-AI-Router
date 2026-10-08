@@ -197,7 +197,9 @@ or `MODEL_QUOTA_EXHAUSTED`. Benches are local to the process, as throttles are: 
 application sharing the account learns of the limit from its own first refusal.
 
 Request counting is unchanged and still per provider. Groq's `request_limit` of 1000 a
-day is applied across both of its models, though Groq publishes that many for each.
+day is applied across both of its models, though Groq publishes that many for each. For
+the same reason a successful Groq answer whose headers report no requests left still
+marks the whole provider spent: per-model scope is applied to refusals only.
 
 ## Token limits
 
@@ -220,6 +222,13 @@ seconds idled the model for six minutes. A limit whose window is not named keeps
 cooldown, and a daily one is unchanged. The attempt log records these as
 `MODEL_RATE_LIMITED_PER_MINUTE` or `RATE_LIMITED_PER_MINUTE`.
 
+The stated wait is trusted once. If the next request to that model is refused the same
+way with no answer in between, the wait did not hold: another application is filling the
+window, or the request can never fit it. The second refusal in a row is held for the full
+60 seconds and a third for the cooldown, so a model that keeps refusing costs three
+requests in six minutes rather than one every few seconds. Any answer from the model
+starts the count again, so a model working at its limit keeps the short waits.
+
 **A request too large for a route is not an outage.** A single request that asks for
 more than a model's whole per-minute allowance is refused outright, and no wait changes
 that. Groq answers HTTP 413, ``Request too large for model ...``. FAIR used to count it
@@ -229,10 +238,15 @@ the next route is tried, the provider's health is untouched, and neither attempt
 is spent. The request was made, so its charge stands.
 
 **A refused size is not sent twice.** The adapter remembers, per model and for an hour,
-the size of the request the provider refused. A later request at least that large in
-both prompt and output budget is stopped before dispatch,
+the sizes of requests the provider refused. A later request at least as large as one of
+them in both prompt and output budget is stopped before dispatch,
 `SIZE_ALREADY_REFUSED_BY_PROVIDER`, and its reservation is given back. Anything smaller
-is sent as usual. `safe_diagnostics()` lists what is held under `refused_sizes`.
+is sent as usual. Up to eight sizes are kept per model, because a long prompt and a large
+answer are different shapes and neither covers the other. `safe_diagnostics()` lists
+what is held under `refused_sizes`. The comparison uses FAIR's own byte-based estimate of
+the prompt, which does not order every text the way a provider's tokenizer does, so a
+dense prompt can occasionally be held back by the refusal of a looser one until the hour
+is up.
 
 FAIR does not track tokens used, predict a refusal, or reserve tokens for a request in
 flight. That would need a tokens-per-minute figure per model, and none has been measured

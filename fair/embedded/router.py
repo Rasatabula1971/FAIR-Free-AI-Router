@@ -145,6 +145,13 @@ class EmbeddedRouter:
         )
         if not reserved:
             return None, None, False
+        if not self.quota.model_available(spec.provider_id, model.model_id):
+            # Benched by another solve between selection and this reservation,
+            # which with a shared ledger is a thread hop away. A provider-wide
+            # throttle is caught inside the reservation; a model's own bench was
+            # checked only by the selector. Nothing was sent, so it is given back.
+            await self.quota.release_async(spec, request.client_id, reservation=held)
+            return None, None, False
         start = monotonic()
         quality = response = error_type = error_detail = None
         validator_failed = cancelled = False
@@ -178,6 +185,7 @@ class EmbeddedRouter:
             if response.quota is not None:
                 await self.quota.observe_async(spec, response.quota)
             self.quota.success(spec.provider_id, probe_token=held.probe_token)
+            self.quota.answered(spec.provider_id, model.model_id)
         except BillingViolation as error:
             # Fail closed on this provider only. One uncertain/nonzero cost report
             # must not take unrelated free providers or local Ollama offline.

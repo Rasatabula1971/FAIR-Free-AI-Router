@@ -362,6 +362,10 @@ class MemoryQuotaGovernor:
         # is local to this process; another application sharing the account learns
         # of the limit from its own first refusal, which costs it no allowance.
         self._model_blocks: dict[tuple[str, str], float] = {}
+        # Per-minute refusals in a row with no answer between them, and when the
+        # bench each one earned ends: (provider_id, model_id or None for the whole
+        # provider) -> (count, until). See _throttle_until.
+        self._minute_strikes: dict[tuple[str, str | None], tuple[int, float]] = {}
         self._probe_sequence = 0
         # Monotonic count of ledger operations that failed. Read before and
         # after a solve to tell a busy ledger from an exhausted quota.
@@ -664,7 +668,7 @@ class MemoryQuotaGovernor:
         """
         return state.circuit_state == "HALF_OPEN" and state.probe_token != probe_token
 
-    def _throttle_until(self, retry_after, per_minute=False):
+    def _throttle_until(self, retry_after, per_minute=False, key=None):
         """When a throttle ends.
 
         The cooldown, or the provider's own wait if longer: the cooldown is FAIR's
@@ -675,6 +679,14 @@ class MemoryQuotaGovernor:
         for the cooldown instead left a model idle for six minutes over a limit
         that had cleared in seconds, which is most of what a token-per-minute
         allowance costs when the answers are large.
+
+        The stated wait is trusted once. If the very next request is refused the
+        same way, the wait did not hold -- another application is filling the
+        window, or the request can never fit it -- and every further try is a
+        request spent for nothing. So a second refusal in a row is held for the
+        whole window, and a third for the cooldown, which is where an unnamed
+        limit starts. An answer in between (see ``answered``) starts the count
+        again, so a model working at its limit keeps the short waits.
         """
         delay = (
             retry_after
@@ -684,16 +696,33 @@ class MemoryQuotaGovernor:
             and 0 < retry_after <= 86400
             else 0
         )
-        if per_minute:
-            return self.clock() + (delay or _PER_MINUTE_WINDOW_SECONDS)
-        return self.clock() + max(self.settings.cooldown_seconds, delay)
+        now = self.clock()
+        if not per_minute:
+            return now + max(self.settings.cooldown_seconds, delay)
+        count, until = self._minute_strikes.get(key, (0, float("-inf")))
+        # A refusal long after the last bench ended is not the same episode.
+        count = count + 1 if now - until <= _PER_MINUTE_WINDOW_SECONDS else 1
+        if count == 1:
+            hold = delay or _PER_MINUTE_WINDOW_SECONDS
+        elif count == 2:
+            hold = max(delay, _PER_MINUTE_WINDOW_SECONDS)
+        else:
+            hold = max(delay, _PER_MINUTE_WINDOW_SECONDS, self.settings.cooldown_seconds)
+        self._minute_strikes[key] = (count, now + hold)
+        return now + hold
+
+    def answered(self, provider_id, model_id):
+        """A model answered, so whatever per-minute refusals came before it are over."""
+        self._minute_strikes.pop((provider_id, model_id), None)
+        self._minute_strikes.pop((provider_id, None), None)
 
     def throttle(self, provider_id, retry_after=None, per_minute=False):
         state = self._state(provider_id)
         if state.circuit_state == "HALF_OPEN":
             self._open(state)
         state.throttled_until = max(
-            state.throttled_until, self._throttle_until(retry_after, per_minute)
+            state.throttled_until,
+            self._throttle_until(retry_after, per_minute, (provider_id, None)),
         )
 
     def model_available(self, provider_id, model_id):
@@ -726,7 +755,8 @@ class MemoryQuotaGovernor:
         The provider itself is left alone. Its circuit is not touched either: a
         refusal that names one model's limit came from a provider that answered.
         """
-        self._bench_model(provider_id, model_id, self._throttle_until(retry_after, per_minute))
+        until = self._throttle_until(retry_after, per_minute, (provider_id, model_id))
+        self._bench_model(provider_id, model_id, until)
 
     def exhaust_model(self, spec, model_id, reset_at=None):
         """Bench one model until a quota its provider counts per model resets."""

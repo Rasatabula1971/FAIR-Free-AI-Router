@@ -193,6 +193,105 @@ class TestAPerMinuteLimitClearsWithinTheMinute:
         assert router.quota.benched_models("p") == {FIRST: clock.now + 360}
 
 
+class TestAStatedWaitIsTrustedOnce:
+    """If the next request is refused the same way, the wait did not hold: another
+    application is filling the window, or the request can never fit it. Each further
+    try is a request spent for nothing, so the hold grows back toward the cooldown."""
+
+    def _refuse(self, governor, clock, wait=2):
+        governor.throttle_model("p", FIRST, retry_after=wait, per_minute=True)
+        return governor.benched_models("p")[FIRST] - clock.now
+
+    def test_refusals_in_a_row_hold_for_the_wait_then_the_window_then_the_cooldown(self):
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        holds = []
+        for _ in range(4):
+            holds.append(self._refuse(governor, clock))
+            clock.now += holds[-1]  # asked again the moment the bench ends
+        assert holds == [2, 60, 360, 360]
+
+    def test_a_longer_stated_wait_is_never_cut_down(self):
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        assert self._refuse(governor, clock, wait=900) == 900
+        clock.now += 900
+        assert self._refuse(governor, clock, wait=900) == 900
+        clock.now += 900
+        assert self._refuse(governor, clock, wait=900) == 900
+
+    def test_an_answer_in_between_starts_the_count_again(self):
+        """A model working at its limit is refused, waits, answers, and is refused
+        again. That is the limit doing its job, and it keeps the short waits."""
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        for _ in range(5):
+            hold = self._refuse(governor, clock, wait=7)
+            assert hold == 7
+            clock.now += hold
+            governor.answered("p", FIRST)
+
+    def test_a_refusal_long_after_the_last_bench_ended_is_a_new_episode(self):
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        assert self._refuse(governor, clock) == 2
+        clock.now += 2 + 60  # still inside the window after the bench: the same episode
+        assert self._refuse(governor, clock) == 60
+        clock.now += 60 + 61  # more than a window after it: a new one
+        assert self._refuse(governor, clock) == 2
+
+    def test_each_model_and_the_provider_keep_their_own_count(self):
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        governor.throttle_model("p", FIRST, retry_after=2, per_minute=True)
+        governor.throttle_model("p", SECOND, retry_after=2, per_minute=True)
+        governor.throttle("p", retry_after=2, per_minute=True)
+        assert governor.benched_models("p") == {FIRST: clock.now + 2, SECOND: clock.now + 2}
+        assert governor.state("p").throttled_until == clock.now + 2
+        clock.now += 2
+        governor.throttle("p", retry_after=2, per_minute=True)
+        assert governor.state("p").throttled_until == clock.now + 60
+        # An answer from any model clears the provider's count and that model's own.
+        clock.now += 60
+        governor.answered("p", FIRST)
+        governor.throttle("p", retry_after=2, per_minute=True)
+        assert governor.state("p").throttled_until == clock.now + 2
+        governor.throttle_model("p", SECOND, retry_after=2, per_minute=True)
+        assert governor.benched_models("p")[SECOND] == clock.now + 60
+
+    def test_a_limit_with_no_named_window_is_not_counted(self):
+        clock = Clock()
+        governor = _governor(clock, cooldown_seconds=360)
+        governor.throttle_model("p", FIRST, retry_after=2)
+        clock.now += 360
+        assert self._refuse(governor, clock) == 2
+
+    async def test_a_model_that_always_refuses_is_not_asked_every_two_seconds(self):
+        """Measured before this: 180 requests in six minutes to a model that kept
+        answering 'per minute, try again in 2s'. An unnamed limit gets one."""
+        refusal = RateLimited("RATE_LIMITED", retry_after=2, model_scoped=True, per_minute=True)
+        router, adapter, _, clock = _router({FIRST: refusal, SECOND: "345"})
+        router.quota.throttle_model("p", SECOND, retry_after=10_000)  # only FIRST is routable
+        for second in range(360):
+            await router.solve(_request(task=f"15*23 #{second}"))
+            clock.now += 1
+        assert adapter.calls.count(FIRST) == 3
+
+    async def test_the_router_reports_an_answer_so_short_waits_survive_real_use(self):
+        refusal = RateLimited("RATE_LIMITED", retry_after=7, model_scoped=True, per_minute=True)
+        router, adapter, _, clock = _router({FIRST: refusal, SECOND: "345"})
+        router.quota.throttle_model("p", SECOND, retry_after=10_000)  # only FIRST is routable
+        for _ in range(3):
+            adapter.outcomes[FIRST] = refusal
+            await router.solve(_request(task=f"refused at {clock.now}"))
+            assert router.quota.benched_models("p")[FIRST] == clock.now + 7
+            clock.now += 7
+            adapter.outcomes[FIRST] = "345"
+            result = await router.solve(_request(task=f"answered at {clock.now}"))
+            assert (result.status, result.model_id) == ("ACCEPTED", FIRST)
+            clock.now += 1
+
+
 class TestARequestTooLargeIsAboutTheRequest:
     async def test_the_next_route_answers_and_the_provider_is_not_blamed(self):
         refusal = RequestTooLarge("REQUEST_TOO_LARGE_FOR_MODEL")

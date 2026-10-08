@@ -207,6 +207,9 @@ class TextAdapter:
     # request against a fixed allowance, so it holds until the account's limits
     # change; an hour is short enough to notice that they have.
     _refused_size_ttl = 3600
+    # How many refused sizes are kept per model. Two already cover the shapes that
+    # differ in kind, a long prompt and a large answer; the rest is headroom.
+    _refused_size_slots = 8
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -218,9 +221,9 @@ class TextAdapter:
         self._catalog_error: Exception | None = None
         self._catalog_error_at = 0.0
         self._catalog_drops: dict[str, str] = {}
-        # model_id -> (prompt estimate, output budget, until) of the last request
-        # the provider refused as too large. See _refuse_known_oversize.
-        self._refused_sizes: dict[str, tuple[int, int, float]] = {}
+        # model_id -> the (prompt estimate, output budget, until) of requests the
+        # provider refused as too large. See _refuse_known_oversize.
+        self._refused_sizes: dict[str, list[tuple[int, int, float]]] = {}
         self._client = httpx.AsyncClient(
             timeout=self._timeout(settings.read_timeout_seconds),
             trust_env=False,
@@ -300,7 +303,13 @@ class TextAdapter:
             raise QuotaExceeded("FREE_ACCESS_UNAVAILABLE")
         if status == 429:
             observation = self._observe(headers)
-            self._quota = observation
+            # self._quota is what the next successful response hands the governor
+            # as the provider's allowance. One model's spent allowance is not that:
+            # a completion streaming from a sibling at the same moment would carry
+            # it back and exhaust every model, which is the outcome model scope
+            # exists to prevent.
+            if not model_scoped:
+                self._quota = observation
             if observation.quota_remaining_estimate == 0:
                 raise QuotaExceeded(
                     "REQUEST_QUOTA_EXHAUSTED",
@@ -397,11 +406,16 @@ class TextAdapter:
             record["last_provider_error"] = dict(self._last_error)
         if self._catalog_drops:
             record["catalog_drops"] = dict(self._catalog_drops)
+        now = self.clock()
         refused = {
-            model_id: {"prompt_tokens_estimate": prompt, "output_budget": budget}
-            for model_id, (prompt, budget, until) in sorted(self._refused_sizes.items())
-            if self.clock() < until
+            model_id: [
+                {"prompt_tokens_estimate": prompt, "output_budget": budget}
+                for prompt, budget, until in sizes
+                if now < until
+            ]
+            for model_id, sizes in sorted(self._refused_sizes.items())
         }
+        refused = {model_id: sizes for model_id, sizes in refused.items() if sizes}
         if refused:
             record["refused_sizes"] = refused
         return record
@@ -416,15 +430,32 @@ class TextAdapter:
         is at least that large in both prompt and output budget. That holds however
         the provider counts the two, which FAIR does not know.
         """
-        known = self._refused_sizes.get(model_id)
-        if known is None:
+        now = self.clock()
+        known = [size for size in self._refused_sizes.get(model_id, ()) if now < size[2]]
+        if not known:
+            self._refused_sizes.pop(model_id, None)
             return
-        refused_prompt, refused_budget, until = known
-        if self.clock() >= until:
-            del self._refused_sizes[model_id]
-            return
-        if prompt >= refused_prompt and budget >= refused_budget:
+        self._refused_sizes[model_id] = known
+        if any(prompt >= refused[0] and budget >= refused[1] for refused in known):
             raise RequestNotSupported("SIZE_ALREADY_REFUSED_BY_PROVIDER")
+
+    def _remember_refused_size(self, model_id, prompt, budget):
+        """Keep a refused size beside the others still held, not in place of them.
+
+        One slot let two shapes of oversized request, a long prompt and a large
+        answer, evict each other: neither is at least as large as the other both
+        ways, so each refusal overwrote the last and both were sent and charged
+        every time. An entry the new one makes redundant is dropped, and the list
+        is bounded so nothing a provider says can grow it without limit.
+        """
+        now = self.clock()
+        kept = [
+            size
+            for size in self._refused_sizes.get(model_id, ())
+            if now < size[2] and not (size[0] >= prompt and size[1] >= budget)
+        ]
+        kept.append((prompt, budget, now + self._refused_size_ttl))
+        self._refused_sizes[model_id] = kept[-self._refused_size_slots :]
 
     async def _stream_json(self, path, payload, timeout):
         """Read an SSE completion and assemble the envelope a buffered one would have.
@@ -837,11 +868,7 @@ class TextAdapter:
                 else await self._json("POST", "/chat/completions", payload, timeout=timeout)
             )
         except RequestTooLarge:
-            self._refused_sizes[model.model_id] = (
-                prompt,
-                budget,
-                self.clock() + self._refused_size_ttl,
-            )
+            self._remember_refused_size(model.model_id, prompt, budget)
             raise
         self._after_completion(data)
         try:

@@ -891,10 +891,113 @@ class TestGroq:
             await adapter.complete(self._asking(3000))
         refused = adapter.safe_diagnostics()["refused_sizes"]
         assert list(refused) == [self.MODEL]
-        assert refused[self.MODEL]["output_budget"] == 3000
-        assert refused[self.MODEL]["prompt_tokens_estimate"] > 0
+        [size] = refused[self.MODEL]
+        assert size["output_budget"] == 3000
+        assert size["prompt_tokens_estimate"] > 0
         clock.now += 3600
         assert adapter.safe_diagnostics() == {}
+
+    async def test_two_shapes_of_oversized_request_are_both_remembered(self):
+        """A long prompt and a large answer: neither is at least as large as the
+        other both ways. With one slot each refusal evicted the other, and both
+        were sent and charged every time."""
+        adapter, sent, _ = self._sized()
+        long_prompt, large_answer = self._asking(3000, task="long " * 2000), self._asking(4000)
+        for request in (long_prompt, large_answer):
+            with pytest.raises(RequestTooLarge):
+                await adapter.complete(request)
+        assert sent() == 2
+        for request in (long_prompt, large_answer, long_prompt, large_answer):
+            with pytest.raises(RequestNotSupported, match="^SIZE_ALREADY_REFUSED"):
+                await adapter.complete(request)
+        assert sent() == 2
+        assert len(adapter.safe_diagnostics()["refused_sizes"][self.MODEL]) == 2
+
+    async def test_a_smaller_refusal_replaces_the_ones_it_covers(self):
+        adapter, sent, _ = self._sized()
+        for tokens in (4000, 3000):
+            with pytest.raises(RequestTooLarge):
+                await adapter.complete(self._asking(tokens))
+        held = adapter.safe_diagnostics()["refused_sizes"][self.MODEL]
+        assert [size["output_budget"] for size in held] == [3000]
+        with pytest.raises(RequestNotSupported, match="^SIZE_ALREADY_REFUSED"):
+            await adapter.complete(self._asking(3500))
+        assert sent() == 2
+
+    async def test_the_memory_of_refused_sizes_is_bounded(self):
+        """Each of these is smaller one way and larger the other, so none covers another."""
+        adapter, _, _ = self._sized()
+        for step in range(12):
+            with pytest.raises(RequestTooLarge):
+                await adapter.complete(self._asking(4000 - step * 100, task="long " * 40 * step))
+        held = adapter.safe_diagnostics()["refused_sizes"][self.MODEL]
+        assert len(held) == adapter._refused_size_slots == 8
+        # The most recent are the ones kept.
+        assert held[-1]["output_budget"] == 2900
+
+    async def test_one_refused_size_expiring_does_not_take_the_others_with_it(self):
+        adapter, sent, clock = self._sized()
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(3000, task="long " * 2000))
+        clock.now += 1800
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(4000))
+        clock.now += 1800  # the first is an hour old, the second half an hour
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(3000, task="long " * 2000))
+        with pytest.raises(RequestNotSupported, match="^SIZE_ALREADY_REFUSED"):
+            await adapter.complete(self._asking(4000))
+        assert sent() == 3
+
+    async def test_a_size_refusal_inside_a_stream_is_too_large_as_well(self):
+        """Groq can deliver an error in-stream under a 200."""
+        frames = [
+            {"model": self.MODEL, "choices": [{"delta": {"role": "assistant"}}]},
+            {"error": {"message": self.TOO_LARGE, "type": "tokens", "code": "rate_limit_exceeded"}},
+        ]
+        content = "".join("data: " + json.dumps(frame) + "\n\n" for frame in frames)
+        transport, _ = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): lambda request: httpx.Response(
+                    200, content=content.encode(), headers={"content-type": "text/event-stream"}
+                ),
+            }
+        )
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+        )
+        with pytest.raises(RequestTooLarge, match="^REQUEST_TOO_LARGE_FOR_MODEL$"):
+            await adapter.complete(_request(self.MODEL))
+        assert len(adapter.safe_diagnostics()["refused_sizes"][self.MODEL]) == 1
+
+    async def test_one_models_spent_allowance_is_not_published_as_the_providers(self):
+        """The adapter's quota snapshot is what the next success on ANY model hands
+        the governor. A refusal about one model must not be left in it."""
+        spent = {
+            "x-ratelimit-limit-requests": "1000",
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": "2h3m",
+        }
+        named = self._refused(
+            self.NAMED.replace("tokens per minute (TPM)", "requests per day (RPD)"), **spent
+        )
+        with pytest.raises(QuotaExceeded) as raised:
+            await named.complete(_request(self.MODEL))
+        assert raised.value.model_scoped is True
+        assert (await named.quota()).quota_remaining_estimate is None
+
+        unnamed = self._refused("Rate limit exceeded", **spent)
+        with pytest.raises(QuotaExceeded) as raised:
+            await unnamed.complete(_request(self.MODEL))
+        assert raised.value.model_scoped is False
+        assert (await unnamed.quota()).quota_remaining_estimate == 0
 
     async def test_a_rate_limit_is_not_remembered_as_a_size(self):
         adapter = self._refused(self.NAMED, **{"retry-after": "3"})
