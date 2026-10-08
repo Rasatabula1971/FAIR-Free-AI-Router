@@ -335,9 +335,10 @@ and the text outside may be at most 300 characters, not counting whitespace. So 
 documents, an example ahead of the answer, or prose that uses brackets itself are still
 a failure: FAIR never chooses between candidates and never repairs JSON. A bare number
 or word in a sentence is never lifted out. Neither is a value inside a larger structure
-that lost its outer braces, such as `"status": "error", "data": {...}`: a quoted key and
-colon straight before the JSON, or a comma and another quoted key straight after it, mark
-it as part of something broken rather than a wrapped answer.
+that lost its outer braces, such as `"status": "error", "data": {...}`. Next to the JSON,
+a quoted key and colon, or a comma with another value on its far side, mark it as part of
+something broken rather than a wrapped answer. A comma after prose ("Here you go, {...}")
+or before prose ("{...}, as requested") does not.
 
 The wrapper is only read through when the answer itself is meant to be JSON. With a
 `python_function`, `arithmetic` or `grounded_claims` contract the answer belongs to that

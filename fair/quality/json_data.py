@@ -15,6 +15,11 @@ MAX_WRAPPER_CHARS = 300
 
 _BRACKETS = frozenset("{}[]")
 
+# Where a JSON value would end or begin. Checked only against the few characters
+# next to the span, so neither can scan the wrapper.
+_VALUE_END = re.compile(r"""(?:["'0-9]|\b(?:true|false|null))$""")
+_VALUE_START = re.compile(r"""["'0-9-]|(?:true|false|null)\b""")
+
 
 def _fenced(text):
     """The body of a code fence wrapping the whole answer, else None.
@@ -51,9 +56,10 @@ def _unwrap(text):
 
     Nor is a value inside a larger structure that lost its outer braces:
     ``"status": "error", "data": {...}`` is a broken object, and lifting ``data``
-    out of it would be choosing a part and calling it the answer. A quoted key
-    and colon straight before the span, or a comma and another quoted key
-    straight after it, mark the span as a member rather than a document.
+    out of it would be choosing a part and calling it the answer. Next to the
+    span, a quoted key and colon, or a comma with another value on its far side,
+    mark it as a member rather than a document. A comma after prose
+    ("Here you go, {...}") or before prose ("{...}, as requested") does not.
     """
     opening = min((i for i in (text.find("{"), text.find("[")) if i >= 0), default=-1)
     closing = max(text.rfind("}"), text.rfind("]"))
@@ -64,9 +70,10 @@ def _unwrap(text):
     if not _BRACKETS.isdisjoint(wrapper):
         raise ValueError("Brackets outside the JSON document")
     lead, trail = before.rstrip(), after.lstrip()
-    if (lead.endswith(":") and lead[:-1].rstrip().endswith('"')) or (
-        trail.startswith(",") and trail[1:].lstrip().startswith('"')
-    ):
+    keyed = lead.endswith(":") and lead[:-1].rstrip()[-1:] in {'"', "'"}
+    listed_after = lead.endswith(",") and _VALUE_END.search(lead[:-1].rstrip()[-6:])
+    listed_before = trail.startswith(",") and _VALUE_START.match(trail[1:].lstrip()[:6])
+    if keyed or listed_after or listed_before:
         raise ValueError("The JSON is a member of a larger structure")
     if len("".join(wrapper.split())) > MAX_WRAPPER_CHARS:
         raise ValueError("Too much text around the JSON document")

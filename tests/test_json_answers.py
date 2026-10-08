@@ -94,6 +94,8 @@ class TestReadingAnAnswer:
             # A quoted word in the sentence is not a key: the colon does not follow it.
             (f'The "items" list you asked for: {DOCUMENT}', "PROSE"),
             (f"{DOCUMENT}, as requested.", "PROSE"),
+            (f"Here you go, {DOCUMENT}", "PROSE"),
+            (f"{DOCUMENT}, then nothing else.", "PROSE"),
         ],
     )
     def test_the_document_is_found_and_what_was_removed_is_named(self, text, wrapper):
@@ -146,6 +148,14 @@ class TestReadingAnAnswer:
             '"data" : \n {"items": []}',
             '{"items": [1]}, "other": 2',
             '{"items": [1]} ,\n "other": 2',
+            # Found by the verification pass: the first rule looked one way only.
+            '"x", {"items": [1]}',
+            '"a": 1, {"items": [1]}',
+            'null, {"items": [1]}',
+            '{"items": [1]}, 2',
+            '{"items": [1]}, -1',
+            '{"items": [1]}, true',
+            "'data': {\"items\": [1]}",
             # No object or array at all: a value in a sentence is not a wrapped answer.
             "The answer is 42",
             'The answer is "yes"',
