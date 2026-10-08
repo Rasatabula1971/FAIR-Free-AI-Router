@@ -16,6 +16,7 @@ from fair.config import RoutingSettings
 from fair.embedded.quota import SharedQuotaLedger
 from fair.embedded.router import EmbeddedRouter
 from fair.governor.policy import AdmissionDenied
+from fair.governor.qualification import review_expiry
 from fair.providers.base import AuthenticationFailed, ProviderAdapter
 from fair.providers.live import (
     MAX_OUTPUT_TOKENS,
@@ -95,6 +96,12 @@ def _make_qualification(provider_id, free_status, models, reference):
             for m in models
         ],
     )
+
+
+def _review_expires_at(spec):
+    """The review's expiry as an ISO 8601 string, or None when there is none."""
+    expiry = review_expiry(spec)
+    return None if expiry is None else expiry.isoformat()
 
 
 def _skip_reason(error):
@@ -735,6 +742,8 @@ class FAIR:
                 "provider_id": p.provider_id,
                 "status": self._router.quota.effective_status(p),
                 "access_class": p.access_class,
+                "request_limit": p.request_limit,
+                "review_expires_at": _review_expires_at(p),
                 "models": [m.model_id for m in p.models],
                 "quota_pool_id": self._router.quota.pool_id(p.provider_id),
                 "quota_remaining": self._router.quota.remaining(p),
@@ -753,6 +762,8 @@ class FAIR:
                 "provider_id": provider.provider_id,
                 "status": status,
                 "access_class": provider.access_class,
+                "request_limit": provider.request_limit,
+                "review_expires_at": _review_expires_at(provider),
                 "models": [model.model_id for model in provider.models],
                 "quota_pool_id": self._router.quota.pool_id(provider.provider_id),
                 "quota_remaining": remaining,

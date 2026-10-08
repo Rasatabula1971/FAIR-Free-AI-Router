@@ -362,12 +362,46 @@ fair-service
 ### Service endpoints
 
 - `GET /health` — local health only; no credential required
+- `GET /status` — read-only status page for a browser; see below
 - `GET /v1/models` — exposes the virtual OpenAI-style model `fair-router`
 - `POST /v1/chat/completions` — non-streaming OpenAI-style compatibility endpoint
 - `POST /v1/fair/solve` — native FAIR contract with validation, privacy and cross-check options
 - `GET /v1/fair/providers` — provider status without secrets
 - `GET /v1/fair/quota` — shared quota usage and per-application attribution
 - `POST /v1/fair/admin/providers/{provider_id}/resume` — optional admin-key-only provider recovery
+
+### Status page
+
+Open `http://127.0.0.1:8000/status` in a browser while the service is running. It says in
+one sentence how many providers can take requests, then lists each provider with its
+state, the requests it has left, its models, and how many days remain before its review
+runs out. Providers that were configured but not loaded are listed with the reason, and
+shared quota is broken down by application when a shared quota file is in use.
+
+The page is read-only and adds no data source: it shows what `GET /health`,
+`GET /v1/fair/providers` and `GET /v1/fair/quota` already return. Without a key it shows
+only the `/health` counts. Paste a FAIR client key to see the rest; the key is held in the
+page's memory and is gone on reload. It refreshes every 15 seconds.
+
+It loads nothing from the network: no fonts, scripts or images. Its
+Content-Security-Policy admits only the one script and stylesheet it ships, and lets it
+talk only to the service that served it.
+
+`/v1/fair/providers` now also returns `request_limit` and `review_expires_at` for each
+provider, which is what the page's last two columns are built from.
+
+Days left on a review are counted on your own calendar, so the count agrees with the
+date beside it; on the last day the page says "today" and gives the time. A provider
+that is out of allowance shows none left, whatever FAIR's own count says.
+
+The page's script is tested in a real browser by `tests/test_status_page_browser.py`,
+which needs Playwright and Chromium and skips without them:
+
+```powershell
+pip install playwright
+python -m playwright install chromium
+pytest tests/test_status_page_browser.py
+```
 
 Example native request:
 

@@ -76,6 +76,26 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  status-page-browser:
+    name: Status page in a browser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project and Playwright
+        run: python -m pip install -e ".[dev]" "playwright>=1.49,<2"
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Run the page in Chromium
+        # The page's script is a string to every other job. A missing browser
+        # must fail here rather than skip, or this job would be green and empty.
+        env:
+          FAIR_REQUIRE_BROWSER: "1"
+        run: pytest -ra tests/test_status_page_browser.py
+
   dependency-audit:
     name: Python dependency audit
     runs-on: ubuntu-latest

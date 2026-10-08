@@ -11,13 +11,14 @@ from time import time
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from fair import FAIR
 from fair.embedded.module import _read_env_file
 from fair.providers.base import BillingViolation
 from fair.schemas.domain import Capability, Priority, PrivacyClass
+from fair.service.status_page import STATUS_HEADERS, STATUS_PAGE
 
 SERVICE_MODEL_ID = "fair-router"
 
@@ -227,6 +228,13 @@ def create_app(fair: FAIR, client_keys: dict[str, str], *, admin_key: str | None
         if fair.stopped or not routable:
             return JSONResponse(status_code=503, content=payload)
         return payload
+
+    @app.get("/status", include_in_schema=False)
+    async def status_page():
+        # The page carries no data and asks for none without a client key, so
+        # like /health it is served without one. Everything it shows comes from
+        # the authenticated endpoints below.
+        return HTMLResponse(STATUS_PAGE, headers=STATUS_HEADERS)
 
     @app.get("/v1/models")
     async def models(_client_id: str = Depends(resolve_client)):
