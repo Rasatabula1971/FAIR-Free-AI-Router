@@ -19,6 +19,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    RequestTooLarge,
     StructuredOutputRejected,
 )
 from fair.quality.consensus import compare, independent
@@ -195,12 +196,18 @@ class EmbeddedRouter:
             disposition, error_type = "QUOTA_FAILURE", "QUOTA_EXHAUSTED"
             error_detail = _failure_detail(error)
         except RateLimited as error:
+            per_minute = error.per_minute is True
             if error.model_scoped is True:
                 self.quota.throttle_model(
-                    spec.provider_id, model.model_id, retry_after=error.retry_after
+                    spec.provider_id,
+                    model.model_id,
+                    retry_after=error.retry_after,
+                    per_minute=per_minute,
                 )
             else:
-                self.quota.throttle(spec.provider_id, retry_after=error.retry_after)
+                self.quota.throttle(
+                    spec.provider_id, retry_after=error.retry_after, per_minute=per_minute
+                )
             disposition, error_type = "QUOTA_FAILURE", "RATE_LIMITED"
             error_detail = _failure_detail(error)
         except StructuredOutputRejected as error:
@@ -209,6 +216,15 @@ class EmbeddedRouter:
             # is down, so provider health is left alone and the attempt counts as an
             # answer: the model answered, and the answer was the wrong shape.
             disposition, error_type = "QUALITY_FAILURE", "PROVIDER_SCHEMA_VALIDATION_FAILED"
+            error_detail = _failure_detail(error)
+        except RequestTooLarge as error:
+            # The provider answered: this request is bigger than the route allows.
+            # That is a fact about the request, so the provider's health and its
+            # other requests are left alone, and like any capability mismatch it
+            # spends neither attempt budget. Unlike the branch below, a request
+            # was made, so the charge stands.
+            self.quota.release(spec, request.client_id, refund=False, reservation=held)
+            disposition, error_type = "CAPABILITY_MISMATCH", "REQUEST_TOO_LARGE_FOR_ROUTE"
             error_detail = _failure_detail(error)
         except RequestNotSupported as error:
             # Raised by the adapter's own budget and capability checks, before any
@@ -304,6 +320,7 @@ class EmbeddedRouter:
         )
         if attempt.disposition != "CANCELLED" and attempt.error_type not in {
             "REQUEST_NOT_SUPPORTED_BY_ROUTE",
+            "REQUEST_TOO_LARGE_FOR_ROUTE",
             "MODEL_UNAVAILABLE",
             "ACCESS_DENIED",
         }:

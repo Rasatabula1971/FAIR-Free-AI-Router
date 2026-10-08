@@ -20,12 +20,17 @@ class RateLimited(ProviderError):
     models are unaffected. It is only ever set on the provider's own word -- an
     error that names the model or a per-model quota. Anything less is False: the
     scope is unknown, and benching the whole provider is the safe reading of that.
+
+    ``per_minute`` says the provider named a per-minute limit -- tokens or requests
+    -- so the window is known to be a minute long. Also only on the provider's own
+    word; a limit whose window is not named keeps FAIR's longer cooldown.
     """
 
-    def __init__(self, message="", *, retry_after=None, model_scoped=False):
+    def __init__(self, message="", *, retry_after=None, model_scoped=False, per_minute=False):
         super().__init__(message)
         self.retry_after = retry_after
         self.model_scoped = model_scoped
+        self.per_minute = per_minute
 
 
 class BillingViolation(ProviderError):
@@ -55,6 +60,16 @@ class MalformedResponse(ProviderError):
 
 class RequestNotSupported(MalformedResponse):
     """The request cannot use this route; provider health is not implicated."""
+
+
+class RequestTooLarge(RequestNotSupported):
+    """The provider was asked and refused this request for its size.
+
+    Unlike its parent this is raised after dispatch, so a request was made. It says
+    the request does not fit the route -- more tokens than the model's per-minute
+    allowance, or a body over the provider's limit -- and waiting does not change
+    that, so it is neither a rate limit nor evidence about provider health.
+    """
 
 
 class StructuredOutputRejected(MalformedResponse):

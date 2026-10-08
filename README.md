@@ -160,7 +160,7 @@ refunded. Without that, a model delisted upstream spends a free request on every
 solve that still carries it, which on a 50-a-day allowance is not a rounding error.
 
 A provider that was called keeps the charge however badly it answered: a 403, a
-5xx and a malformed body all mean a request was made. A cancelled solve keeps it
+413, a 5xx and a malformed body all mean a request was made. A cancelled solve keeps it
 too, since cancellation can tear down a call already in flight. Over-counting
 costs a free request; under-counting exceeds a free tier, which is the thing the
 governor exists to prevent.
@@ -189,7 +189,8 @@ and any allowance that really is account-wide, such as Cloudflare's daily neuron
 OpenRouter's daily requests. An unknown scope gets the widest block.
 
 A benched model returns after the cooldown, or the provider's own wait if that is
-longer, or when its quota resets. `fair.providers()` lists them under `benched_models`
+longer, or when its quota resets. A limit the provider names as per-minute is held
+for less; see [Token limits](#token-limits). `fair.providers()` lists them under `benched_models`
 with the time each returns, and a provider whose every model is benched reports
 `THROTTLED`. In the attempt log a per-model refusal is recorded as `MODEL_RATE_LIMITED`
 or `MODEL_QUOTA_EXHAUSTED`. Benches are local to the process, as throttles are: another
@@ -197,6 +198,45 @@ application sharing the account learns of the limit from its own first refusal.
 
 Request counting is unchanged and still per provider. Groq's `request_limit` of 1000 a
 day is applied across both of its models, though Groq publishes that many for each.
+
+## Token limits
+
+FAIR counts requests, not tokens. Groq and Gemini also meter tokens per minute, and
+with large answers that is the limit reached first: one long answer spends most of a
+model's per-minute allowance, and the next request is refused until some of it comes
+back. FAIR keeps no token count of its own. It acts on what the refusal says.
+
+**A per-minute limit is held for the minute, not the cooldown.** Both providers name
+the window and state a wait:
+
+- **Groq** in the text: ``Rate limit reached for model `...` ... on tokens per minute
+  (TPM): ... Please try again in 2.5s.``
+- **Gemini** in the quota id and its retry delay:
+  `GenerateContentInputTokensPerModelPerMinute-FreeTier`, `"retryDelay": "8s"`.
+
+When the window is named, the bench lasts the stated wait, or 60 seconds if none is
+stated. Before, the cooldown was a floor under every wait, so a limit that cleared in
+seconds idled the model for six minutes. A limit whose window is not named keeps the
+cooldown, and a daily one is unchanged. The attempt log records these as
+`MODEL_RATE_LIMITED_PER_MINUTE` or `RATE_LIMITED_PER_MINUTE`.
+
+**A request too large for a route is not an outage.** A single request that asks for
+more than a model's whole per-minute allowance is refused outright, and no wait changes
+that. Groq answers HTTP 413, ``Request too large for model ...``. FAIR used to count it
+as a provider failure, so three in a minute opened the circuit and took the provider's
+small requests with it. It is now a capability mismatch, `REQUEST_TOO_LARGE_FOR_ROUTE`:
+the next route is tried, the provider's health is untouched, and neither attempt budget
+is spent. The request was made, so its charge stands.
+
+**A refused size is not sent twice.** The adapter remembers, per model and for an hour,
+the size of the request the provider refused. A later request at least that large in
+both prompt and output budget is stopped before dispatch,
+`SIZE_ALREADY_REFUSED_BY_PROVIDER`, and its reservation is given back. Anything smaller
+is sent as usual. `safe_diagnostics()` lists what is held under `refused_sizes`.
+
+FAIR does not track tokens used, predict a refusal, or reserve tokens for a request in
+flight. That would need a tokens-per-minute figure per model, and none has been measured
+against a live account. Until one is, the first refusal is how FAIR finds out.
 
 ## Shared quota across applications
 

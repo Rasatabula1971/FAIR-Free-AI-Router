@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 
 _EXHAUSTION_RETRY_SECONDS = 3600
+# The longest a per-minute limit can stay full once nothing more is sent into it.
+_PER_MINUTE_WINDOW_SECONDS = 60
 _WINDOW_ZONES = {"DAILY_UTC": UTC, "DAILY_PACIFIC": ZoneInfo("America/Los_Angeles")}
 
 
@@ -662,22 +664,37 @@ class MemoryQuotaGovernor:
         """
         return state.circuit_state == "HALF_OPEN" and state.probe_token != probe_token
 
-    def _throttle_until(self, retry_after):
-        """When a throttle ends: the cooldown, or the provider's own wait if longer."""
+    def _throttle_until(self, retry_after, per_minute=False):
+        """When a throttle ends.
+
+        The cooldown, or the provider's own wait if longer: the cooldown is FAIR's
+        guess at a window it was not told, so it only ever lengthens a block.
+
+        A limit the provider names as per-minute needs no guess. Its wait is taken
+        as stated, and with none stated the window itself is the answer. Holding it
+        for the cooldown instead left a model idle for six minutes over a limit
+        that had cleared in seconds, which is most of what a token-per-minute
+        allowance costs when the answers are large.
+        """
         delay = (
             retry_after
             if isinstance(retry_after, (int, float))
+            and not isinstance(retry_after, bool)
             and isfinite(retry_after)
             and 0 < retry_after <= 86400
             else 0
         )
+        if per_minute:
+            return self.clock() + (delay or _PER_MINUTE_WINDOW_SECONDS)
         return self.clock() + max(self.settings.cooldown_seconds, delay)
 
-    def throttle(self, provider_id, retry_after=None):
+    def throttle(self, provider_id, retry_after=None, per_minute=False):
         state = self._state(provider_id)
         if state.circuit_state == "HALF_OPEN":
             self._open(state)
-        state.throttled_until = max(state.throttled_until, self._throttle_until(retry_after))
+        state.throttled_until = max(
+            state.throttled_until, self._throttle_until(retry_after, per_minute)
+        )
 
     def model_available(self, provider_id, model_id):
         """Whether this one model is free of a block of its own."""
@@ -703,13 +720,13 @@ class MemoryQuotaGovernor:
         key = (provider_id, model_id)
         self._model_blocks[key] = max(self._model_blocks.get(key, 0), until)
 
-    def throttle_model(self, provider_id, model_id, retry_after=None):
+    def throttle_model(self, provider_id, model_id, retry_after=None, per_minute=False):
         """Bench one model for a rate limit its provider counts per model.
 
         The provider itself is left alone. Its circuit is not touched either: a
         refusal that names one model's limit came from a provider that answered.
         """
-        self._bench_model(provider_id, model_id, self._throttle_until(retry_after))
+        self._bench_model(provider_id, model_id, self._throttle_until(retry_after, per_minute))
 
     def exhaust_model(self, spec, model_id, reset_at=None):
         """Bench one model until a quota its provider counts per model resets."""

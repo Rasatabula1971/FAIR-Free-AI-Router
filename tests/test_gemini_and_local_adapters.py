@@ -348,6 +348,59 @@ class TestGemini:
         assert raised.value.model_scoped is True
 
     @pytest.mark.parametrize(
+        "quota_id",
+        [
+            "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+            # The token one, as Google returns it once large requests fill the minute.
+            "GenerateContentInputTokensPerModelPerMinute-FreeTier",
+        ],
+    )
+    async def test_a_per_minute_quota_says_so_and_carries_googles_wait(self, quota_id):
+        adapter = self._violating(
+            error={
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaId": quota_id}],
+                    },
+                    {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "8s"},
+                ],
+            }
+        )
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert (raised.value.per_minute, raised.value.model_scoped) == (True, True)
+        assert raised.value.retry_after == 8
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            # A window is known only when every violated quota names it.
+            {
+                "code": 429,
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [
+                            {"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"},
+                            {"quotaId": "GenerateRequestsPerProjectPerModel-FreeTier"},
+                        ],
+                    }
+                ],
+            },
+            # And never when no quota is named at all.
+            {"code": "rate_limit_exceeded", "message": "slow down"},
+        ],
+    )
+    async def test_a_limit_whose_window_is_not_named_is_not_per_minute(self, error):
+        adapter = self._violating(error=error)
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(GEMINI_MODEL))
+        assert raised.value.per_minute is False
+
+    @pytest.mark.parametrize(
         "quota_ids",
         [
             ("GenerateRequestsPerDayPerProject-FreeTier",),

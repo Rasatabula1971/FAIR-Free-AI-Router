@@ -15,6 +15,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    RequestTooLarge,
     StructuredOutputRejected,
 )
 
@@ -95,11 +96,23 @@ class CredentialedAdapter:
         except RateLimited as error:
             logger.info("Rate limited by provider %s", self.provider_id)
             scoped = error.model_scoped is True
+            # The window travels the same way: dropped, a limit that clears in
+            # seconds is held for the full cooldown.
+            per_minute = error.per_minute is True
+            code = "MODEL_RATE_LIMITED" if scoped else "RATE_LIMITED"
             raise RateLimited(
-                "MODEL_RATE_LIMITED" if scoped else "RATE_LIMITED",
+                code + "_PER_MINUTE" if per_minute else code,
                 retry_after=error.retry_after,
                 model_scoped=scoped,
+                per_minute=per_minute,
             ) from None
+        except RequestTooLarge as error:
+            # Must precede RequestNotSupported: re-raised as its parent, a request
+            # the provider was sent and refused reads as one FAIR never sent, and
+            # the router refunds a request that was made.
+            code = _safe_code(error, "REQUEST_TOO_LARGE")
+            logger.info("Provider %s refused a request for its size: %s", self.provider_id, code)
+            raise RequestTooLarge(code) from None
         except RequestNotSupported as error:
             code = _safe_code(error, "REQUEST_NOT_SUPPORTED")
             raise RequestNotSupported(code) from None

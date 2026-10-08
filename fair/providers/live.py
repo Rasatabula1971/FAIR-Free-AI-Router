@@ -27,6 +27,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    RequestTooLarge,
     StructuredOutputRejected,
 )
 from fair.providers.schema_dialects import (
@@ -202,6 +203,10 @@ class TextAdapter:
     # value the rest of this package refuses to keep, so an unrecognised code keeps
     # its existing status-based classification rather than being guessed at.
     schema_rejection_codes = frozenset({"json_validate_failed"})
+    # How long a size the provider refused is remembered. The refusal is about the
+    # request against a fixed allowance, so it holds until the account's limits
+    # change; an hour is short enough to notice that they have.
+    _refused_size_ttl = 3600
 
     def __init__(self, spec, settings, credential=None, transport=None, clock=time):
         self.provider_id, self.spec, self.settings = spec.provider_id, spec, settings
@@ -213,6 +218,9 @@ class TextAdapter:
         self._catalog_error: Exception | None = None
         self._catalog_error_at = 0.0
         self._catalog_drops: dict[str, str] = {}
+        # model_id -> (prompt estimate, output budget, until) of the last request
+        # the provider refused as too large. See _refuse_known_oversize.
+        self._refused_sizes: dict[str, tuple[int, int, float]] = {}
         self._client = httpx.AsyncClient(
             timeout=self._timeout(settings.read_timeout_seconds),
             trust_env=False,
@@ -283,7 +291,7 @@ class TextAdapter:
     def _observe(self, headers):
         return QuotaSnapshot(provider_id=self.provider_id)
 
-    def _error(self, status, headers, *, model_scoped=False):
+    def _error(self, status, headers, *, model_scoped=False, per_minute=False):
         if status == 403:
             raise AccessDenied("PROVIDER_ACCESS_DENIED")
         if status == 401 or 300 <= status < 400:
@@ -303,7 +311,14 @@ class TextAdapter:
                 "RATE_LIMITED",
                 retry_after=retry_seconds(headers.get("retry-after"), self.clock()),
                 model_scoped=model_scoped,
+                per_minute=per_minute,
             )
+        if status == 413:
+            # Content Too Large is a verdict on this request, not on the provider.
+            # Left to the branch below it read as an outage: three oversized
+            # requests in a minute opened the circuit on a provider that had
+            # answered every one of them, and took its small requests with it.
+            raise RequestTooLarge("HTTP_413")
         if status != 200:
             # The status code is FAIR's own observation, not upstream text, so
             # it is safe to surface; it is the difference between "overloaded
@@ -382,7 +397,34 @@ class TextAdapter:
             record["last_provider_error"] = dict(self._last_error)
         if self._catalog_drops:
             record["catalog_drops"] = dict(self._catalog_drops)
+        refused = {
+            model_id: {"prompt_tokens_estimate": prompt, "output_budget": budget}
+            for model_id, (prompt, budget, until) in sorted(self._refused_sizes.items())
+            if self.clock() < until
+        }
+        if refused:
+            record["refused_sizes"] = refused
         return record
+
+    def _refuse_known_oversize(self, model_id, prompt, budget):
+        """Stop before dispatch when the provider already refused a request this size.
+
+        A size refusal does not clear by waiting, so without this every large
+        request is sent, refused and charged again. Nothing here is a limit FAIR
+        assumed: the only number kept is the size of a request the provider itself
+        turned away, in FAIR's own estimate, and a request is held back only when it
+        is at least that large in both prompt and output budget. That holds however
+        the provider counts the two, which FAIR does not know.
+        """
+        known = self._refused_sizes.get(model_id)
+        if known is None:
+            return
+        refused_prompt, refused_budget, until = known
+        if self.clock() >= until:
+            del self._refused_sizes[model_id]
+            return
+        if prompt >= refused_prompt and budget >= refused_budget:
+            raise RequestNotSupported("SIZE_ALREADY_REFUSED_BY_PROVIDER")
 
     async def _stream_json(self, path, payload, timeout):
         """Read an SSE completion and assemble the envelope a buffered one would have.
@@ -783,14 +825,24 @@ class TextAdapter:
                 "json_schema": {"name": "fair_result", "strict": True, "schema": schema},
             }
         await self._before_completion(payload)
-        if estimated_tokens(json.dumps(payload)) + budget > model.context_window:
+        prompt = estimated_tokens(json.dumps(payload))
+        if prompt + budget > model.context_window:
             raise RequestNotSupported("CONTEXT_BUDGET_EXCEEDED")
+        self._refuse_known_oversize(model.model_id, prompt, budget)
         timeout = self._completion_timeout(request, streaming)
-        data = (
-            await self._stream_json("/chat/completions", payload, timeout)
-            if streaming
-            else await self._json("POST", "/chat/completions", payload, timeout=timeout)
-        )
+        try:
+            data = (
+                await self._stream_json("/chat/completions", payload, timeout)
+                if streaming
+                else await self._json("POST", "/chat/completions", payload, timeout=timeout)
+            )
+        except RequestTooLarge:
+            self._refused_sizes[model.model_id] = (
+                prompt,
+                budget,
+                self.clock() + self._refused_size_ttl,
+            )
+            raise
         self._after_completion(data)
         try:
             choices = data["choices"]
@@ -850,12 +902,26 @@ class GroqAdapter(TextAdapter):
             return QuotaSnapshot(provider_id=self.provider_id)
 
     def _error_from_body(self, status, headers, data):
+        message = self._error_message(data).casefold()
+        # "Request too large for model `...` on tokens per minute (TPM): Limit 8000,
+        # Requested 9000": the request asks for more tokens than the model's whole
+        # per-minute allowance. No wait makes it fit, so it is not a rate limit,
+        # whatever status carries it.
+        if "request too large for model" in message:
+            raise RequestTooLarge("REQUEST_TOO_LARGE_FOR_MODEL")
         # Groq counts its limits per model and says so in the refusal itself: "Rate
         # limit reached for model `openai/gpt-oss-120b` in organization ...". Its
         # other models keep their own allowance, so only this one is benched. A
         # refusal that does not name a model keeps the provider-wide reading.
-        named = "rate limit reached for model" in self._error_message(data).casefold()
-        self._error(status, headers, model_scoped=status == 429 and named)
+        named = "rate limit reached for model" in message
+        # It names the window as well: "on tokens per minute (TPM)" or "on requests
+        # per minute (RPM)", against "per day" for the daily ones.
+        self._error(
+            status,
+            headers,
+            model_scoped=status == 429 and named,
+            per_minute=status == 429 and "per minute" in message,
+        )
 
 
 class OpenRouterFreeAdapter(TextAdapter):
@@ -1237,7 +1303,18 @@ class GeminiAdapter(TextAdapter):
         ):
             if retry_after is None:
                 retry_after = retry_seconds(headers.get("retry-after"), self.clock())
-            raise RateLimited("RATE_LIMITED", retry_after=retry_after, model_scoped=per_model)
+            # The quota id names the window too: "...PerMinutePerProjectPerModel" for
+            # requests, "...InputTokensPerModelPerMinute" for tokens. A daily one has
+            # already left through the branch above.
+            per_minute = bool(quota_ids) and all(
+                "perminute" in quota_id.casefold() for quota_id in quota_ids
+            )
+            raise RateLimited(
+                "RATE_LIMITED",
+                retry_after=retry_after,
+                model_scoped=per_model,
+                per_minute=per_minute,
+            )
 
         self._error(status, headers)
 

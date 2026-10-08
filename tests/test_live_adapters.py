@@ -8,7 +8,9 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
+from fair.config import RoutingSettings
 from fair.embedded.module import _CLOUD_PROVIDERS, FAIR, _loopback
+from fair.embedded.router import EmbeddedRouter
 from fair.providers.base import (
     AccessDenied,
     AuthenticationFailed,
@@ -18,6 +20,7 @@ from fair.providers.base import (
     QuotaExceeded,
     RateLimited,
     RequestNotSupported,
+    RequestTooLarge,
     StructuredOutputRejected,
 )
 from fair.providers.live import (
@@ -31,8 +34,12 @@ from fair.providers.live import (
     TextAdapter,
     ZaiFreeAdapter,
 )
+from fair.providers.registry import Registry
+from fair.quality.thresholds import DEFAULT_THRESHOLDS
+from fair.schemas.api import SolveRequest
 from fair.schemas.domain import NormalizedModelRequest, ProviderSpec
 from fair.schemas.qualification import ModelQualification, ProviderQualification
+from fair.security.adapter import CredentialedAdapter
 
 ACCOUNT = "0" * 32
 
@@ -675,14 +682,15 @@ class TestGroq:
         assert payload["max_completion_tokens"] == 64
         assert "max_tokens" not in payload
 
-    # The refusal Groq sends, recorded from its API: the model is named in the text.
+    # The refusal Groq sends, in the wording its users report: the model is named in
+    # the text, and so is the window the limit is counted over.
     NAMED = (
         "Rate limit reached for model `openai/gpt-oss-20b` in organization `org_x` "
         "service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7313, "
         "Requested 1024. Please try again in 2.5s."
     )
 
-    def _refused(self, message, **headers):
+    def _refused(self, message, status=429, **headers):
         body = {"error": {"message": message, "type": "tokens", "code": "rate_limit_exceeded"}}
         transport, _ = _transport(
             {
@@ -691,7 +699,7 @@ class TestGroq:
                     {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
                 ),
                 ("POST", "/chat/completions"): lambda request: httpx.Response(
-                    429, json=body, headers=headers
+                    status, json=body, headers=headers
                 ),
             }
         )
@@ -748,6 +756,218 @@ class TestGroq:
         )
         with pytest.raises(ProviderUnavailable, match="HTTP_503"):
             await adapter.complete(_request(self.MODEL))
+
+    @pytest.mark.parametrize("window", ["tokens per minute (TPM)", "requests per minute (RPM)"])
+    async def test_a_limit_named_as_per_minute_says_so(self, window):
+        message = self.NAMED.replace("tokens per minute (TPM)", window)
+        adapter = self._refused(message, **{"retry-after": "3"})
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(self.MODEL))
+        assert (raised.value.per_minute, raised.value.model_scoped) == (True, True)
+        assert raised.value.retry_after == 3
+
+    async def test_a_daily_token_limit_is_not_a_per_minute_one(self):
+        """Tokens per day runs out like a quota: its wait is hours, not seconds."""
+        message = self.NAMED.replace("tokens per minute (TPM)", "tokens per day (TPD)")
+        adapter = self._refused(message, **{"retry-after": "5400"})
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(self.MODEL))
+        assert (raised.value.per_minute, raised.value.model_scoped) == (False, True)
+        assert raised.value.retry_after == 5400
+
+    @pytest.mark.parametrize("message", ["Rate limit exceeded", "Too many requests", ""])
+    async def test_a_refusal_that_names_no_window_keeps_the_cooldown(self, message):
+        adapter = self._refused(message, **{"retry-after": "3"})
+        with pytest.raises(RateLimited) as raised:
+            await adapter.complete(_request(self.MODEL))
+        assert raised.value.per_minute is False
+
+    # Sent when one request asks for more than the model's whole per-minute allowance.
+    TOO_LARGE = (
+        "Request too large for model `openai/gpt-oss-20b` in organization `org_x` "
+        "service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 9311, "
+        "please reduce your message size and try again."
+    )
+
+    @pytest.mark.parametrize("status", [413, 429, 400])
+    async def test_a_request_over_the_whole_allowance_is_too_large_not_rate_limited(self, status):
+        """Waiting does not make it fit, whichever status carries the refusal."""
+        adapter = self._refused(self.TOO_LARGE, status=status, **{"retry-after": "3"})
+        with pytest.raises(RequestTooLarge, match="^REQUEST_TOO_LARGE_FOR_MODEL$"):
+            await adapter.complete(_request(self.MODEL))
+
+    async def test_a_bare_413_is_too_large_not_an_outage(self):
+        adapter = self._refused("Payload Too Large", status=413)
+        with pytest.raises(RequestTooLarge, match="^HTTP_413$"):
+            await adapter.complete(_request(self.MODEL))
+
+    def _sized(self, refuse_above=2000):
+        """A route that refuses any request asking for more than ``refuse_above``."""
+        clock = _Clock()
+
+        def answer(request):
+            asked = json.loads(request.content)["max_completion_tokens"]
+            if asked > refuse_above:
+                return httpx.Response(413, json={"error": {"message": self.TOO_LARGE}})
+            return _as_sse(_completion(self.MODEL))
+
+        transport, seen = _transport(
+            {
+                ("GET", "/models"): (
+                    200,
+                    {"data": [{"id": self.MODEL, "context_window": 131072, "active": True}]},
+                ),
+                ("POST", "/chat/completions"): answer,
+            }
+        )
+        adapter = GroqAdapter(
+            _spec("groq", "FREE_RECURRING", self.MODEL),
+            _settings(),
+            credential=SecretStr("k"),
+            transport=transport,
+            clock=clock,
+        )
+        return adapter, lambda: sum(request.method == "POST" for request in seen), clock
+
+    def _asking(self, tokens, task="ping"):
+        return NormalizedModelRequest(
+            task=task,
+            model_id=self.MODEL,
+            request_id="r",
+            client_id="c",
+            task_class="general",
+            max_output_tokens=tokens,
+        )
+
+    async def test_a_size_the_provider_refused_is_not_sent_again(self):
+        adapter, sent, _ = self._sized()
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(3000))
+        assert sent() == 1
+
+        # The same size, and anything larger, stops before dispatch. It is FAIR's
+        # own refusal now, so the router gives the reservation back.
+        for tokens in (3000, 4000):
+            with pytest.raises(RequestNotSupported, match="^SIZE_ALREADY_REFUSED") as raised:
+                await adapter.complete(self._asking(tokens))
+            assert type(raised.value) is RequestNotSupported
+        assert sent() == 1
+
+        # Anything smaller was never refused, so it is still asked.
+        assert (await adapter.complete(self._asking(1000))).text == "pong"
+        assert sent() == 2
+
+    async def test_only_a_request_at_least_as_large_both_ways_is_held_back(self):
+        """FAIR does not know how prompt and output are weighed, so it assumes nothing."""
+        adapter, sent, _ = self._sized()
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(3000, task="long " * 2000))
+        # A larger budget on a much shorter prompt is a different request: it is sent.
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(4000))
+        assert sent() == 2
+        # And that refusal is the one now remembered.
+        with pytest.raises(RequestNotSupported, match="^SIZE_ALREADY_REFUSED"):
+            await adapter.complete(self._asking(4000, task="long " * 2000))
+        assert sent() == 2
+
+    async def test_a_refused_size_is_forgotten_after_an_hour(self):
+        adapter, sent, clock = self._sized()
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(3000))
+        clock.now += 3599
+        with pytest.raises(RequestNotSupported, match="^SIZE_ALREADY_REFUSED"):
+            await adapter.complete(self._asking(3000))
+        assert sent() == 1
+        clock.now += 1
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(3000))
+        assert sent() == 2
+
+    async def test_the_refused_size_is_shown_to_the_operator(self):
+        adapter, _, clock = self._sized()
+        assert adapter.safe_diagnostics() == {}
+        with pytest.raises(RequestTooLarge):
+            await adapter.complete(self._asking(3000))
+        refused = adapter.safe_diagnostics()["refused_sizes"]
+        assert list(refused) == [self.MODEL]
+        assert refused[self.MODEL]["output_budget"] == 3000
+        assert refused[self.MODEL]["prompt_tokens_estimate"] > 0
+        clock.now += 3600
+        assert adapter.safe_diagnostics() == {}
+
+    async def test_a_rate_limit_is_not_remembered_as_a_size(self):
+        adapter = self._refused(self.NAMED, **{"retry-after": "3"})
+        with pytest.raises(RateLimited):
+            await adapter.complete(_request(self.MODEL))
+        assert adapter.safe_diagnostics() == {}
+
+    def _routed(self, adapter, clock):
+        """The adapter as routing really reaches it: behind the credential guard."""
+        registry = Registry()
+        guard = CredentialedAdapter("groq", adapter, SecretStr("not-in-any-message"))
+        registry.register(adapter.spec, guard)
+        router = EmbeddedRouter(registry, RoutingSettings(), dict(DEFAULT_THRESHOLDS))
+        router.quota.clock = clock
+        return router
+
+    async def test_end_to_end_a_refused_size_costs_one_request_and_no_health(self):
+        adapter, sent, clock = self._sized()
+        router = self._routed(adapter, clock)
+        ask = {"client_id": "c", "max_output_tokens": 3000}
+
+        first = await router.solve(SolveRequest.model_validate(ask | {"task": "one"}))
+        [attempt] = first.attempts
+        assert (str(attempt.disposition), attempt.error_type, attempt.error_detail) == (
+            "CAPABILITY_MISMATCH",
+            "REQUEST_TOO_LARGE_FOR_ROUTE",
+            "REQUEST_TOO_LARGE_FOR_MODEL",
+        )
+        # The next one that size is stopped by FAIR, sent nowhere, and given back.
+        second = await router.solve(SolveRequest.model_validate(ask | {"task": "two"}))
+        [attempt] = second.attempts
+        assert (str(attempt.disposition), attempt.error_type, attempt.error_detail) == (
+            "CAPABILITY_MISMATCH",
+            "REQUEST_NOT_SUPPORTED_BY_ROUTE",
+            "SIZE_ALREADY_REFUSED_BY_PROVIDER",
+        )
+        assert sent() == 1
+        state = router.quota.state("groq")
+        assert (state.used, state.failures, state.circuit_state) == (1, [], "CLOSED")
+        # A request that fits is still answered by the same route.
+        small = await router.solve(
+            SolveRequest.model_validate(
+                {"client_id": "c", "task": "three", "max_output_tokens": 64}
+            )
+        )
+        assert small.attempts[0].error_type is None
+        assert sent() == 2
+
+    async def test_end_to_end_a_token_per_minute_refusal_benches_for_groqs_own_wait(self):
+        clock = _Clock()
+        adapter = self._refused(self.NAMED, **{"retry-after": "3"})
+        adapter.clock = clock
+        router = self._routed(adapter, clock)
+        result = await router.solve(SolveRequest.model_validate({"client_id": "c", "task": "one"}))
+        [attempt] = result.attempts
+        assert (str(attempt.disposition), attempt.error_type, attempt.error_detail) == (
+            "QUOTA_FAILURE",
+            "RATE_LIMITED",
+            "MODEL_RATE_LIMITED_PER_MINUTE",
+        )
+        # Three seconds, where the cooldown would have held it for six minutes.
+        assert router.quota.benched_models("groq") == {self.MODEL: clock.now + 3}
+        assert router.quota.state("groq").throttled_until == 0
+        clock.now += 3
+        assert router.quota.model_available("groq", self.MODEL) is True
+
+
+class _Clock:
+    def __init__(self):
+        self.now = datetime.now(UTC).timestamp()
+
+    def __call__(self):
+        return self.now
 
 
 def _sse_error(model, error, *, status=200):
