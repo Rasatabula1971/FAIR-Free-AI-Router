@@ -7,9 +7,21 @@ from fair.quality.arithmetic import calculate, numeric_answer
 from fair.quality.claims import validate_claims
 from fair.quality.code_validator import validate_function
 from fair.quality.grounding import grounded_result
-from fair.quality.json_data import json_document
+from fair.quality.json_data import read_json
 from fair.quality.thresholds import STRUCTURE_VALIDATED_SCORE
 from fair.schemas.domain import QualityReport, SourcePolicyReport, VerificationState
+
+
+def _note_wrapper(checks, wrapper):
+    """Record that a passing JSON answer was lifted out of surrounding prose.
+
+    The prose is gone from what the caller receives, and it is the one place a
+    model could have said the JSON was a placeholder. A shape check cannot see
+    that, so the attempt says the text was there: it is how an operator learns
+    how often this happens, and which answers to look at twice.
+    """
+    if wrapper == "PROSE":
+        checks["json_wrapper"] = "PROSE_REMOVED"
 
 
 def evaluate(request, profile, response, *, source_review=None) -> QualityReport:
@@ -26,10 +38,11 @@ def evaluate(request, profile, response, *, source_review=None) -> QualityReport
         reasons.append("INCOMPLETE_RESPONSE")
     if request.expected_schema is not None:
         try:
-            data = json_document(response.text)
+            data, _, wrapper = read_json(response.text)
             Draft202012Validator(request.expected_schema).validate(data)
             verification = "STRUCTURE_VALIDATED"
             checks["schema"] = "PASS"
+            _note_wrapper(checks, wrapper)
         except (ValueError, ValidationError, RecursionError):
             reasons.append("SCHEMA_FAILURE")
             checks["schema"] = "FAIL"
@@ -70,9 +83,12 @@ def evaluate(request, profile, response, *, source_review=None) -> QualityReport
                 reasons.append("ARITHMETIC_MISMATCH")
         elif kind == "reference_json":
             try:
-                actual = json.dumps(json_document(response.text), sort_keys=True, allow_nan=False)
+                data, _, wrapper = read_json(response.text)
+                actual = json.dumps(data, sort_keys=True, allow_nan=False)
                 expected = json.dumps(request.validation.expected, sort_keys=True, allow_nan=False)
                 matched = actual == expected
+                if matched:
+                    _note_wrapper(checks, wrapper)
             except (ValueError, RecursionError):
                 matched = False
             checks["reference_json"] = "PASS" if matched else "FAIL"
@@ -82,8 +98,10 @@ def evaluate(request, profile, response, *, source_review=None) -> QualityReport
         elif kind == "grounded_json":
             expected = grounded_result(request.validation, request.evidence)
             try:
-                actual = json_document(response.text)
+                actual, _, wrapper = read_json(response.text)
                 matched = json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+                if matched:
+                    _note_wrapper(checks, wrapper)
             except (ValueError, RecursionError):
                 matched = False
             checks["grounded_json"] = "PASS" if matched else "FAIL"

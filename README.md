@@ -315,10 +315,35 @@ FAIR verifies AI responses before accepting them:
 - **`grounded_claims`** — structured fact-checking across supplied evidence sources
 
 Passing `expected_schema` with no contract checks JSON Schema conformance of the
-output. A single markdown code fence around the whole answer is tolerated (free models
-add one even when told not to); prose around the JSON is still a schema failure. That proves shape, not truth, so it scores 85: accepted at `commodity` and
+output. That proves shape, not truth, so it scores 85: accepted at `commodity` and
 `standard`, escalated at `advanced` and `high_impact_support`. Tasks the profiler
 flags as needing code or grounding still require a matching contract.
+
+### JSON a model wrapped in something
+
+Free models wrap JSON even when told not to. For `expected_schema`, `reference_json`
+and `grounded_json`, FAIR reads through two kinds of wrapper and then applies the whole
+check to what is inside:
+
+- a single markdown code fence around the whole answer;
+- a short wrapper of plain text around one object or array, such as
+  `Here is your JSON: {...}` or a fenced block with a sentence before and after it.
+
+The second is deliberately narrow. Everything from the first opening bracket to the last
+closing one must be a single valid document, nothing outside it may contain a bracket,
+and the text outside may be at most 300 characters, not counting whitespace. So two
+documents, an example ahead of the answer, or prose that uses brackets itself are still
+a failure: FAIR never chooses between candidates and never repairs JSON. A bare number
+or word in a sentence is never lifted out.
+
+`output` is then the JSON alone, exactly as the model wrote it, with the fence or the
+wrapper removed. A bare JSON answer is returned unchanged.
+
+When prose was removed, the attempt records `json_wrapper: PROSE_REMOVED` in
+`validator_results`. That text is the one place a model could have said the JSON was a
+placeholder, and a shape check cannot see it, so treat the marker as a reason to look
+twice where nothing else verifies the values. `python_function` and `grounded_claims`
+answers are not relaxed.
 
 ### Work nothing can verify
 
