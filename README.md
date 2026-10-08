@@ -334,7 +334,14 @@ closing one must be a single valid document, nothing outside it may contain a br
 and the text outside may be at most 300 characters, not counting whitespace. So two
 documents, an example ahead of the answer, or prose that uses brackets itself are still
 a failure: FAIR never chooses between candidates and never repairs JSON. A bare number
-or word in a sentence is never lifted out.
+or word in a sentence is never lifted out. Neither is a value inside a larger structure
+that lost its outer braces, such as `"status": "error", "data": {...}`: a quoted key and
+colon straight before the JSON, or a comma and another quoted key straight after it, mark
+it as part of something broken rather than a wrapped answer.
+
+The wrapper is only read through when the answer itself is meant to be JSON. With a
+`python_function`, `arithmetic` or `grounded_claims` contract the answer belongs to that
+contract, and a schema alongside it is checked against the bare or fenced answer only.
 
 `output` is then the JSON alone, exactly as the model wrote it, with the fence or the
 wrapper removed. A bare JSON answer is returned unchanged.
@@ -342,8 +349,7 @@ wrapper removed. A bare JSON answer is returned unchanged.
 When prose was removed, the attempt records `json_wrapper: PROSE_REMOVED` in
 `validator_results`. That text is the one place a model could have said the JSON was a
 placeholder, and a shape check cannot see it, so treat the marker as a reason to look
-twice where nothing else verifies the values. `python_function` and `grounded_claims`
-answers are not relaxed.
+twice where nothing else verifies the values.
 
 ### Work nothing can verify
 

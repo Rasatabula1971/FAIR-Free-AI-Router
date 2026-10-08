@@ -10,6 +10,9 @@ strictly as before and still has to pass the whole contract.
 """
 
 import json
+import random
+import re
+from time import perf_counter
 
 import pytest
 
@@ -19,7 +22,14 @@ from fair.providers.mock import MockAdapter
 from fair.providers.registry import Registry
 from fair.quality.claims import validate_claims
 from fair.quality.contracts import ClaimsValidation, Evidence
-from fair.quality.json_data import MAX_WRAPPER_CHARS, json_document, json_text, read_json
+from fair.quality.engine import expects_json_document
+from fair.quality.json_data import (
+    MAX_WRAPPER_CHARS,
+    _fenced,
+    json_document,
+    json_text,
+    read_json,
+)
 from fair.schemas.api import SolveRequest
 from fair.schemas.domain import NormalizedModelResponse, ProviderSpec
 
@@ -81,6 +91,9 @@ class TestReadingAnAnswer:
             (f"Here you go:\n{DOCUMENT}\nEnjoy!", "PROSE"),
             (f"{DOCUMENT}\n\nLet me know if you need anything else.", "PROSE"),
             (f"Sure!\n```json\n{DOCUMENT}\n```\nHope that helps.", "PROSE"),
+            # A quoted word in the sentence is not a key: the colon does not follow it.
+            (f'The "items" list you asked for: {DOCUMENT}', "PROSE"),
+            (f"{DOCUMENT}, as requested.", "PROSE"),
         ],
     )
     def test_the_document_is_found_and_what_was_removed_is_named(self, text, wrapper):
@@ -126,6 +139,13 @@ class TestReadingAnAnswer:
             '{"items": []} (see note [a])',
             'Closed early } then {"items": []}',
             '{"items": []} and then an opening [',
+            # A value inside a larger structure that lost its outer braces. Lifting it
+            # out would be choosing one part of a broken object and calling it the answer.
+            '"status": "error", "data": {"items": [1]}',
+            '"items": [1, 2]',
+            '"data" : \n {"items": []}',
+            '{"items": [1]}, "other": 2',
+            '{"items": [1]} ,\n "other": 2',
             # No object or array at all: a value in a sentence is not a wrapped answer.
             "The answer is 42",
             'The answer is "yes"',
@@ -163,6 +183,73 @@ class TestReadingAnAnswer:
     def test_whitespace_does_not_count_toward_the_wrapper(self):
         padded = "Here:" + "\n" * (MAX_WRAPPER_CHARS * 2) + DOCUMENT
         assert read_json(padded)[2] == "PROSE"
+
+
+# The single pattern the fence used to be read with. Kept here only to prove the
+# linear reader gives the same body; it must never be run on untrusted text again.
+_OLD_FENCE = re.compile(r"^\s*```(?:[A-Za-z0-9_-]+)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
+
+
+class TestTheFenceIsReadInLinearTime:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "```json" + "\n" * 20000,  # opened, then ran away in newlines: was cubic
+            "```json" + "\n" * 20000 + DOCUMENT,
+            "```json\n" + DOCUMENT + " " * 90000 + "x",  # was quadratic
+            "```" * 30000,
+            " " * 100000,
+        ],
+    )
+    def test_a_runaway_answer_is_read_or_refused_at_once(self, text):
+        """1,600 newlines after an opening fence used to hold the event loop for
+        seven seconds, and 3,000 for most of a minute. Nothing times the gate out."""
+        started = perf_counter()
+        try:
+            read_json(text)
+        except ValueError:
+            pass
+        assert perf_counter() - started < 1.0
+
+    def test_it_reads_exactly_what_the_old_pattern_read(self):
+        rng = random.Random(20261007)
+        pieces = ["```", "``", "`", "json", "x-1_", "{", "}", "[", "]", '"', "1", "é"]
+        pieces += [
+            " ",
+            "\n",
+            "\t",
+            "\r",
+            "\x0b",
+            "\x0c",
+            "\x1c",
+            "\x85",
+            "\xa0",
+            "\u2028",
+            "\ufeff",
+        ]
+        for _ in range(20000):
+            text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 12)))
+            match = _OLD_FENCE.match(text)
+            assert _fenced(text) == (match.group(1) if match else None), repr(text)
+
+    @pytest.mark.parametrize(
+        "text, body",
+        [
+            ("```json\n{}\n```", "{}"),
+            ("  ```\n\n{}  \n\n```  \n", "{}"),
+            ("```json{}```", "{}"),
+            ("``````", ""),
+            ("```json```", ""),
+            ("```", None),
+            ("`````", None),
+            ("```json\n{}", None),
+            ("{}\n```", None),
+            ("x```json\n{}\n```", None),
+            ("```json\n{}\n```x", None),
+        ],
+    )
+    def test_only_a_fence_around_the_whole_answer_counts(self, text, body):
+        assert _fenced(text) == body
 
 
 class TestTheQualityGate:
@@ -268,6 +355,68 @@ class TestTheQualityGate:
         assert result.status == "ACCEPTED"
         assert result.cross_check.state == "PASSED"
         assert sum(adapter.calls for adapter in adapters) == 2
+
+    async def test_code_is_not_read_as_a_wrapper_around_its_own_list(self):
+        """A function contract owns the answer. With a schema as well, the code was
+        accepted as the array literal inside it and returned as that fragment."""
+        code = "def f(a):\n    return [1, 2, 3]"
+        ask = _request(
+            task="write f",
+            task_type="coding",
+            expected_schema={"type": "array"},
+            validation={
+                "kind": "python_function",
+                "function_name": "f",
+                "cases": [{"arguments": [0], "expected": [1, 2, 3]}],
+            },
+        )
+        router, _ = _router(code)
+        result = await router.solve(ask)
+        assert result.status == "ESCALATION_REQUIRED"
+        quality = result.attempts[0].quality
+        assert quality.reject_reasons == ["SCHEMA_FAILURE"]
+        assert "json_wrapper" not in quality.validator_results
+        # And were such an answer ever returned, it would be the code, not a slice.
+        response = NormalizedModelResponse(provider_id="p", model_id="m", text=code)
+        assert _output(ask, response) == code
+
+    @pytest.mark.parametrize(
+        "fields, expected",
+        [
+            ({"expected_schema": ITEMS}, True),
+            ({"validation": {"kind": "reference_json", "expected": {"x": 1}}}, True),
+            (
+                {
+                    "expected_schema": ITEMS,
+                    "validation": {"kind": "reference_json", "expected": {"x": 1}},
+                },
+                True,
+            ),
+            ({}, False),
+            ({"validation": {"kind": "arithmetic", "expression": "1+1"}}, False),
+            (
+                {
+                    "expected_schema": {"type": "integer"},
+                    "validation": {"kind": "arithmetic", "expression": "1+1"},
+                },
+                False,
+            ),
+        ],
+    )
+    def test_only_a_json_contract_makes_the_answer_a_json_document(self, fields, expected):
+        assert expects_json_document(_request(**fields)) is expected
+
+    async def test_a_number_contract_with_a_schema_is_not_read_through_prose(self):
+        router, _ = _router("The answer is [2].")
+        result = await router.solve(
+            _request(
+                task="1+1",
+                expected_schema={"type": "array"},
+                validation={"kind": "arithmetic", "expression": "1+1"},
+            )
+        )
+        assert result.status == "ESCALATION_REQUIRED"
+        assert "SCHEMA_FAILURE" in result.attempts[0].quality.reject_reasons
 
     def test_an_answer_that_cannot_be_read_as_json_is_handed_back_as_written(self):
         """The gate refuses these before they are returned; if one ever got through,

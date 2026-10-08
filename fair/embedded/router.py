@@ -22,7 +22,7 @@ from fair.providers.base import (
     StructuredOutputRejected,
 )
 from fair.quality.consensus import compare, independent
-from fair.quality.engine import acceptable, evaluate
+from fair.quality.engine import acceptable, evaluate, expects_json_document
 from fair.quality.json_data import json_text
 from fair.quality.thresholds import validate_thresholds
 from fair.schemas.api import SolveResponse
@@ -60,8 +60,7 @@ def _output(request, response):
     handing back the raw text afterwards left the caller holding an answer FAIR
     called accepted and ``json.loads`` could not read.
     """
-    kind = request.validation.kind if request.validation is not None else None
-    if request.expected_schema is not None or kind in {"reference_json", "grounded_json"}:
+    if expects_json_document(request):
         try:
             return json_text(response.text)
         except (ValueError, RecursionError):

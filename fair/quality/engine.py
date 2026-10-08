@@ -24,6 +24,21 @@ def _note_wrapper(checks, wrapper):
         checks["json_wrapper"] = "PROSE_REMOVED"
 
 
+def expects_json_document(request):
+    """Whether the answer itself is meant to be one JSON document.
+
+    True for a bare ``expected_schema`` and for the two JSON contracts. False
+    when another contract owns the answer: a function, a number or a claims
+    document is not something a model wrapped in prose, and reading it that way
+    accepted ``def f(a): return [1, 2, 3]`` as the array ``[1, 2, 3]`` because
+    the code happened to hold exactly one bracketed literal.
+    """
+    kind = request.validation.kind if request.validation is not None else None
+    if kind is None:
+        return request.expected_schema is not None
+    return kind in {"reference_json", "grounded_json"}
+
+
 def evaluate(request, profile, response, *, source_review=None) -> QualityReport:
     reasons = []
     checks = {}
@@ -39,6 +54,8 @@ def evaluate(request, profile, response, *, source_review=None) -> QualityReport
     if request.expected_schema is not None:
         try:
             data, _, wrapper = read_json(response.text)
+            if wrapper == "PROSE" and not expects_json_document(request):
+                raise ValueError("Only a JSON answer is read through a wrapper")
             Draft202012Validator(request.expected_schema).validate(data)
             verification = "STRUCTURE_VALIDATED"
             checks["schema"] = "PASS"
