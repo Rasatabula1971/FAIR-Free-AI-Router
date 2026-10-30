@@ -44,7 +44,7 @@ from fair.security.credentials import CredentialConfigurationError
 # documentation on this date. This MUST NOT be derived from process startup:
 # qualified() intentionally expires provider evidence after 30 days so stale
 # pricing/terms cannot be renewed merely by restarting FAIR.
-_BUILTIN_PROVIDER_REVIEWED_AT = datetime(2026, 9, 27, tzinfo=UTC)
+_BUILTIN_PROVIDER_REVIEWED_AT = datetime(2026, 10, 29, tzinfo=UTC)
 
 
 def _reviewed_at():
